@@ -29,13 +29,13 @@ usage as another's.
 
 ## Current Position
 
-Phase: 1 (encrypted-bundle-core) — EXECUTING
-Plan: 1 of 8
-Status: Executing Phase 1
+Phase: 1 (encrypted-bundle-core) — CODE COMPLETE, gate green; formal completion awaits 2 live UATs
+Plan: 11 of 11 (9 planned + 2 security remediations)
+Status: Phase 1 done pending user UAT; Phase 2 starting
 Last activity: 2026-08-19 — Phase 1 execution started
 and reconciled, REQUIREMENTS.md (37 v1) and ROADMAP.md (6 phases) written
 
-Progress: [░░░░░░░░░░] 0%
+Progress: [█░░░░░░░░░] ~17% (1 of 6 phases)
 
 ## Performance Metrics
 
@@ -117,3 +117,27 @@ Last session: 2026-08-17
 Stopped at: Milestone artifacts written (PROJECT, REQUIREMENTS, ROADMAP, STATE, research×3 +
 SUMMARY). Nothing implemented yet.
 Resume file: None
+
+## Phase 1 — closing note
+
+**Code complete, full gate green: 1104 tests (baseline 973), 0 failures, `make test` PASS,
+clippy 0, fmt clean.** 11 units executed (9 planned + `1-10`/`1-11` security remediations),
+9 worktree merges with zero conflicts.
+
+`gsd phase.complete 1` is **deliberately not run**. It requires verification status `passed`,
+and the status is `human_needed` for two live-gated calibrations (CAL-1 needs a real private
+repo + token; CAL-3's aarch64-Linux leg needs slow non-Apple hardware). Marking them
+`uat-passed` would assert the user ran tests they have not. Both have shipped fallbacks and
+neither gates the code, so the run proceeds — but the roadmap checkbox stays honest until
+`1-HUMAN-UAT.md` is actually executed.
+
+**What the phase caught that planning did not:**
+- A measured defect — the *default* bundle's manifest (1558 entries, 448 KiB) could not seal
+  against a 256 KiB chunk limit. Fixed in-phase (`1-09`) because `Root`'s shape is on-disk
+  format and `1-07` was about to pin it.
+- An AEAD **nonce-reuse flaw** introduced by the fix for an earlier plan-review blocker: the
+  nonce derived from the plaintext while the sealed message was the zstd frame. Invisible to
+  all 13 adversarial tests and to the first verification pass; found only by auditing from the
+  threat model rather than from the suite.
+- Three separate instances of *documentation describing behaviour that does not exist*, the
+  last one still asserting the removed nonce rule after two remediation rounds.
