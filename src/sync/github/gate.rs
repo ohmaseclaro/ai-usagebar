@@ -600,6 +600,89 @@ mod tests {
         );
     }
 
+    /// REPO-03, as a standing check rather than a one-time grep.
+    ///
+    /// Withholding `Administration: write` is what makes creating a repository —
+    /// and therefore a **public** one — impossible rather than merely
+    /// disallowed. A `grep` in a plan's verify step proves that for one
+    /// afternoon; REPO-03 is a property of the shipped crate, so this walks
+    /// `src/` on every `cargo test`, and therefore on every `make test`, and
+    /// therefore in every later phase. The cost is one directory walk.
+    ///
+    /// All four creating endpoints, not just the obvious one:
+    ///
+    /// - the user-namespace create path,
+    /// - the organization-namespace create path — D-01 explicitly permits an
+    ///   organization owner, so this is a live route and not a hypothetical,
+    /// - create-from-template,
+    /// - **fork**, which is the dangerous one: a fork of a public upstream is
+    ///   public, which is exactly the outcome REPO-03 exists to make impossible.
+    ///
+    /// The organization fragment is deliberately broader than its create path.
+    /// This crate calls no organization endpoint at all, so matching every one
+    /// of them costs nothing and catches every spelling of the create path,
+    /// including ones a `format!` would break into pieces.
+    ///
+    /// **This file is excluded from the walk, deliberately.** The fragments
+    /// below are the things being searched for, so a guard that scanned its own
+    /// source would fail on the day it was written. That exclusion is also the
+    /// rule for everyone else: do not write any of these fragments anywhere
+    /// under `src/` — not in a call, not in a test fixture, and not in a comment
+    /// explaining that the endpoint is never used. To this test a comment and a
+    /// call site are indistinguishable. Say what is true instead: the tool
+    /// refuses and prints the command the user should run.
+    ///
+    /// The braces to plan 3-01's belt, which is the stronger half: `Client`
+    /// exposes no method that can carry a request body, and none of these four
+    /// endpoints is reachable without one. Both are cheap; having both is right.
+    #[test]
+    fn no_repository_creating_endpoint_is_reachable_from_the_crate() {
+        const FORBIDDEN: [&str; 4] = ["/user/repos", "/orgs/", "/generate", "/forks"];
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rs(&root, &mut files);
+
+        let mut scanned = 0usize;
+        let mut skipped = 0usize;
+        for path in &files {
+            if path.ends_with(file!()) {
+                skipped += 1;
+                continue;
+            }
+            scanned += 1;
+            let text = std::fs::read_to_string(path).unwrap();
+            for fragment in FORBIDDEN {
+                assert!(
+                    !text.contains(fragment),
+                    "REPO-03: {} contains {fragment:?}. ai-usagebar holds no permission that \
+                     could create a repository, and that is a structural guarantee rather \
+                     than a policy — creating one is how a *public* repository comes to \
+                     exist. Remove the path. If a repository is missing, print the \
+                     `gh repo create <owner>/<name> --private` line and exit non-zero.",
+                    path.display()
+                );
+            }
+        }
+
+        // Non-vacuity: a guard that asserts an absence must also prove it looked
+        // at something. A refactor that moved this file, or a walk that silently
+        // found nothing, would otherwise report green forever.
+        assert_eq!(skipped, 1, "this file must be excluded exactly once");
+        assert!(scanned > 50, "only {scanned} files walked under {root:?}");
+    }
+
+    fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect_rs(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
     /// D-04's "immediately", enforceable rather than merely described.
     #[test]
     fn a_clearance_goes_stale_and_a_clearance_from_the_future_is_refused() {
