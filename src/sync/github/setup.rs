@@ -599,9 +599,21 @@ mod tests {
         assert!(!out.reused_pairing);
         assert!(out.keyfile.starts_with(dir.path()));
         assert!(out.keyfile.exists());
-        // Phase 2's own number for the two files seeded above.
+        // Phase 2's own number, and the same number the user was shown: step 4
+        // renders the dry-run's own report over the dry-run's own plan, so the
+        // figure here and the figure `sync push --dry-run` prints cannot
+        // disagree.
         assert!(out.files >= 1, "{out:?}");
         assert!(out.would_send > 0, "{out:?}");
+        let said = script.borrow().said.join("\n");
+        assert!(
+            said.contains(&crate::sync::report::human_bytes(out.would_send)),
+            "the confirmed size is the plan builder's own total: {said}"
+        );
+        assert!(said.contains("uploads nothing"), "{said}");
+        // The token never reaches the narration either, not even a prefix.
+        assert!(!said.contains(FIXTURE), "{said}");
+        assert!(!said.contains(&FIXTURE[..8]), "{said}");
     }
 
     /// T-3-36. Neither secret, nor an eight-character prefix of either, reaches
