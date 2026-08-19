@@ -676,10 +676,12 @@ fn cal3_argon2id_timing_at_production_parameters() {
 /// **CAL-1** — does a private-repo release asset honour a `Range:` request
 /// after the redirect to signed storage?
 ///
-/// It decides pack sizing. If ranged reads work, one chunk can be fetched out
-/// of a large pack and packs may grow; if they do not, fetching one chunk means
-/// fetching its whole pack, and `sync::pack::PACK_TARGET` stays at the recorded
-/// 32 MiB fallback where that waste is tolerable.
+/// It is an **optimisation** question, not a blocker: a restore fetches whole
+/// packs either way, and `PACK_MAX`'s 48 MiB sits under `download_asset`'s
+/// 64 MiB body cap, so nothing shipped depends on the answer. What it buys is a
+/// partial restore — if ranged reads work, one chunk can be fetched out of a
+/// large pack and `sync::pack::PACK_TARGET` could then grow past its 32 MiB
+/// fallback without making the waste of a whole-pack fetch worse.
 ///
 /// **Setup** — a throwaway private repository with one release carrying an
 /// asset a little over 1 MiB (large enough that a whole-body `200` is
@@ -813,12 +815,15 @@ async fn cal1_range_on_private_release_asset() {
     );
     if status.as_u16() == 206 && content_range.is_some() {
         println!(
-            "  CAL-1 = Range IS honoured. Phase 3 may raise sync::pack::PACK_TARGET above 32 MiB."
+            "  CAL-1 = Range IS honoured. A partial restore is possible, and \
+             sync::pack::PACK_TARGET may be raised above 32 MiB. Record it in \
+             docs/sync-format.md §7, which currently says this was never measured."
         );
     } else {
         println!(
             "  CAL-1 = Range is NOT honoured ({received} of {asset_size} bytes). \
-             The 32 MiB PACK_TARGET fallback stands."
+             The 32 MiB PACK_TARGET fallback stands, now measured. Record it in \
+             docs/sync-format.md §7."
         );
     }
 }
