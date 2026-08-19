@@ -170,6 +170,14 @@ pub enum SyncAction {
     /// when it last ran. Reads only — nothing is uploaded or written.
     Status,
 
+    /// Pair this machine with the private GitHub repository named in
+    /// `[sync] repo`.
+    ///
+    /// Resolves a token, asks GitHub what the repository is, and refuses unless
+    /// it reports itself private. **Nothing is uploaded** — this command has no
+    /// way to send a request body at all.
+    Setup,
+
     /// Send the encrypted bundle to the private remote.
     ///
     /// This build has no transport, so only `--dry-run` does anything: it
@@ -461,6 +469,14 @@ mod tests {
             status.command,
             Some(Command::Sync {
                 action: SyncAction::Status
+            })
+        ));
+
+        let setup = Cli::parse_from(["ai-usagebar", "sync", "setup"]);
+        assert!(matches!(
+            setup.command,
+            Some(Command::Sync {
+                action: SyncAction::Setup
             })
         ));
 
