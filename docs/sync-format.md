@@ -83,10 +83,13 @@ openable; one initialised higher stays strong.
   smallest input the algorithm is defined for rather than a security parameter,
   and the 12-character password rule in §9 is arithmetic against the guess rate
   the *shipped* parameters buy. The two are also coupled directly: below the
-  default memory cost, a user-supplied password is refused unless it is of
-  generated strength (20 characters, 100 bits), which is uncrackable at any KDF
-  cost. Lowering the cost therefore trades against password strength instead of
-  against security.
+  default memory cost a user-supplied password must be at least **20
+  characters** rather than 12 — the length a generated passphrase has. Lowering
+  the cost therefore trades against password length instead of against security.
+  It is a length rule and not an entropy one, and §9 says what that is worth: 20
+  characters from the generator are 100 uniform bits, 20 characters somebody
+  chose may be worth half that, and an implementation holding only the string
+  cannot tell which it has.
 - **Reading** is refused above **4 GiB**, and is deliberately unbounded below.
   `m_kib` reaches a reader from a keyfile a hostile remote may have edited, and
   an implementation whose Argon2 allocates infallibly turns one edited integer
@@ -624,8 +627,20 @@ is refused outright.
 
 That 12 is not a round number: it is arithmetic against the guess rate the
 shipped Argon2id parameters buy, so it means nothing unless those parameters are
-held to. **Below the default memory cost, a user-supplied password is refused
-unless it is of generated strength** — see §1. The two controls are one control.
+held to. **Below the default memory cost the floor rises from 12 characters to
+20**, the length of a generated passphrase — see §1. The two controls are one
+control.
+
+**That floor is a length, and length is a weak proxy for entropy.** Nothing in
+this format measures entropy, and nothing can from the string alone: 20
+characters out of the generator are 100 uniform bits, while 20 characters
+somebody remembered may be worth 40, and the two arrive identically. So do not
+read §1's raised floor as "only a generated passphrase is accepted" — earlier
+drafts of this document said exactly that, no implementation has ever done it,
+and a 20-character typed password is accepted. An implementation that refuses
+one is not following this document. What the floor does is price the cheapest
+mistakes out; what makes the offline attack hopeless is taking the generated
+passphrase.
 
 **Changing the password is not revocation.** A rewrap unwraps the master key
 under the old password and rewraps *the same* master key under the new one — 48

@@ -93,9 +93,12 @@ impl Default for KdfParams {
 ///
 /// 8 MiB is 1/128 of the shipped default and a thousand times argon2's floor.
 /// The floor and the passphrase policy are also coupled directly — below
-/// [`KdfParams::default`]'s memory, `passphrase::check` accepts nothing short of
-/// generated strength — because a floor alone only moves the line, while the
-/// coupling makes lowering the KDF cost pay for itself in password strength.
+/// [`KdfParams::default`]'s memory, `passphrase::check` raises the accepted
+/// password length from 12 characters to 20 — because a floor alone only moves
+/// the line, while the coupling makes lowering the KDF cost pay for itself in
+/// password length. Length, not measured entropy: 20 is what the generator
+/// emits, and `passphrase` says plainly why nothing there can tell a generated
+/// passphrase from a typed one of the same length.
 ///
 /// Only new keyfiles. An existing bundle written below this stays openable
 /// forever: refusing to *read* it would destroy data to enforce a policy the

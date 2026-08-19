@@ -17,9 +17,25 @@
 //! and nothing used to hold the parameters to it: a bundle written at a lower
 //! `--kdf-memory` bought a cheaper guess while the length rule stayed put. Two
 //! halves close it — `crypto::MIN_KDF_MEMORY_KIB` refuses the absurd end
-//! outright, and below the shipped memory cost this module accepts nothing
-//! short of a generated passphrase, which is uncrackable at any cost. Lowering
-//! the KDF therefore costs password strength rather than security.
+//! outright, and below the shipped memory cost the accepted length rises from
+//! [`MIN_CHARS`] to [`RECOMMENDED_CHARS`]. Lowering the KDF therefore costs
+//! password length rather than security.
+//!
+//! **That is a length rule, and length is only a proxy for entropy.** Say it
+//! plainly, because three earlier drafts of these docs said "below the default
+//! memory cost nothing short of a generated passphrase is accepted" and the code
+//! never did that: [`check`] counts characters, [`generate`] emits exactly
+//! [`RECOMMENDED_CHARS`] of them, and 20 typed characters are therefore
+//! indistinguishable from 20 CSPRNG ones to every line in this file. The proxy
+//! is honest at the bottom — a 6-character password is weak no matter who chose
+//! it — and weak at the top, where `20` may mean 100 uniform bits or may mean a
+//! remembered phrase worth 40.
+//!
+//! Carrying provenance out of [`generate`] would make the rule real and was
+//! rejected: a generated passphrase kept in a password manager comes back
+//! through the same stdin as anything else, so the type would refuse exactly the
+//! users it exists to bless. The honest control is that [`generate`] is the
+//! default path and [`OFFLINE_ATTACK_NOTE`] explains why.
 //!
 //! **Only three ways a password enters the process:** a reader ([`read_line`],
 //! for a pipe or stdin), a mode-0600 file ([`read_from_file`]), and a TTY
@@ -88,8 +104,9 @@ instead if you have somewhere safe to keep it.";
 const WEAKENED_KDF: &str = "\
 Too short for a bundle at this key-derivation cost. Lowering the memory cost \
 makes every offline guess cheaper, and the length rules are calculated against \
-the full cost — so below it, only a generated passphrase is accepted. Take the \
-generated one, or put the memory cost back.";
+the full cost — so below it the minimum is 20 characters rather than 12. Length \
+is all that can be checked, and it proves nothing on its own: take the generated \
+passphrase, or put the memory cost back.";
 
 /// The message on a warning.
 const THIN: &str = "\
@@ -145,9 +162,15 @@ pub fn generate() -> Result<Zeroizing<String>> {
 /// *shipped* parameters buy, so a bundle written at a lower `--kdf-memory` moves
 /// that arithmetic without moving the rule — the two controls were calibrated
 /// against each other and enforced apart. Below [`KdfParams::default`]'s memory
-/// the trade has to be paid for on the other side: nothing short of generated
-/// strength is accepted, which is uncrackable at any KDF cost, so a user who
-/// lowers the cost cannot also weaken the password.
+/// the trade has to be paid for on the other side: the accepted length rises
+/// from [`MIN_CHARS`] to [`RECOMMENDED_CHARS`], so a user who lowers the cost
+/// cannot also keep a short password.
+///
+/// **A longer password, not a provably stronger one.** 20 characters is what
+/// [`generate`] emits, but this function sees only a string and cannot tell a
+/// generated passphrase from a typed one of the same length — see the module
+/// docs, and do not restate the rule as "only a generated passphrase is
+/// accepted".
 pub fn check(pw: &str, k: KdfParams) -> Strength {
     let n = pw.chars().count();
     if n >= RECOMMENDED_CHARS {
@@ -270,10 +293,16 @@ mod tests {
 
     /// The coupling. `MIN_CHARS` is arithmetic against the guess rate the
     /// shipped parameters buy, so a bundle written cheaper has to pay for it in
-    /// password strength instead — and a generated passphrase is 100 bits,
-    /// uncrackable at any KDF cost.
+    /// password *length* instead: the floor rises from 12 to 20.
+    ///
+    /// Pinned as a length rule on purpose. Four documents used to call it an
+    /// entropy rule — "refused unless it is of generated strength" — which this
+    /// code has never enforced and cannot: `GENERATED_CHARS ==
+    /// RECOMMENDED_CHARS`, so 20 typed characters and 20 CSPRNG characters are
+    /// one input to `check`. The last assertion here is the one that keeps the
+    /// documents honest.
     #[test]
-    fn a_lowered_kdf_cost_accepts_nothing_short_of_a_generated_passphrase() {
+    fn a_lowered_kdf_cost_raises_the_accepted_length_from_twelve_to_twenty() {
         let lowered = KdfParams {
             m_kib: FULL.m_kib / 2,
             ..FULL
@@ -284,11 +313,11 @@ mod tests {
             let Strength::Rejected(msg) = check(pw, lowered) else {
                 panic!("{pw:?} must be refused below the shipped KDF cost");
             };
-            assert!(msg.contains("only a generated passphrase is accepted"));
+            assert!(msg.contains("20 characters rather than 12"));
             assert!(matches!(check(pw, FULL), Strength::Weak(_)));
         }
 
-        // …and generated strength still clears it, at any cost.
+        // …and a generated passphrase still clears it, at any cost.
         assert_eq!(check(&generate().unwrap(), lowered), Strength::Strong);
         assert_eq!(
             check(
@@ -305,6 +334,14 @@ mod tests {
         // The gate is the *default* memory, not a re-typed literal: raising the
         // shipped parameters must raise this with them.
         assert_eq!(FULL, KdfParams::default());
+
+        // What the rule actually is. A typed 20-character password clears the
+        // lowered cost exactly as a generated one does — the function counts
+        // characters and `generate` emits 20 of them, so nothing in the string
+        // says where it came from. Any document claiming otherwise describes
+        // behaviour that is not here.
+        assert_eq!(GENERATED_CHARS, RECOMMENDED_CHARS);
+        assert_eq!(check("twenty-characters-!!", lowered), Strength::Strong);
     }
 
     #[test]

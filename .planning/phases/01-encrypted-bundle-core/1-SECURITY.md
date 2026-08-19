@@ -124,8 +124,13 @@ m=8 KiB a 12-character password is trivially crackable offline.
 Backstop keeping this at medium: `generate()` is the documented default and yields 100 bits,
 uncrackable at any KDF cost. The residual bites only user-supplied password + lowered KDF.
 
-**Remediation applied:** `MIN_KDF_MEMORY_KIB` enforced in `Keyfile::wrap`, plus coupling — below
-the default memory, `passphrase::check` rejects anything short of generated strength.
+**Remediation applied:** `MIN_KDF_MEMORY_KIB` enforced on the write path, plus coupling — below
+the default memory, `passphrase::check` raises the accepted length from 12 characters to 20.
+
+**Corrected in 1-11 (F-4b):** this line first read "rejects anything short of generated
+strength", which the code has never done. `check` counts characters and `GENERATED_CHARS ==
+RECOMMENDED_CHARS == 20`, so a typed 20-character password and a generated one are one input to
+it. The coupling is real but is a *length* rule; the entropy claim was not implemented anywhere.
 
 ---
 
