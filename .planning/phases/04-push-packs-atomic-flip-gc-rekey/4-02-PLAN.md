@@ -150,7 +150,7 @@ objects multi-chunk. At 48 MiB of 256 KiB chunks a pack holds about 192 entries 
 in the thousands, so today it is slack rather than a limit.
 
 Write the test that keeps it that way, and build the case at **`PACK_MAX`**: fill a pack to
-`PACK_MAX` with the **smallest** blobs the format admits, serialize its header, and assert the
+`PACK_MAX` with the smallest blobs the format admits **in practice** — a sealed full `CHUNK_SIZE` chunk, i.e. ~192 entries at `PACK_MAX`. Do not read this as an unbounded sub-chunk blob: a header of hundreds of thousands of entries legitimately overflows one frame and would fail a guard that is meant to pass, serialize its header, and assert the
 header's JSON is comfortably inside one `CHUNK_SIZE` frame. Building the case at `PACK_TARGET`
 would understate the real worst case by half again, and a guard that understates its case is a
 guard that passes on the day it should fail. Name in the test's own doc comment that the upgrade
