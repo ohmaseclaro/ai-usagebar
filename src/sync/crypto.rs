@@ -22,8 +22,10 @@
 //! and run in microseconds, which keeps the AUR `check()` inside its time budget.
 //! Production passes [`KdfParams::default`]. Those parameters are bounded rather
 //! than trusted: [`MIN_KDF_MEMORY_KIB`] on the write path (with the floor itself
-//! as an argument, so the cheap seam survives it) and [`MAX_KDF_MEMORY_KIB`] on
-//! the read path, where `m_kib` arrives from a hostile remote.
+//! as an argument, so the cheap seam survives it) and [`MAX_KDF_MEMORY_KIB`]
+//! inside [`derive_kek`] itself, which every derivation routes through — so a
+//! caller reaching for the primitive directly with a hostile remote's `m_kib`
+//! is bounded too, rather than only the two paths that remembered to ask.
 //!
 //! Secret hygiene is structural, not aspirational: key material lives in
 //! `Zeroizing`, [`Keys`] has a hand-written `Debug` that prints `<redacted>`,
@@ -138,6 +140,9 @@ fn check_kdf_floor(m_kib: u32, min_m_kib: u32) -> Result<()> {
 ///
 /// Pure and clock-free, like everything else here. The parameters are public —
 /// they live in cleartext in the keyfile — so naming them is safe.
+///
+/// Private, and it stays private because [`derive_kek`] applies it to every
+/// derivation: an outside caller has nothing left to enforce by hand.
 fn check_kdf_ceiling(m_kib: u32) -> Result<()> {
     if m_kib <= MAX_KDF_MEMORY_KIB {
         return Ok(());
@@ -152,7 +157,20 @@ fn check_kdf_ceiling(m_kib: u32) -> Result<()> {
 }
 
 /// Password + salt -> key-encryption key.
+///
+/// **[`MAX_KDF_MEMORY_KIB`] is enforced here, not by the callers.** This is the
+/// one function every derivation routes through, including the idiom
+/// [`KdfDoc::params`] tells a caller to write —
+/// `derive_kek(pw, &salt, keyfile.kdf.params())`, whose `m_kib` is whatever a
+/// hostile remote put in the keyfile. The ceiling used to sit in `wrap` and in
+/// `unwrap_master_key` instead, which bounded two call sites rather than the
+/// rule: any third caller, in this crate or outside it, reached `argon2`
+/// 0.5.3's infallible `vec![]` and died in `handle_alloc_error` — an abort, in
+/// flat violation of the project's hard invariant that the widget always exits
+/// 0. A guard in the shared function is both the smaller diff and the only one
+/// a future caller cannot forget.
 pub fn derive_kek(pw: &[u8], salt: &[u8; 16], k: KdfParams) -> Result<Zeroizing<[u8; 32]>> {
+    check_kdf_ceiling(k.m_kib)?;
     let params = Params::new(k.m_kib, k.t, k.p, Some(32)).map_err(|_| {
         // The parameters are public (they live in cleartext in the keyfile), so
         // naming them is safe and is the only actionable thing to say.
@@ -384,8 +402,10 @@ impl Keyfile {
     }
 
     fn wrap(mk: &[u8; 32], pw: &[u8], k: KdfParams, min_m_kib: u32) -> Result<Keyfile> {
+        // The floor only. The ceiling is `derive_kek`'s, a few lines down, and
+        // repeating it here would be a second copy of one rule — the shape that
+        // let a third caller past it in the first place.
         check_kdf_floor(k.m_kib, min_m_kib)?;
-        check_kdf_ceiling(k.m_kib)?;
 
         let mut salt = [0u8; 16];
         let mut nonce = [0u8; NONCE_LEN];
@@ -414,11 +434,11 @@ impl Keyfile {
     }
 
     fn unwrap_master_key(&self, pw: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
-        // Both gates run *before* any cryptographic work: refusing a too-new
-        // bundle must not cost 1.5 s and a gibibyte first, and refusing an
-        // absurd working set must not cost the allocation it is refusing.
+        // Before any cryptographic work: refusing a too-new bundle must not cost
+        // 1.5 s and a gibibyte first. The absurd-working-set gate is one layer
+        // down in `derive_kek`, which is still ahead of every allocation — the
+        // only thing between here and there is base64 decoding.
         check_version(self.format, MAX_SUPPORTED_KEYFILE, "keyfile")?;
-        check_kdf_ceiling(self.kdf.m_kib)?;
 
         let salt = self.kdf.salt_bytes()?;
         let nonce = self.nonce_bytes()?;
@@ -691,8 +711,8 @@ pub fn content_address(bytes: &[u8]) -> ChunkId {
 ///
 /// This is the *pre-flight*, for a surface that knows how much memory it has and
 /// can print something a user can act on. It is not the safety net:
-/// `check_kdf_ceiling` is, it runs inside [`Keyfile::open`] with no dependency
-/// on a caller remembering anything, and it does not read the machine.
+/// `check_kdf_ceiling` is, it runs inside [`derive_kek`] with no dependency on a
+/// caller remembering anything, and it does not read the machine.
 pub fn check_memory_budget(m_kib: u32, available_kib: u64) -> Result<()> {
     if u64::from(m_kib) <= available_kib {
         return Ok(());
@@ -1121,6 +1141,33 @@ mod tests {
         // Untouched, it still opens, so the refusal above is the gate rather
         // than a keyfile that never worked.
         assert!(keyfile.open(b"a hostile remote").is_ok());
+    }
+
+    /// The ceiling belongs to `derive_kek`, not to the two paths that used to
+    /// remember it.
+    ///
+    /// `KdfDoc::params` is public and its own doc tells callers to use the
+    /// keyfile's stored parameters, so this is the *recommended* idiom written
+    /// out — with the `m_kib` a hostile remote chose. Guarding `wrap` and
+    /// `unwrap_master_key` instead left exactly this line reaching argon2
+    /// 0.5.3's infallible `vec![]`, which aborts rather than errors.
+    #[test]
+    fn derive_kek_refuses_the_ceiling_itself_rather_than_trusting_its_callers() {
+        let (keyfile, _) =
+            Keyfile::create_with_floor(b"a hostile remote", CHEAP, CHEAP.m_kib).unwrap();
+        let mut absurd = keyfile.clone();
+        absurd.kdf.m_kib = u32::MAX;
+
+        let err = derive_kek(b"a hostile remote", &[0u8; 16], absurd.kdf.params())
+            .expect_err("the documented idiom must not reach a 4 TiB allocation")
+            .to_string();
+        assert!(err.contains("ceiling this build will allocate"), "{err}");
+        // …and the message names no secret: the parameters are cleartext in the
+        // keyfile, the password is not in it.
+        assert!(!err.contains("a hostile remote"), "{err}");
+
+        // The honest parameters still derive, so the refusal is the gate.
+        assert!(derive_kek(b"a hostile remote", &[0u8; 16], keyfile.kdf.params()).is_ok());
     }
 
     #[test]
