@@ -284,9 +284,17 @@ impl IndexObject {
 /// data and cannot be edited in transit. They are repeated here because the root
 /// is the *first* object a reader touches, so an unknown chunker or an
 /// unsupported KDF configuration can be refused before a single pack is fetched.
-/// A mismatch between the two copies is a signal worth reporting rather than
-/// silently preferring one: the keyfile wins, but the disagreement itself means
-/// somebody rewrote something.
+///
+/// **The two copies are not compared, and this build does not claim to.** An
+/// earlier draft of this doc said a disagreement was "worth reporting"; nothing
+/// reported it, and describing behaviour that does not exist is worse than
+/// describing none. Comparing them would need a warning channel `src/sync/` does
+/// not have — it is pure, and an *error* would contradict "the keyfile wins" by
+/// making a cosmetic disagreement unreadable. Nor is a disagreement reachable by
+/// an attacker: `kdf` sits inside the root's authenticated plaintext, and the
+/// keyfile's copy is AAD-bound, so only the key holder's own writer can produce
+/// one. Whichever phase gains a warning channel may add the comparison there;
+/// until then a reader uses the keyfile's parameters, full stop.
 ///
 /// `manifest_chunks` is ordered and is the only place the manifest's chunk order
 /// is recorded. It is a list rather than a single id because a real bundle's

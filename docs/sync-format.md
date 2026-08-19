@@ -393,9 +393,10 @@ content address of its own — hence the fixed AAD literal.
   the KDF parameters is the keyfile's, where they are bound as associated data
   and cannot be edited in transit. They are repeated here because the root is
   the *first* object a reader touches, so an unknown chunker or an unsupported
-  KDF configuration can be refused before a single pack is fetched. If the two
-  copies disagree the keyfile wins — but the disagreement itself is worth
-  reporting, because it means somebody rewrote something.
+  KDF configuration can be refused before a single pack is fetched. A reader
+  uses the keyfile's parameters and is not required to compare the two copies —
+  `kdf` here sits inside the root's authenticated plaintext and the keyfile's is
+  AAD-bound, so a disagreement is not something a remote can manufacture.
 - `manifest_chunks` is ordered, and is the only place the manifest's chunk order
   is recorded.
 
