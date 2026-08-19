@@ -53,14 +53,15 @@
 //!   extension, then asserts usage percent and plan. Set
 //!   `SUPERGROK_GROK_BINARY` to the trusted official executable.
 //!
-//! ## Calibration probes (encrypted sync, plan 1-08)
+//! ## Calibration probes (encrypted sync, plans 1-08 and 2-06)
 //!
-//! Two probes at the bottom of this file are not vendor smoke tests. They
+//! Four probes at the bottom of this file are not vendor smoke tests. They
 //! answer sizing questions the encrypted-sync format would otherwise have to
 //! guess at, and they live here because this is where the project keeps every
 //! test allowed to cost real seconds, real gibibytes, or a real network call —
 //! all of it behind `#[ignore]`, so `cargo test` and the AUR `check()` run
-//! neither.
+//! neither. Their measured answers are written down in
+//! `docs/sync-calibration.md`; re-run one when its answer goes stale.
 //!
 //! - **CAL-3**, `cal3_argon2id_timing_at_production_parameters`: what Argon2id
 //!   actually costs at the shipped m = 1 GiB / t = 3 / p = 1, plus the two
@@ -72,6 +73,18 @@
 //!   Credential-gated and skips cleanly when unset — see its own doc comment
 //!   for the three variables and `docs/sync-format.md` for what the answer
 //!   changes.
+//! - **CAL-2**, `cal2_desktop_state_chunk_stability`: how much of a profile's
+//!   `desktop-state/` is new bytes the next time claude-acc captures it, which
+//!   decides whether `credentials` dominates the daily sync cost. Records a
+//!   digest snapshot per invocation and diffs against the previous one, so the
+//!   capture is the user's to make and the probe never forces one. Note it is
+//!   an *account switch*, not an app restart, that rewrites those bytes:
+//!   `AI_USAGEBAR_CAL2_PROFILE=… AI_USAGEBAR_CAL2_SNAPSHOT=… cargo test --test
+//!   live -- --ignored --nocapture cal2_`
+//! - **CAL-4**, `cal4_default_bundle_compressed_size`: the real zstd-compressed
+//!   and sealed size of this machine's default bundle, per category. Needs no
+//!   credential and no network:
+//!   `cargo test --release --test live -- --ignored --nocapture cal4_`
 
 use std::time::Duration;
 
@@ -819,4 +832,438 @@ fn header_value(response: &reqwest::Response, name: &str) -> Option<String> {
         .get(name)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string)
+}
+
+// ---------------------------------------------------------------------------
+// Calibration probes — bundle scope and sizing, plan 2-06.
+// ---------------------------------------------------------------------------
+
+/// **CAL-2** — how much of a profile's `desktop-state/` is new bytes the next
+/// time it is written?
+///
+/// It decides whether `credentials` dominates the *daily* cost of a sync. The
+/// category is ~24 MB across this machine's four profiles, and if each rewrite
+/// is wholesale then each rewrite re-uploads all of it, which is a sentence
+/// `sync status` owes the user.
+///
+/// **Read the trigger carefully, because the obvious one is wrong.** What the
+/// bundle carries is not Claude Desktop's live data dir: it is
+/// `~/.claude-acc/profiles/<label>/desktop-state/`, a *snapshot copy* that
+/// [`crate::claude_desktop`]'s `snapshot_profile` stages into a tempdir and
+/// renames into place when an account is switched away from — with the app
+/// already quit. Quitting and relaunching Claude Desktop therefore does not
+/// touch these bytes at all; only a capture does. Measuring across a plain
+/// restart would report 0% churn and mean nothing by it, so the second run has
+/// to sit on the far side of an account switch.
+///
+/// The probe hashes each file under an injected `desktop-state/` root at fixed
+/// 256 KiB offsets and records the digests. Run it again later and it compares
+/// against what it recorded. Deliberately `sha2` rather than Phase 1's keyed
+/// BLAKE3: the question is whether the *same offsets still hold the same bytes*,
+/// which is a property of the boundaries, not of the function that names them —
+/// so this stays independent of the sync key material entirely.
+///
+/// **It never restarts, quits or switches anything.** Two invocations separated
+/// by whatever the user does on their own schedule is the whole protocol:
+///
+/// ```bash
+/// # 1. before — writes the baseline
+/// AI_USAGEBAR_CAL2_PROFILE=~/.claude-acc/profiles/<label>/desktop-state \
+/// AI_USAGEBAR_CAL2_SNAPSHOT=~/.cache/ai-usagebar-cal2/<label>.json \
+///   cargo test --release --test live -- --ignored --nocapture cal2_
+/// # 2. use Claude Desktop on that account, then switch away from it — that
+/// #    switch is what re-captures the profile
+/// # 3. after — same two variables, same snapshot path: prints the churn
+/// ```
+///
+/// Output is counts and digests only: no file body, no path outside the
+/// injected root, no account label (T-2-25). Skips with a printed message when
+/// either variable is unset, so it is never a hard failure.
+#[test]
+#[ignore = "calibration; reads a real Claude Desktop profile — run with --ignored --nocapture"]
+fn cal2_desktop_state_chunk_stability() {
+    let (Some(root), Some(snapshot)) = (
+        non_empty_var("AI_USAGEBAR_CAL2_PROFILE"),
+        non_empty_var("AI_USAGEBAR_CAL2_SNAPSHOT"),
+    ) else {
+        eprintln!(
+            "cal2_desktop_state_chunk_stability: needs AI_USAGEBAR_CAL2_PROFILE (a \
+             profile's desktop-state/ directory) and AI_USAGEBAR_CAL2_SNAPSHOT (a \
+             scratch .json path) — skipping. Run it once, let an account switch \
+             re-capture that profile, run it again; see docs/sync-calibration.md \
+             for the fallback that applies until then."
+        );
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let snapshot = std::path::PathBuf::from(snapshot);
+    if !root.is_dir() {
+        eprintln!(
+            "cal2_desktop_state_chunk_stability: AI_USAGEBAR_CAL2_PROFILE is not a \
+             directory — skipping"
+        );
+        return;
+    }
+
+    let current = cal2_scan(&root);
+    let bytes: u64 = current.values().map(|(_, len)| *len).sum();
+    let files = cal2_paths(&current).len();
+    println!(
+        "CAL-2 — {files} files, {} windows, {bytes} bytes under the injected root",
+        current.len()
+    );
+
+    let Some(previous) = cal2_load(&snapshot) else {
+        cal2_store(&snapshot, &current);
+        println!("  no prior snapshot — baseline written to the given path.");
+        println!("  Use Claude Desktop on this account and then switch away from it —");
+        println!("  the switch is what re-captures the profile — and re-run this");
+        println!("  exact command for the churn figure. A plain app restart will not");
+        println!("  move these bytes and would only produce a meaningless 0%.");
+        return;
+    };
+
+    let unchanged = current
+        .iter()
+        .filter(|(key, value)| previous.get(*key) == Some(value))
+        .count();
+    let changed = current.len() - unchanged;
+    let changed_bytes: u64 = current
+        .iter()
+        .filter(|(key, value)| previous.get(*key) != Some(value))
+        .map(|(_, (_, len))| *len)
+        .sum();
+
+    let before = cal2_paths(&previous);
+    let after = cal2_paths(&current);
+    let appeared: Vec<_> = after.difference(&before).cloned().collect();
+    let disappeared: Vec<_> = before.difference(&after).cloned().collect();
+
+    let pct = |n: usize| {
+        if current.is_empty() {
+            0.0
+        } else {
+            n as f64 * 100.0 / current.len() as f64
+        }
+    };
+    println!(
+        "  windows {} total, {unchanged} unchanged ({:.1}%), {changed} changed ({:.1}%), \
+         {changed_bytes} bytes changed",
+        current.len(),
+        pct(unchanged),
+        pct(changed),
+    );
+    println!(
+        "  files {} appeared, {} disappeared",
+        appeared.len(),
+        disappeared.len()
+    );
+    // Relative names only — the injected root is never reprinted.
+    for name in appeared.iter().take(20) {
+        println!("    + {name}");
+    }
+    for name in disappeared.iter().take(20) {
+        println!("    - {name}");
+    }
+    if changed == 0 && appeared.is_empty() && disappeared.is_empty() {
+        // Not an answer. `snapshot_profile` renames a freshly staged copy into
+        // place, so a re-captured profile always has *some* new bytes — an
+        // identical tree means no capture happened between the two runs.
+        println!(
+            "  CAL-2 = INCONCLUSIVE: byte-for-byte identical, so this profile was \
+             not re-captured between the two runs. Switch away from this account \
+             (or run a capture) and re-run; do not record 0% as the answer."
+        );
+    } else if changed_bytes * 2 > bytes {
+        println!(
+            "  CAL-2 = the category churns wholesale. `sync status` must say that \
+             credentials re-uploads most of itself whenever the profile is captured."
+        );
+    } else {
+        println!(
+            "  CAL-2 = the rewrite is partial. Dedup carries most of the category \
+             across a capture."
+        );
+    }
+    cal2_store(&snapshot, &current);
+}
+
+/// `(relative path, window index) -> (hex sha-256, window length)`.
+type Cal2Windows = std::collections::BTreeMap<(String, u32), (String, u64)>;
+
+/// Hash every file under `root` at fixed 256 KiB offsets. Reads in one window
+/// at a time so a large LevelDB table never lands in memory whole.
+fn cal2_scan(root: &std::path::Path) -> Cal2Windows {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    use std::io::Read as _;
+
+    let mut out = Cal2Windows::new();
+    let mut files = Vec::new();
+    cal2_walk(root, &mut files);
+    for path in files {
+        let name = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .into_owned();
+        let Ok(mut file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        // Zeroized: this window may be a slice of a saved OAuth token.
+        let mut buf = zeroize::Zeroizing::new(vec![0u8; ai_usagebar::sync::CHUNK_SIZE]);
+        let mut index = 0u32;
+        loop {
+            let mut filled = 0usize;
+            // `read` may return short of the buffer without being at EOF.
+            while filled < buf.len() {
+                match file.read(&mut buf[filled..]) {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(_) => break,
+                }
+            }
+            if filled == 0 && index > 0 {
+                break;
+            }
+            let mut hex = String::with_capacity(64);
+            for byte in Sha256::digest(&buf[..filled]) {
+                let _ = write!(hex, "{byte:02x}");
+            }
+            out.insert((name.clone(), index), (hex, filled as u64));
+            if filled < buf.len() {
+                // A short read that reached EOF: an empty file still records
+                // one zero-length window so it stays visible in the file count.
+                break;
+            }
+            index += 1;
+        }
+    }
+    out
+}
+
+/// Regular files under `dir`, depth-first. `DirEntry::file_type` does not
+/// follow symlinks, so a link planted in the store cannot pull in a host tree.
+fn cal2_walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            cal2_walk(&entry.path(), out);
+        } else if kind.is_file() {
+            out.push(entry.path());
+        }
+    }
+}
+
+fn cal2_paths(windows: &Cal2Windows) -> std::collections::BTreeSet<String> {
+    windows.keys().map(|(name, _)| name.clone()).collect()
+}
+
+fn cal2_load(path: &std::path::Path) -> Option<Cal2Windows> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&text).ok()?;
+    let mut out = Cal2Windows::new();
+    for row in rows {
+        let (Some(name), Some(index), Some(digest), Some(len)) = (
+            row["path"].as_str(),
+            row["window_index"].as_u64(),
+            row["hex_digest"].as_str(),
+            row["len"].as_u64(),
+        ) else {
+            continue;
+        };
+        out.insert((name.to_string(), index as u32), (digest.to_string(), len));
+    }
+    Some(out)
+}
+
+fn cal2_store(path: &std::path::Path, windows: &Cal2Windows) {
+    let rows: Vec<serde_json::Value> = windows
+        .iter()
+        .map(|((name, index), (digest, len))| {
+            serde_json::json!({
+                "path": name,
+                "window_index": index,
+                "hex_digest": digest,
+                "len": len,
+            })
+        })
+        .collect();
+    if let Err(e) = std::fs::write(
+        path,
+        serde_json::to_vec(&rows).expect("a digest list always serialises"),
+    ) {
+        eprintln!("  could not write the snapshot: {e}");
+    }
+}
+
+/// **CAL-4** — what the default bundle actually costs once compressed.
+///
+/// The research's ~33 MB comes from applying an assumed 4-5x ratio to a raw
+/// figure. This measures this machine's real bytes through the real collectors
+/// and Phase 1's real framing, because SCOPE-03 shows the number *before* the
+/// first push and an estimate that flatters the payload is worse than none.
+///
+/// Per window it runs [`ai_usagebar::sync::chunk::frame`] — zstd level 3, then
+/// the power-of-two pad that hides tail lengths — and adds the 40 bytes every
+/// seal appends (24-byte nonce, 16-byte Poly1305 tag). So the "stored" column
+/// is the ciphertext that would really be uploaded, padding included; the
+/// "zstd" column beside it is the compressor's own output, which is the honest
+/// place to read a ratio off.
+///
+/// ```bash
+/// cargo test --release --test live -- --ignored --nocapture cal4_
+/// AI_USAGEBAR_CAL4_ALL=1 cargo test --release --test live -- --ignored --nocapture cal4_
+/// ```
+///
+/// The variable forces every category on, including opt-in transcripts, so the
+/// one category big enough to matter can be calibrated without editing the
+/// user's `config.toml`. Without it the probe measures exactly what
+/// `config.toml` selects — the real default bundle.
+#[test]
+#[ignore = "calibration; reads this machine's real bundle — run with --ignored --nocapture"]
+fn cal4_default_bundle_compressed_size() {
+    use ai_usagebar::config::{Config, SyncCategory};
+    use ai_usagebar::sync::{CHUNK_SIZE, SyncRoots, chunk, scope};
+
+    /// 24-byte XChaCha20 nonce stored inline + 16-byte Poly1305 tag.
+    const SEAL_OVERHEAD: u64 = 40;
+
+    let config = match Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("cal4_default_bundle_compressed_size: config unreadable ({e}) — skipping");
+            return;
+        }
+    };
+    let roots = match SyncRoots::resolve(&config) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("cal4_default_bundle_compressed_size: roots unresolvable ({e}) — skipping");
+            return;
+        }
+    };
+    let mut cfg = config.sync.clone();
+    let forced = non_empty_var("AI_USAGEBAR_CAL4_ALL").is_some();
+    if forced {
+        cfg.categories = SyncCategory::ALL.to_vec();
+    }
+
+    println!(
+        "CAL-4 — {}/{}, {} profile, {}{}",
+        std::env::consts::ARCH,
+        std::env::consts::OS,
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
+        chrono::Utc::now().format("%Y-%m-%d"),
+        if forced {
+            ", AI_USAGEBAR_CAL4_ALL=1 (every category, not the default bundle)"
+        } else {
+            ", the configured default bundle"
+        },
+    );
+    println!(
+        "  {:<12} {:>7} {:>14} {:>14} {:>14} {:>7}",
+        "category", "files", "raw", "zstd", "stored", "ratio"
+    );
+
+    let now = chrono::Utc::now();
+    let (mut all_files, mut all_raw, mut all_zstd, mut all_stored) = (0usize, 0u64, 0u64, 0u64);
+    for cat in SyncCategory::ALL {
+        if !cfg.includes(cat) {
+            continue;
+        }
+        let scan = scope::collect(cat, &roots, &cfg, now);
+        let (mut raw, mut zstd_bytes, mut stored, mut unreadable) = (0u64, 0u64, 0u64, 0usize);
+        for entry in &scan.files {
+            // Zeroized: `credentials` is literally a pile of OAuth tokens.
+            let Ok(bytes) = std::fs::read(&entry.path).map(zeroize::Zeroizing::new) else {
+                unreadable += 1;
+                continue;
+            };
+            raw += bytes.len() as u64;
+            for window in bytes.chunks(CHUNK_SIZE) {
+                let framed = chunk::frame(window).expect("a <=CHUNK_SIZE window always frames");
+                // Bytes 4..8 of the frame are zstd's own output length.
+                zstd_bytes += u32::from_le_bytes(framed[4..8].try_into().expect("4 bytes")) as u64;
+                stored += framed.len() as u64 + SEAL_OVERHEAD;
+            }
+        }
+        println!(
+            "  {:<12} {:>7} {:>14} {:>14} {:>14} {:>6.2}x",
+            cat.label(),
+            scan.files.len(),
+            human(raw),
+            human(zstd_bytes),
+            human(stored),
+            ratio(raw, stored),
+        );
+        if unreadable > 0 || scan.skipped > 0 || scan.walk_capped {
+            println!(
+                "    ({unreadable} unreadable, {} skipped by the walker, walk_capped={})",
+                scan.skipped, scan.walk_capped
+            );
+        }
+        if scan.excluded_files > 0 {
+            println!(
+                "    (bounds dropped {} files / {} — D3's byte budget, not the day window)",
+                scan.excluded_files,
+                human(scan.excluded_bytes),
+            );
+        }
+        all_files += scan.files.len();
+        all_raw += raw;
+        all_zstd += zstd_bytes;
+        all_stored += stored;
+    }
+    println!(
+        "  {:<12} {:>7} {:>14} {:>14} {:>14} {:>6.2}x",
+        "TOTAL",
+        all_files,
+        human(all_raw),
+        human(all_zstd),
+        human(all_stored),
+        ratio(all_raw, all_stored),
+    );
+    println!(
+        "  zstd alone would be {} ({:.2}x); padding and per-chunk seal overhead add {}.",
+        human(all_zstd),
+        ratio(all_raw, all_zstd),
+        human(all_stored.saturating_sub(all_zstd)),
+    );
+    assert!(
+        all_stored > 0 || all_files == 0,
+        "a non-empty bundle must produce sealed bytes"
+    );
+}
+
+fn ratio(raw: u64, packed: u64) -> f64 {
+    if packed == 0 {
+        0.0
+    } else {
+        raw as f64 / packed as f64
+    }
+}
+
+fn human(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.2} {}", UNITS[unit])
+    }
 }
