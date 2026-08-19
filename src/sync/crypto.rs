@@ -636,4 +636,201 @@ mod tests {
         let keys = keys();
         assert_eq!(format!("{keys:?}"), "Keys { <redacted> }");
     }
+
+    #[test]
+    fn a_root_sealed_twice_differs_but_both_copies_reopen() {
+        let keys = keys();
+        let plaintext = b"counter=7".as_slice();
+        let first = keys.seal_root(plaintext).unwrap();
+        let second = keys.seal_root(plaintext).unwrap();
+
+        // Fresh random nonce per seal: the root's plaintext changes every sync,
+        // so deterministic sealing would leak equality between snapshots.
+        assert_ne!(first, second);
+        assert_eq!(&*keys.open_root(&first).unwrap(), plaintext);
+        assert_eq!(&*keys.open_root(&second).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn the_root_path_uses_the_root_subkey_and_not_the_chunk_subkey() {
+        let alice = keys();
+        // Same chunk and name subkeys, different root subkey. If `seal_root`
+        // reached for `chunk`, this would open — and `root_key` would be dead.
+        let mallory = Keys {
+            chunk: alice.chunk.clone(),
+            name: alice.name.clone(),
+            root: Zeroizing::new([0x5a; 32]),
+        };
+        let sealed = alice.seal_root(b"counter=7").unwrap();
+        assert!(mallory.open_root(&sealed).is_err());
+        assert!(alice.open_root(&sealed).is_ok());
+    }
+
+    #[test]
+    fn a_root_shorter_than_a_nonce_and_a_tag_errors_instead_of_panicking() {
+        let keys = keys();
+        for len in [0, 1, NONCE_LEN, NONCE_LEN + TAG_LEN - 1] {
+            assert!(
+                keys.open_root(&vec![0u8; len]).is_err(),
+                "a {len}-byte root must be refused, not indexed into"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrap_under_a_new_password_preserves_the_subkeys() {
+        let (keyfile, original) = Keyfile::create(b"first password", CHEAP).unwrap();
+        let rewrapped = keyfile
+            .rewrap(b"first password", b"second password", CHEAP)
+            .unwrap();
+
+        // A fresh salt and nonce, so the bytes differ …
+        assert_ne!(keyfile.kdf.salt, rewrapped.kdf.salt);
+        assert_ne!(keyfile.wrapped_master_key, rewrapped.wrapped_master_key);
+
+        // … but the same master key is underneath, so no data needs re-encrypting.
+        let opened = rewrapped.open(b"second password").unwrap();
+        assert_eq!(*opened.chunk, *original.chunk);
+        assert_eq!(*opened.name, *original.name);
+        assert_eq!(*opened.root, *original.root);
+
+        // The old password no longer opens the *new* keyfile.
+        assert!(rewrapped.open(b"first password").is_err());
+    }
+
+    #[test]
+    fn rewrap_with_the_wrong_old_password_produces_no_keyfile() {
+        let (keyfile, _) = Keyfile::create(b"first password", CHEAP).unwrap();
+        assert!(
+            keyfile
+                .rewrap(b"guessed wrong", b"second password", CHEAP)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_keyfile_opens_with_its_own_stored_parameters_not_the_compiled_default() {
+        let stored = KdfParams {
+            m_kib: 16,
+            t: 2,
+            p: 1,
+        };
+        // The point of the test: the production default is 1 GiB / t=3, so a
+        // keyfile that opens here proves the stored parameters are what got used.
+        assert_eq!(KdfParams::default().m_kib, 1_048_576);
+        assert_ne!(stored, KdfParams::default());
+
+        let (keyfile, _) = Keyfile::create(b"stored params please", stored).unwrap();
+        assert_eq!(keyfile.kdf.params(), stored);
+        assert!(keyfile.open(b"stored params please").is_ok());
+    }
+
+    #[test]
+    fn kdf_parameters_edited_in_transit_fail_to_unwrap() {
+        let (keyfile, _) = Keyfile::create(b"in transit", CHEAP).unwrap();
+
+        // An attacker downgrading the work factor on the wire. The parameters
+        // are bound as AEAD associated data, so the KEK they now describe is not
+        // the KEK the master key was wrapped under.
+        let mut tampered = keyfile.clone();
+        tampered.kdf.m_kib = 16;
+        assert!(tampered.open(b"in transit").is_err());
+
+        let mut retagged = keyfile.clone();
+        retagged.kdf.algo = "argon2i".into();
+        assert!(retagged.open(b"in transit").is_err());
+
+        // Untouched, it still opens — so the failures above are the binding, not
+        // a broken round trip.
+        assert!(keyfile.open(b"in transit").is_ok());
+    }
+
+    #[test]
+    fn a_keyfile_above_the_read_ceiling_is_refused_before_any_cryptographic_work() {
+        let (keyfile, _) = Keyfile::create(b"future bundle", CHEAP).unwrap();
+
+        // At the ceiling: accepted.
+        assert_eq!(keyfile.format, MAX_SUPPORTED_KEYFILE);
+        assert!(keyfile.open(b"future bundle").is_ok());
+
+        // One above, and written by a future client at the production 1 GiB
+        // parameters. If the version gate ever moved below `derive_kek`, this
+        // test would allocate a gibibyte instead of returning instantly.
+        let mut from_the_future = keyfile.clone();
+        from_the_future.format = MAX_SUPPORTED_KEYFILE + 1;
+        from_the_future.kdf.m_kib = KdfParams::default().m_kib;
+        from_the_future.kdf.t = KdfParams::default().t;
+        let err = from_the_future
+            .open(b"future bundle")
+            .expect_err("a newer format must be refused")
+            .to_string();
+        assert!(err.contains("upgrade ai-usagebar"));
+    }
+
+    #[test]
+    fn the_memory_budget_refuses_actionably_instead_of_letting_argon2_oom() {
+        let err = check_memory_budget(1_048_576, 900_000)
+            .expect_err("1 GiB must not be attempted on a 900 MiB budget")
+            .to_string();
+        assert!(err.contains("--kdf-memory"));
+        assert!(err.contains("1024 MiB"));
+        assert!(err.contains("878 MiB"));
+
+        assert!(check_memory_budget(1_048_576, 4_000_000).is_ok());
+        // Exactly enough is enough.
+        assert!(check_memory_budget(1_048_576, 1_048_576).is_ok());
+    }
+
+    #[test]
+    fn content_address_is_unkeyed_and_therefore_key_independent() {
+        // Naming-only: it must never address a *sealed* object, or it becomes a
+        // confirmation-of-plaintext oracle for anyone holding the repository.
+        let public_bytes = b"already-public ciphertext".as_slice();
+        assert_eq!(content_address(public_bytes), content_address(public_bytes));
+        // Two unrelated key hierarchies produce the same address, which is the
+        // whole difference from `chunk_id`.
+        assert_ne!(keys().chunk_id(public_bytes), content_address(public_bytes));
+        assert_ne!(keys().chunk_id(public_bytes), keys().chunk_id(public_bytes));
+    }
+
+    #[test]
+    fn only_the_crypto_module_imports_the_cryptographic_crates() {
+        // Resolved from CARGO_MANIFEST_DIR, not a relative path, so the test is
+        // independent of the working directory and survives the AUR `srcdir`
+        // layout. This invariant is what lets a security auditor read one file
+        // instead of six.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sync");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).expect("src/sync must exist") {
+            let path = entry.expect("readable directory entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            if path.file_name().and_then(|n| n.to_str()) == Some("crypto.rs") {
+                continue;
+            }
+            checked += 1;
+            let source = std::fs::read_to_string(&path).expect("readable module");
+            for line in source.lines() {
+                let trimmed = line.trim_start();
+                // Match on the leading `use` token, so prose in a doc comment
+                // naming these crates can never trip the gate.
+                let Some(imported) = trimmed.strip_prefix("use ") else {
+                    continue;
+                };
+                for crate_name in ["argon2", "chacha20poly1305"] {
+                    assert!(
+                        !imported.starts_with(crate_name),
+                        "{} imports {crate_name} directly; every cryptographic \
+                         call belongs in src/sync/crypto.rs",
+                        path.display()
+                    );
+                }
+            }
+        }
+        assert!(
+            checked >= 6,
+            "expected mod.rs plus the five sibling modules"
+        );
+    }
 }
