@@ -156,6 +156,19 @@ pub enum Command {
         #[command(subcommand)]
         action: SettingsAction,
     },
+
+    /// Encrypted sync of local Claude state to a private remote.
+    Sync {
+        #[command(subcommand)]
+        action: SyncAction,
+    },
+}
+
+#[derive(clap::Subcommand, Debug, Clone)]
+pub enum SyncAction {
+    /// What sync would carry: per-category file counts and raw bytes, plus
+    /// when it last ran. Reads only — nothing is uploaded or written.
+    Status,
 }
 
 #[derive(clap::Subcommand, Debug, Clone)]

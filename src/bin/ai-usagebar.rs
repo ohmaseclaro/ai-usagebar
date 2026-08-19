@@ -13,6 +13,10 @@ fn main() {
     if let Some(Command::Settings { action }) = &cli.command {
         std::process::exit(ai_usagebar::tui::settings::run_cli(action));
     }
+    // Local filesystem scanning only — no network call, so no runtime needed.
+    if let Some(Command::Sync { action }) = &cli.command {
+        std::process::exit(ai_usagebar::sync::cli::run(action));
+    }
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

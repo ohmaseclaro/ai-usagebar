@@ -25,6 +25,7 @@ pub fn default_path() -> Result<PathBuf> {
 /// production — [`default_path`] is the only thing that knows about `$HOME`.
 pub struct Index {
     conn: Connection,
+    path: PathBuf,
 }
 
 impl Index {
@@ -45,7 +46,16 @@ impl Index {
             [],
         )
         .map_err(|e| AppError::Other(format!("could not initialise {}: {e}", path.display())))?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// Where this index lives — so a report can name it without resolving
+    /// `$HOME` itself, which is what keeps the report builder hermetic.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// When the last successful sync completed, if the index knows. `None` is
