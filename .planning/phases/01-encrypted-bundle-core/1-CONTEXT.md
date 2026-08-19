@@ -75,3 +75,20 @@ Surface it in the UI as a deliberate wait ("deriving key…"), not a freeze.
   lower them knowingly rather than being locked out.
 - **CAL-1** — whether private-repo Release assets honour `Range:` (decides pack sizing). May be
   answered in Phase 3 once HTTP plumbing exists; if not, assume no `Range:` support.
+
+---
+
+## Risk propagated from plan 1-02 (recorded during execution)
+
+**Ordering integrity is the manifest's job, and `1-04` must own it explicitly.**
+
+Plan 1-02 established, with a test, that transposing two whole `(id, ciphertext)` pairs
+*cannot* be detected at the chunk layer: a chunk carries no position, so a swapped pair
+decrypts cleanly and still hashes to its own id. The only observable is a reordered buffer.
+
+CRYPTO-05 names reordering as a thing that must be detected. That detection therefore lives in
+the manifest (`1-04`) — the ordered chunk list is the only place position exists — and `1-06`
+Attack 8 is the test that proves it. `1-04` must treat this as its own requirement rather than
+assume it inherited it from the chunk layer, which demonstrably cannot provide it.
+
+`reassemble`'s doc comment in `chunk.rs` states the boundary.
