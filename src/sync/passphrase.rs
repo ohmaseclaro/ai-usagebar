@@ -2,4 +2,337 @@
 //! default) and the 12-character floor applied to a user-supplied one, with the
 //! offline-attack cost explained rather than asserted.
 //!
+//! **Why the floor is higher than a login form's.** A login form is rate
+//! limited; this is not. The encrypted bundle lives in a git repository, so an
+//! attacker who obtains it can guess offline, forever, on hardware they own. At
+//! roughly 10^5 Argon2id guesses per second — the rate the locked parameters
+//! buy — a century of grinding covers about 2^55 candidates. Every human-chosen
+//! password worth remembering is inside that. That is why [`generate`] is the
+//! default path and a user-supplied password is the exception, and why
+//! [`OFFLINE_ATTACK_NOTE`] explains the risk in words rather than printing a
+//! rule.
+//!
+//! **Only three ways a password enters the process:** a reader ([`read_line`],
+//! for a pipe or stdin), a mode-0600 file ([`read_from_file`]), and a TTY
+//! prompt, which belongs to whichever surface owns the terminal and is
+//! deliberately not here. There is no function taking a password from a
+//! command-line argument or from the environment: argv is world-readable
+//! through `/proc`, environment values are inherited by children and land in
+//! crash dumps, and the project already forbids credentials in process
+//! arguments. `no_password_input_path_reads_the_process_environment` enforces
+//! that.
+//!
+//! Every password returned from this module lives in `Zeroizing`. No error here
+//! interpolates one — a failure says what could not be read, never what was
+//! read.
+//!
 //! Owned by plan 1-05.
+
+use std::io::BufRead;
+use std::path::Path;
+
+use zeroize::Zeroizing;
+
+use crate::error::{AppError, Result};
+
+/// Crockford base32: the digits and uppercase letters minus `I`, `L`, `O` and
+/// `U`, so nothing in a generated passphrase can be misread off a screen or
+/// mis-typed from a note.
+const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/// Characters in a generated passphrase. 20 × 5 bits = exactly 100 bits, which
+/// is past the point where the offline attack in the module docs matters.
+const GENERATED_CHARS: usize = 20;
+
+/// Below this a supplied password is refused outright.
+pub const MIN_CHARS: usize = 12;
+
+/// Below this a supplied password is accepted with a warning.
+pub const RECOMMENDED_CHARS: usize = 20;
+
+/// Printed by every surface that sets a password, before it is set.
+pub const NO_RECOVERY: &str = "\
+There is no recovery. No reset link, no support address, no escrow copy, no \
+back door. If you lose this password the bundle is permanently unreadable and \
+its contents are gone — by design, because that is the only way a hosted \
+backup can be safe to hand to a server you do not control.";
+
+/// Printed alongside [`NO_RECOVERY`] whenever the user supplies their own
+/// password instead of taking a generated one (CRYPTO-06 requires the risk
+/// explained in plain language, not merely enforced).
+pub const OFFLINE_ATTACK_NOTE: &str = "\
+Your password is the only thing protecting this bundle. Anyone who gets a copy \
+of the repository — a service that hosts it, someone who forks it, anyone who \
+later gets into your account — can sit at their own machine and guess at it as \
+long as they like. There is nothing on the other end to lock them out after \
+three tries or to notice they are trying at all. That is why the length floor \
+exists, and why a generated passphrase is the recommended choice.";
+
+/// The message on a refusal.
+const TOO_SHORT: &str = "\
+Too short — at least 12 characters are required. A short password is guessed \
+offline in minutes; see the offline-attack note. Take the generated passphrase \
+instead if you have somewhere safe to keep it.";
+
+/// The message on a warning.
+const THIN: &str = "\
+Accepted, but thin. Six random words from the EFF diceware list — chosen by \
+dice or a generator, not by you — is about 77 bits and is the smallest thing \
+worth typing here. A generated passphrase is stronger still.";
+
+/// The verdict on a user-supplied password. Carries only fixed message text; it
+/// never holds or echoes the password.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Strength {
+    /// Below the hard floor. Do not proceed.
+    Rejected(&'static str),
+    /// Above the floor but below the recommendation. Proceed after showing the
+    /// message.
+    Weak(&'static str),
+    /// At or above the recommendation.
+    Strong,
+}
+
+/// Generate a passphrase: 20 Crockford base32 characters, exactly 100 bits,
+/// straight from the OS CSPRNG. This is the recommended path; a user-supplied
+/// password is the exception.
+///
+/// 13 bytes are drawn and the first 100 of those 104 uniform bits are consumed
+/// five at a time, so every character is an unbiased draw from the 32-character
+/// alphabet — no modulo bias, and no embedded wordlist to ship.
+pub fn generate() -> Result<Zeroizing<String>> {
+    let mut bytes = Zeroizing::new([0u8; 13]);
+    getrandom::fill(&mut bytes[..])
+        .map_err(|_| AppError::Other("the operating system random source is unavailable".into()))?;
+
+    let mut out = Zeroizing::new(String::with_capacity(GENERATED_CHARS));
+    for i in 0..GENERATED_CHARS {
+        let bit = i * 5;
+        let (byte, offset) = (bit / 8, bit % 8);
+        let window = u16::from(bytes[byte]) << 8 | u16::from(bytes[byte + 1]);
+        let index = ((window >> (11 - offset)) & 0x1f) as usize;
+        out.push(ALPHABET[index] as char);
+    }
+    Ok(out)
+}
+
+/// Judge a user-supplied password by length alone, measured in **characters**
+/// rather than bytes so a passphrase with non-ASCII is not flattered by its
+/// UTF-8 length.
+///
+/// Length is a floor, not a score: no entropy estimator can tell a memorable
+/// phrase from a leaked one, and pretending otherwise would hand the user a
+/// green checkmark for `correcthorsebattery`. The real control is [`generate`].
+pub fn check(pw: &str) -> Strength {
+    match pw.chars().count() {
+        n if n < MIN_CHARS => Strength::Rejected(TOO_SHORT),
+        n if n < RECOMMENDED_CHARS => Strength::Weak(THIN),
+        _ => Strength::Strong,
+    }
+}
+
+/// Read a password from a reader — a pipe, or stdin when the caller has already
+/// decided this is not an interactive terminal.
+///
+/// Only a single trailing newline (and the `\r` of a `\r\n` pair) is stripped.
+/// Nothing else is trimmed: a password may legitimately begin or end with a
+/// space, and silently eating it would make a correct password fail to open a
+/// bundle it created.
+pub fn read_line(mut r: impl BufRead) -> Result<Zeroizing<String>> {
+    let mut line = Zeroizing::new(String::new());
+    r.read_line(&mut line)
+        .map_err(|e| AppError::Other(format!("could not read the password: {e}")))?;
+    if line.ends_with('\n') {
+        line.pop();
+        if line.ends_with('\r') {
+            line.pop();
+        }
+    }
+    Ok(line)
+}
+
+/// Read a password from a file that only its owner can read.
+///
+/// The mode is checked on the *opened handle*, not the path, so the file that
+/// was inspected is the file that is read. Any group or other bit is a refusal:
+/// a password file another local user can read is not a password file.
+pub fn read_from_file(path: &Path) -> Result<Zeroizing<String>> {
+    let file = std::fs::File::open(path).map_err(|e| AppError::io_at(path, e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mode = file
+            .metadata()
+            .map_err(|e| AppError::io_at(path, e))?
+            .mode();
+        if mode & 0o077 != 0 {
+            return Err(AppError::Other(format!(
+                "the password file {} is group- or world-accessible (mode {:04o}); \
+                 run `chmod 600` on it before using it",
+                path.display(),
+                mode & 0o7777
+            )));
+        }
+    }
+    read_line(std::io::BufReader::new(file))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_generated_passphrase_is_twenty_crockford_characters_and_never_repeats() {
+        let a = generate().unwrap();
+        let b = generate().unwrap();
+        assert_eq!(a.chars().count(), 20);
+        assert!(
+            a.chars().all(|c| ALPHABET.contains(&(c as u8))),
+            "every character must come from the Crockford alphabet"
+        );
+        assert_ne!(*a, *b, "two draws from the CSPRNG must differ");
+    }
+
+    #[test]
+    fn every_alphabet_character_is_reachable() {
+        // Guards the five-bit slicing: an off-by-one in the shift would make
+        // whole regions of the alphabet unreachable and quietly cost entropy.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            seen.extend(generate().unwrap().chars());
+        }
+        assert_eq!(seen.len(), 32, "all 32 characters must be reachable");
+    }
+
+    #[test]
+    fn a_password_below_the_floor_is_refused() {
+        assert!(matches!(check("short"), Strength::Rejected(_)));
+        assert!(matches!(check("elevenchars"), Strength::Rejected(_)));
+        let Strength::Rejected(msg) = check("short") else {
+            panic!("must be rejected");
+        };
+        assert!(msg.contains("12 characters"));
+    }
+
+    #[test]
+    fn a_password_between_the_floor_and_the_recommendation_warns_about_diceware() {
+        let Strength::Weak(msg) = check("fifteenchars123") else {
+            panic!("15 characters must warn, not reject or pass");
+        };
+        assert!(msg.contains("diceware"));
+        assert!(msg.contains("Six random words"));
+    }
+
+    #[test]
+    fn twenty_characters_is_strong() {
+        assert_eq!(check("twenty-characters-!!"), Strength::Strong);
+        // And the recommended path clears the gate it recommends.
+        assert_eq!(check(&generate().unwrap()), Strength::Strong);
+    }
+
+    #[test]
+    fn length_is_measured_in_characters_not_utf8_bytes() {
+        // 12 characters, 24 bytes: judged by what the user typed.
+        let twelve = "ααααααααββββ";
+        assert_eq!(twelve.chars().count(), 12);
+        assert!(twelve.len() > 12);
+        assert!(matches!(check(twelve), Strength::Weak(_)));
+    }
+
+    #[test]
+    fn reading_a_line_strips_one_newline_and_nothing_else() {
+        let pw = read_line(&b"trailing space \n"[..]).unwrap();
+        assert_eq!(*pw, "trailing space ");
+
+        let crlf = read_line(&b"windows\r\n"[..]).unwrap();
+        assert_eq!(*crlf, "windows");
+
+        let bare = read_line(&b"no newline at all"[..]).unwrap();
+        assert_eq!(*bare, "no newline at all");
+
+        // Only the *first* line is the password; a second line is not merged in.
+        let first = read_line(&b"first\nsecond\n"[..]).unwrap();
+        assert_eq!(*first, "first");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_group_readable_password_file_is_refused_and_a_private_one_is_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("password");
+        std::fs::write(&path, b"a private passphrase\n").unwrap();
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = read_from_file(&path)
+            .expect_err("a group- or world-readable password file must be refused")
+            .to_string();
+        assert!(err.contains("chmod 600"));
+        assert!(
+            !err.contains("a private passphrase"),
+            "an error must never echo the password"
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(*read_from_file(&path).unwrap(), "a private passphrase");
+    }
+
+    #[test]
+    fn the_no_recovery_text_states_the_consequence_without_hedging() {
+        assert!(NO_RECOVERY.contains("no recovery") || NO_RECOVERY.contains("No recovery"));
+        assert!(NO_RECOVERY.contains("permanently unreadable"));
+        for hedge in ["may be", "might", "possibly", "usually", "in most cases"] {
+            assert!(
+                !NO_RECOVERY.to_lowercase().contains(hedge),
+                "the no-recovery text must not hedge with {hedge:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_offline_attack_note_explains_the_risk_in_plain_language() {
+        // Plain language means no jargon: the point is that a user who
+        // understands "this can be attacked forever, offline" picks better than
+        // one told "minimum 12 characters".
+        assert!(OFFLINE_ATTACK_NOTE.contains("guess at it as long as they like"));
+        assert!(OFFLINE_ATTACK_NOTE.contains("lock them out"));
+        for jargon in ["entropy", "Argon2", "KDF", "bits of", "brute-force"] {
+            assert!(
+                !OFFLINE_ATTACK_NOTE.contains(jargon),
+                "the offline-attack note must avoid the jargon {jargon:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_password_input_path_reads_the_process_environment() {
+        // argv and the environment are readable by any local user through
+        // /proc, and environment values are inherited by children and captured
+        // in crash dumps. The three sanctioned input paths are a reader, a
+        // mode-0600 file, and a TTY prompt owned by the calling surface.
+        //
+        // Resolved from CARGO_MANIFEST_DIR so the gate is independent of the
+        // working directory and survives the AUR `srcdir` layout.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for name in ["src/sync/passphrase.rs", "src/sync/anchor.rs"] {
+            let source = std::fs::read_to_string(root.join(name)).expect("module must exist");
+            // Prose may discuss the rule freely, and the test module below may
+            // name the needles; only shipped code is scanned.
+            let code = source.split("#[cfg(test)]").next().unwrap_or_default();
+            for line in code.lines() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                for needle in ["std::env", "env::var", "var_os", "clap", "Arg::new"] {
+                    assert!(
+                        !trimmed.contains(needle),
+                        "{name} takes a password from {needle} — only a reader, a \
+                         mode-0600 file, and a TTY prompt are sanctioned input paths"
+                    );
+                }
+            }
+        }
+    }
+}
