@@ -51,7 +51,7 @@ The token must be scoped to your single backup repository with exactly two permi
 6. **Repository permissions:**
    - **Contents:** Check **Read and write**
    - **Metadata:** **Read-only** (checked by default, cannot be removed)
-7. **Do NOT grant Administration permissions.** This field must remain unchecked. The lack of this permission is what structurally prevents the token from creating or modifying repository settings. The tool will warn you if it detects a token with Administration permissions, because a token that has it silently weakens the guarantee — but it is your responsibility to not grant it in the first place.
+7. **Do NOT grant Administration permissions.** This field must remain unchecked. The lack of this permission is what structurally prevents the token from creating or modifying repository settings. There is deliberately **no warning** if you grant it anyway: `GET /repos/{owner}/{repo}` reports the authenticated *user's* role on the repository rather than the token's granted permissions, and since you create the repository yourself you are always its admin — so the warning would fire on every legitimate install, and a warning that always fires trains you to ignore it. Not granting it in the first place is the control.
 8. Click **Generate token** and copy the token value immediately (GitHub only displays it once)
 
 Your token carries exactly two permissions:
@@ -68,7 +68,7 @@ The tool looks for the token in this order:
 
 2. **macOS Keychain item** (macOS only) — Service name `ai-usagebar-sync-token`. The tool reads it via `security(1)` and writes via Security.framework, so the token never appears in process arguments or shell history.
 
-3. **`~/.config/ai-usagebar/sync-token` file** (Linux and other platforms) — Mode 0600 (read/write by owner only), matching the existing credential-file convention. This is where the token lives if you are not on macOS.
+3. **`sync-token` file beside `config.toml`** — normally `~/.config/ai-usagebar/sync-token`, mode 0600 (read/write by owner only), matching the existing credential-file convention. This is where `sync setup` *writes* the token when you are not on macOS. It is *read* on every platform, so a token file copied from another machine still works on a Mac.
 
 4. **`gh auth token`** (convenience fallback) — If the GitHub CLI is installed and logged in, the tool can use its authentication. This is never required; it is a convenience so you do not need to manage a separate token.
 
@@ -85,7 +85,7 @@ Before any sync operation, the tool verifies the repository meets these conditio
 - **Private visibility** — the repository is marked private, not internal or public
 - **Owned by the configured user** — the repository's owner numeric ID matches the one recorded at first pairing
 - **Not archived** — archived repositories reject pushes
-- **Not a fork** — forks have limited API quotas and cannot receive certain types of data
+- **Not a fork** — a fork shares its upstream's object network, so objects pushed to it can be reachable from the public parent
 
 This check runs **immediately before every push**, not once at setup. A repository can be made public from the web interface at any moment, so the tool re-checks every time.
 
@@ -103,12 +103,13 @@ This is not optional. If you backed up credentials before you made the repositor
 
 `sync setup` authenticates, resolves the repository, and verifies it is private. It performs **zero uploads** in this release.
 
-The command chain looks like this:
+It is a guided, five-step flow:
 
-- Authenticates using the token (checks it is valid and has the right scopes)
-- Fetches the repository details (verifies it exists and belongs to the right owner)
-- Checks visibility (must be private)
-- Records the owner's numeric ID for future pairing checks
+1. **The repository and the gate.** Resolves the token, fetches the repository's details, and refuses unless it passes every condition above. Every refusal stops *here* — you are never asked to choose a sync password for a repository that is about to be rejected.
+2. **The sync password.** Offers a generated 20-character passphrase (press Enter to take it) or accepts your own, subject to a length floor. There is no recovery: the password is the only thing that can open the bundle. A keyfile is written to `<config dir>/sync/keyfile.json` at mode 0600. If one is already there, setup stops rather than overwriting it — overwriting a keyfile makes every bundle written under the old password permanently unreadable.
+3. **The categories.** Shows what gets bundled and lets you toggle each one, `credentials` included and explicit. Your choices are written back into `config.toml` with comments and key order preserved.
+4. **The size.** Runs the same planner `sync push --dry-run` runs and shows its figures — files, raw bytes, and what a first push would actually send — then asks you to confirm.
+5. **Ready.** Stores the token where only you can read it (the Keychain on macOS, the mode-0600 file elsewhere), records the pairing, and says plainly that nothing was uploaded.
 
 Pushing to the repository arrives in a later release. If you need to back up your data today, this phase verifies the foundation is in place; it does not yet upload anything.
 
@@ -117,6 +118,19 @@ Check the status of your pairing with:
 ```bash
 ai-usagebar sync status
 ```
+
+It prints the category listing, then the repository:
+
+```
+  repo:      owner/name
+  visible:   private
+  token:     present (env)
+  verified:  2026-08-19T12:00:00+00:00
+```
+
+The `token:` line reports the token's **source**, never its value. The four labels are `env`, `Keychain`, `file`, and `gh`, matching the resolution order above. `verified:` is when this machine last confirmed the pairing.
+
+The repository half and the category listing fail independently: an expired token still leaves the listing visible, so you can always see what *would* be sent — but any repository-section failure is a non-zero exit.
 
 ## Bandwidth caveat
 

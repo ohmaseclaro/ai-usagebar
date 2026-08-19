@@ -34,6 +34,46 @@ pub struct CategoryLine {
     pub capped: bool,
 }
 
+/// What `sync status` learned about the remote (plan 3-07).
+///
+/// **Best-effort with respect to the category lines, not with respect to the
+/// exit code.** A user whose token expired should still see what would be sent,
+/// so [`failure`](RepoSection::failure) suppresses nothing above it — but a
+/// non-empty `failure` is a non-zero exit (D-06, REPO-05, T-3-41).
+///
+/// The token appears here only as a **source label**. There is no field that
+/// could hold its value, which is a cheaper guarantee than remembering not to
+/// print one (REPO-02).
+#[derive(Debug, Clone, Default)]
+pub struct RepoSection {
+    /// `owner/name` from `[sync] repo`; `None` means the key is unset, which is
+    /// an unconfigured machine rather than a failure.
+    pub configured: Option<String>,
+    /// What GitHub reported this run.
+    pub visibility: Option<String>,
+    /// [`TokenSource::label`](crate::sync::github::token::TokenSource::label).
+    pub token_source: Option<&'static str>,
+    /// The pairing record's `checked_at` — when this machine last verified it.
+    pub last_verified: Option<DateTime<Utc>>,
+    /// Drift and gate warnings, verbatim from plans 3-04 and 3-03.
+    pub warnings: Vec<String>,
+    /// Why the section could not be filled, or the incident that filled it.
+    /// Verbatim; a status-flavoured paraphrase would make one event read as
+    /// two.
+    pub failure: Option<String>,
+}
+
+impl RepoSection {
+    /// Record why this section could not be filled and stop. Returns `self` so
+    /// a caller can `return section.failed(e.to_string())` on one line — the
+    /// fields gathered before the failure stay visible, which is the point of
+    /// the section being best-effort about its *contents*.
+    pub fn failed(mut self, why: String) -> RepoSection {
+        self.failure = Some(why);
+        self
+    }
+}
+
 /// Everything `sync status` prints.
 #[derive(Debug, Clone)]
 pub struct StatusReport {
@@ -45,6 +85,9 @@ pub struct StatusReport {
     /// What a push would send right now. `None` before a plan was ever built,
     /// or when no sync key was available to build one.
     pub plan: Option<SyncPlan>,
+    /// The repository half. `None` only for `push --dry-run`, which contacts no
+    /// network at all.
+    pub repo: Option<RepoSection>,
 }
 
 impl StatusReport {
@@ -101,6 +144,7 @@ pub fn build_status(
     index: Option<&Index>,
     now: DateTime<Utc>,
     plan: Option<SyncPlan>,
+    repo: Option<RepoSection>,
 ) -> StatusReport {
     let lines = match &plan {
         Some(p) => p.categories.iter().map(|c| line_of(c, cfg)).collect(),
@@ -116,6 +160,7 @@ pub fn build_status(
         // this builder touches `$HOME`.
         index_path: index.map(|i| i.path().to_path_buf()).unwrap_or_default(),
         plan,
+        repo,
     }
 }
 
@@ -154,6 +199,48 @@ pub fn render_status(report: &StatusReport) -> String {
         out.push_str(&format!("  index:     {}\n", report.index_path.display()));
     }
     out.push_str(&rebuilt_note(report));
+    if let Some(repo) = &report.repo {
+        out.push_str(&render_repo(repo));
+    }
+    out
+}
+
+/// The repository half of `sync status`. Pure, like everything else here.
+///
+/// Prints the token's **source**, never the token — [`RepoSection`] has no
+/// field that could carry one.
+fn render_repo(repo: &RepoSection) -> String {
+    let Some(name) = &repo.configured else {
+        return "\n  repo:      not configured — no sync repository is paired.\n\
+                \x20            Name one in config.toml, after creating it yourself:\n\
+                \x20              gh repo create <owner>/<name> --private\n\
+                \n\
+                \x20              [sync]\n\
+                \x20              repo = \"<owner>/<name>\"\n"
+            .to_string();
+    };
+
+    let mut out = format!("\n  repo:      {name}\n");
+    out.push_str(&format!(
+        "  visible:   {}\n",
+        repo.visibility.as_deref().unwrap_or("unknown")
+    ));
+    out.push_str(&match repo.token_source {
+        Some(source) => format!("  token:     present ({source})\n"),
+        None => "  token:     none found\n".to_string(),
+    });
+    out.push_str(&match repo.last_verified {
+        Some(at) => format!("  verified:  {}\n", at.to_rfc3339()),
+        None => "  verified:  never — this machine is not paired yet, run \
+                 `ai-usagebar sync setup`\n"
+            .to_string(),
+    });
+    for warning in &repo.warnings {
+        out.push_str(&note("warning", warning));
+    }
+    if let Some(failure) = &repo.failure {
+        out.push_str(&note("repo:      FAILED", failure));
+    }
     out
 }
 
@@ -314,7 +401,7 @@ fn rebuilt_note(report: &StatusReport) -> String {
     }
 }
 
-fn human_bytes(n: u64) -> String {
+pub(crate) fn human_bytes(n: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = n as f64;
     let mut unit = 0;
@@ -365,6 +452,7 @@ mod tests {
             None,
             Utc::now(),
             None,
+            None,
         );
         assert_eq!(
             report.lines.iter().map(|l| l.category).collect::<Vec<_>>(),
@@ -396,6 +484,7 @@ mod tests {
             None,
             Utc::now(),
             None,
+            None,
         );
         let transcripts = report.lines.last().unwrap();
         assert_eq!(transcripts.category, SyncCategory::Transcripts);
@@ -419,6 +508,7 @@ mod tests {
             None,
             Utc::now(),
             None,
+            None,
         );
         assert!(report.last_sync.is_none());
         assert!(render_status(&report).contains("last sync: never"));
@@ -432,6 +522,7 @@ mod tests {
                 .map(|t| t.with_timezone(&Utc)),
             index_path: PathBuf::from("/nowhere/index.sqlite3"),
             plan,
+            repo: None,
         }
     }
 
@@ -719,7 +810,7 @@ mod tests {
         let stored = plan.total_new_stored_bytes;
 
         let report = DryRunReport {
-            status: build_status(&roots, &cfg, Some(&index), now, Some(plan)),
+            status: build_status(&roots, &cfg, Some(&index), now, Some(plan), None),
             no_key: None,
         };
         let text = render_dry_run(&report);
@@ -734,7 +825,7 @@ mod tests {
         let again = plan::build_with_keys(&roots, &cfg, &index, now, &keys).unwrap();
         assert_eq!(again.files_opened, 0);
         let report = DryRunReport {
-            status: build_status(&roots, &cfg, Some(&index), now, Some(again)),
+            status: build_status(&roots, &cfg, Some(&index), now, Some(again), None),
             no_key: None,
         };
         assert!(render_dry_run(&report).contains("would send nothing"));
