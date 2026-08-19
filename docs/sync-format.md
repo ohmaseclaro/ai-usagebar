@@ -332,8 +332,9 @@ cannot keep the name it is served under. Two-level fanout keeps any single
 listing far below GitHub's 3,000-entry directory width.
 
 **Sizes**: a writer aims for `PACK_TARGET` = 32 MiB and is sealed before a blob
-would carry it past `PACK_MAX` = 48 MiB. The 32 MiB comes from CAL-1's recorded
-fallback — see §7.
+would carry it past `PACK_MAX` = 48 MiB. The 32 MiB is CAL-1's *unmeasured*
+fallback — see §7. A restore fetches a whole pack either way, so this bounds
+wasted bytes, not correctness.
 
 A pack header is itself a single sealed chunk, so it is bounded at 256 KiB of
 JSON, some thousands of entries. A 32 MiB pack of 256 KiB chunks holds about
@@ -581,18 +582,26 @@ implementation measures 1492–1548 ms on the same class of machine, so the
 estimate was sound. It remains an M3 Max number, and every consumer of it should
 treat it as the fast end of the range.
 
-### CAL-1 — does a private-repo release asset honour `Range:`? Not measured
+### CAL-1 — does a private-repo release asset honour `Range:`? Offered in phase 3, declined
 
-**This was not run.** It needs a GitHub token and a throwaway private repository
-with a release asset over 1 MiB — credentials this phase deliberately does not
-have, since everything else in it is pure and offline.
+**Still not measured, and nothing below is a measurement.** Phase 1 could not
+run it: that phase was offline by construction and had no GitHub credential.
+Phase 3 could have — it is the first phase with both an HTTP client and a live
+token — and plan 3-06 offered the probe with its setup written out. It was
+declined rather than run. No status code, no `Content-Range`, no byte count.
 
-The fallback is the recorded answer and it is a *fallback*, not a measurement:
-assume ranged reads are **not** honoured, and pack at 32 MiB, which is where the
-waste of fetching a whole pack to read one chunk stays tolerable. That value is
-already baked into `PACK_TARGET`, so nothing is blocked by the probe being
-unrun; if it later comes back `206 Partial Content`, a future phase may raise
-the pack target and nothing else in the format changes.
+**What stands.** The assumption is unchanged: assume ranged reads are **not**
+honoured. `PACK_TARGET` stays at 32 MiB and `PACK_MAX` at 48 MiB.
+
+**It is no longer a blocker, and it never sized a restore into a corner.** Phase
+5 plans a **whole-pack fetch**, which is the correct design whichever way
+`Range:` goes, and `PACK_MAX`'s 48 MiB sits under `download_asset`'s 64 MiB body
+cap — so no streaming verb and no `reqwest` `stream` feature is needed either
+way. What CAL-1 could still buy is an *optimisation*: if ranged reads are
+honoured, a restore could fetch only the chunks it needs out of a pack rather
+than the whole pack, and packs could then grow past 32 MiB without making that
+waste worse. That is a performance question for whoever wants partial restore,
+not a gate on any shipped behaviour, and it can be asked at any time.
 
 The probe is written and waiting in `tests/live.rs` as
 `cal1_range_on_private_release_asset`. It skips with a printed message when its
@@ -606,7 +615,58 @@ GSD_CAL1_ASSET=payload.bin \
     cal1_range_on_private_release_asset
 ```
 
-Delete the throwaway repository and revoke the token afterwards.
+It needs a throwaway private repository carrying one release asset a little over
+1 MiB, and a fine-grained PAT scoped to it with `Contents: Read`. Use a
+throwaway, not the repository you paired: there is no reason to point a
+hand-rolled probe at a real backup target. Delete the repository and revoke the
+token afterwards.
+
+### `permissions.admin` for a Contents-only token — open, awaiting the probe
+
+**Not measured.** This is a question, not a decision.
+
+D-03 wants `sync setup` to warn when the paired token carries more permission
+than it needs. `sync::github::gate` parses `permissions.admin` from
+`GET /repos/{owner}/{repo}` into `RepoFacts::admin_permission` and then
+**deliberately warns on nothing**, because for a classic token that field
+reports the *authenticated user's role on the repository*, not the token's
+granted permissions — and D-01 has the user create the repository themselves,
+which makes them its admin. On that reading a correctly-scoped
+`Contents: read/write` PAT would still read `admin: true`, the warning would
+fire on essentially every legitimate install, and a warning that always fires
+teaches its reader to ignore warnings. That is a worse security outcome than no
+warning, which is why plan 3-04 held it back.
+
+**But whether a *fine-grained* PAT narrows the field is undocumented, and the
+reading above is a guess.** Plan 3-06 wrote
+`permissions_shape_for_a_fine_grained_contents_token` in `tests/live.rs` to
+settle it and offered it at a checkpoint; it was declined, so the question is
+still open:
+
+```bash
+GSD_PERM_TOKEN=<the sync PAT> \
+GSD_PERM_REPO=owner/name \
+  cargo test --test live -- --ignored --nocapture \
+    permissions_shape_for_a_fine_grained_contents_token
+```
+
+**The token shape is part of the question.** It must be run with exactly what
+[`sync-github.md`](sync-github.md) tells every user to create — fine-grained,
+`Contents: Read and write`, `Metadata: Read`, no Administration, on a repository
+the user owns. A classic PAT, an org-owned repository, or a token with
+Administration granted each move the field for their own reasons; a reading from
+one of those is an answer to a different question and must not be recorded here.
+
+**What the answer settles.** `admin: true` means the field reflects the user's
+role, cannot detect an over-permissioned token, and D-03's runtime warning is
+not implementable from this endpoint — closable, with a reason. `admin: false`
+means it narrows to the token's grant, and the warning becomes a one-line
+addition to `assert_pushable`'s warning list.
+
+**What stands until then.** No runtime warning ships, and the token recipe in
+[`sync-github.md`](sync-github.md) is D-03's sole enforcement — which is where
+its force actually lies, since the recipe is what determines the token's scope
+in the first place.
 
 ---
 

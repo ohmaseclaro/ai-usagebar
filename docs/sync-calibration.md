@@ -163,5 +163,7 @@ between the two runs and the number is not usable.
 
 CAL-1 (does a private release asset honour `Range:`) and CAL-3 (Argon2id timing
 at the shipped parameters) are Phase 1's, and their probes carry their own
-answers and setup in `tests/live.rs`. See `docs/sync-format.md` for what each one
-decides.
+answers and setup in `tests/live.rs`. CAL-3 is measured; CAL-1 was offered again
+in Phase 3 and declined, so its 32 MiB fallback still stands unmeasured and is
+now only an optimisation question. See `docs/sync-format.md` §7 for both, and
+for the open `permissions.admin` question Phase 3 left beside them.
