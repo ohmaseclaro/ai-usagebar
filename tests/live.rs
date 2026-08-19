@@ -1267,3 +1267,52 @@ fn human(bytes: u64) -> String {
         format!("{value:.2} {}", UNITS[unit])
     }
 }
+
+/// **Writes to your real login Keychain** — the sync token's round trip
+/// (plan 3-02), under a service name the product never reads.
+///
+/// It lives here, `#[ignore]`d, rather than in `src/sync/github/keychain.rs`,
+/// because a `#[test]` in the library would be reached by `cargo test --
+/// --ignored` in any CI leg and by the AUR `check()` on an installer's machine,
+/// and would leave an item behind on a developer's Keychain. macOS only:
+/// `sync::github::keychain` is not compiled anywhere else.
+///
+/// What it proves is the read/write *split*: the value goes in through
+/// Security.framework (never `argv`) and comes back out through `security(1)`,
+/// selected by the same account, which is the pairing that once drifted apart
+/// and created a second, empty-account item the read could never find.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore]
+fn sync_token_keychain_live_round_trip() {
+    use ai_usagebar::sync::github::keychain;
+
+    const PROBE_SERVICE: &str = "ai-usagebar-sync-token-livetest";
+    const PROBE_VALUE: &str = "github_pat_livetest_not_a_real_token";
+    assert_ne!(
+        PROBE_SERVICE,
+        keychain::SERVICE,
+        "the probe must never touch the item the product reads"
+    );
+
+    // Whatever an interrupted earlier run left behind; also the idempotence
+    // `token::clear` depends on.
+    keychain::delete_raw_service(PROBE_SERVICE).expect("deleting what is absent is not a failure");
+    assert_eq!(keychain::read_raw_service(PROBE_SERVICE).unwrap(), None);
+
+    keychain::write_raw_service(PROBE_SERVICE, PROBE_VALUE).expect("write via Security.framework");
+    assert_eq!(
+        keychain::read_raw_service(PROBE_SERVICE)
+            .unwrap()
+            .as_deref(),
+        Some(PROBE_VALUE),
+        "written natively, read back through security(1) — same (service, account) pair"
+    );
+
+    keychain::delete_raw_service(PROBE_SERVICE).expect("cleanup");
+    assert_eq!(
+        keychain::read_raw_service(PROBE_SERVICE).unwrap(),
+        None,
+        "the probe left nothing on the login Keychain"
+    );
+}

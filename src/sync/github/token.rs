@@ -7,19 +7,37 @@
 //! 3. `~/.config/ai-usagebar/sync-token`, mode 0600
 //! 4. `gh auth token`, when `gh` happens to be installed — convenience only
 //!
-//! Plan 3-01 fills 1 and 3, which need no platform code. Plan 3-02 supplies the
-//! two closures for 2 and 4 and owns the write path; the field types below do
-//! not change again.
+//! All four are injected as fields on [`TokenChain`], so a test exercises every
+//! source without a Keychain, a real path, or a subprocess anywhere near it.
+//! [`TokenChain::production`] is the single place that decides which of them are
+//! live on this platform, and no test calls it.
+//!
+//! [`store`] and [`clear`] are the other half: where a token collected by
+//! `sync setup` goes, and how a revoked one is taken back out. Neither can
+//! reach `config.toml` — a `Contents: write` GitHub token is a different class
+//! of secret from the read-only provider keys that file may hold inline.
 //!
 //! The value is a [`Zeroizing<String>`] end to end, and **no type here derives
 //! `Debug` while holding it**. It is never logged, not even a prefix: only its
 //! [`TokenSource`] is ever reported.
 
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
 use zeroize::Zeroizing;
 
 use crate::error::{AppError, Result};
+
+/// Source 1, and the name every failure message has to print.
+const ENV_VAR: &str = "AI_USAGEBAR_SYNC_TOKEN";
+
+/// How long source 4 gets before it is killed. `gh` shells out to whatever
+/// credential helper the user configured, and one of those blocked on a locked
+/// keyring would otherwise wedge `sync setup` with no output at all.
+const GH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Which of D-02's four the token actually came from. This — never the value —
 /// is what gets printed.
@@ -62,11 +80,18 @@ impl TokenChain {
     /// installers' machines.
     pub fn production() -> TokenChain {
         TokenChain {
-            env_value: std::env::var("AI_USAGEBAR_SYNC_TOKEN").ok(),
-            keychain: None, // plan 3-02
+            env_value: std::env::var(ENV_VAR).ok(),
+            // Source 2 exists on macOS only. D-02 rejects `keyring`/
+            // `secret-service` for the Linux half: it needs a live D-Bus
+            // session and fails over SSH, which is precisely the headless
+            // restore this feature exists to serve. Source 3 covers it.
+            #[cfg(target_os = "macos")]
+            keychain: Some(Box::new(super::keychain::read_raw)),
+            #[cfg(not(target_os = "macos"))]
+            keychain: None,
             file_path: crate::config::resolved_path()
                 .and_then(|p| p.parent().map(|d| d.join("sync-token"))),
-            gh: None, // plan 3-02
+            gh: Some(Box::new(gh_auth_token)),
         }
     }
 }
@@ -104,11 +129,13 @@ pub fn resolve(chain: &TokenChain) -> Result<(Zeroizing<String>, TokenSource)> {
 
     Err(AppError::Credentials(format!(
         "no GitHub token for sync. Supply one of:\n\
-         \x20 - AI_USAGEBAR_SYNC_TOKEN in the environment\n\
+         \x20 - {ENV_VAR} in the environment\n\
+         {}\
          \x20 - {}, mode 0600\n\
          \x20 - `gh auth login`, if you already use the GitHub CLI\n\
          It must be a fine-grained PAT scoped to the single sync repository, \
          with Contents: read/write and Metadata: read — and nothing else.",
+        keychain_hint(),
         chain
             .file_path
             .as_ref()
@@ -124,6 +151,152 @@ fn usable(raw: Option<String>) -> Option<Zeroizing<String>> {
     (!trimmed.is_empty()).then_some(trimmed)
 }
 
+/// The Keychain line of the exhausted-chain message, on the one platform where
+/// source 2 exists. D-06: a failure names its fix, and naming a Keychain item
+/// that cannot exist on this machine is not a fix.
+#[cfg(target_os = "macos")]
+fn keychain_hint() -> String {
+    format!(
+        "\x20 - the macOS Keychain item `{}`, which `ai-usagebar sync setup` writes\n",
+        super::keychain::SERVICE
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn keychain_hint() -> String {
+    String::new()
+}
+
+/// Source 4: `gh auth token`, when `gh` happens to be installed.
+///
+/// `Ok(None)` for a missing binary and for a non-zero exit alike — this source
+/// is convenience and never a requirement, so "not installed" and "not logged
+/// in" are both just "this source had nothing".
+///
+/// Two rules govern the spawn. The token travels back on the child's
+/// **stdout**; nothing is passed *to* it. And the child's environment is
+/// stripped of this project's provider secrets and of the sync token itself, so
+/// a subprocess this tool spawns inherits no credential it has no business
+/// seeing (T-3-09).
+///
+/// The bound is `spawn` + a watchdog thread + [`std::process::Child::kill`],
+/// because [`Command::output`] has no timeout of its own, nothing in this
+/// dependency tree adds one, and `resolve` is synchronous — so `tokio::process`
+/// is not reachable from here either.
+fn gh_auth_token() -> Result<Option<String>> {
+    let mut cmd = Command::new("gh");
+    cmd.args(["auth", "token"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        // `gh`'s diagnostics are not ours to relay, and "not logged in" is not
+        // a failure at this layer.
+        .stderr(Stdio::null());
+    for var in crate::vendor::vendor_secret_env_vars_to_remove(&[]) {
+        cmd.env_remove(var);
+    }
+    cmd.env_remove(ENV_VAR);
+
+    let Ok(mut child) = cmd.spawn() else {
+        return Ok(None);
+    };
+    // Taken out before the child is shared: the read below must not hold the
+    // lock the watchdog needs, and a killed child closes this pipe, which is
+    // what ends that read.
+    let stdout = child.stdout.take();
+    let child = Arc::new(Mutex::new(child));
+
+    let watched = Arc::clone(&child);
+    let (finished, wake) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        // `Disconnected` means the call below finished and dropped its end;
+        // only `Timeout` means the child is still running.
+        if matches!(
+            wake.recv_timeout(GH_TIMEOUT),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ) && let Ok(mut child) = watched.lock()
+        {
+            let _ = child.kill();
+        }
+    });
+
+    let mut out = String::new();
+    if let Some(mut pipe) = stdout {
+        let _ = pipe.read_to_string(&mut out);
+    }
+    let exited_zero = child
+        .lock()
+        .ok()
+        .and_then(|mut child| child.wait().ok())
+        .is_some_and(|status| status.success());
+    drop(finished);
+
+    // `resolve` trims and treats an empty result as "nothing here".
+    Ok(exited_zero.then_some(out))
+}
+
+/// Persist a token collected by `sync setup`, and report where it went.
+///
+/// macOS stores it in the Keychain and never touches `file_path`; every other
+/// target writes `file_path` at mode 0600. There is no third option and no
+/// config path: nothing here can write a token into `config.toml` (REPO-02).
+pub fn store(token: &str, file_path: &Path) -> Result<TokenSource> {
+    #[cfg(target_os = "macos")]
+    {
+        // The Keychain *is* the store on macOS (D-02); the file remains
+        // readable by `resolve` so a token copied from another machine still
+        // works, but this is not where a new one is written.
+        let _ = file_path;
+        super::keychain::write_raw(token)?;
+        Ok(TokenSource::Keychain)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        store_file(token, file_path)?;
+        Ok(TokenSource::File)
+    }
+}
+
+/// The file half of [`store`], separated so it is testable on macOS too — where
+/// `store` itself would reach the real login Keychain and no unit test may.
+///
+/// [`crate::cache::atomic_write`] puts the temp file in the destination's own
+/// directory and creates the parent, so this inherits the project's no-torn-
+/// state rule rather than reinventing it — and never lands in `/tmp`, which is
+/// world-readable, is often a different filesystem (making `persist` a copy
+/// that leaves the original behind), and may be swap-backed tmpfs. The mode is
+/// then set explicitly rather than trusting the temp file's inherited one, the
+/// same belt-and-braces `anchor::write_to` applies.
+#[cfg(any(not(target_os = "macos"), test))]
+fn store_file(token: &str, file_path: &Path) -> Result<()> {
+    crate::cache::atomic_write(file_path, token.trim().as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(file_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| AppError::io_at(file_path, e))?;
+    }
+    Ok(())
+}
+
+/// Remove every stored half, idempotently — the 401 path: a revoked token
+/// should be cleared, not retried.
+///
+/// Both halves, on macOS too: a file written on another machine and copied over
+/// is still a source [`resolve`] would find.
+pub fn clear(file_path: &Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    super::keychain::delete_raw()?;
+    clear_file(file_path)
+}
+
+fn clear_file(file_path: &Path) -> Result<()> {
+    match std::fs::remove_file(file_path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(AppError::io_at(file_path, e)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,16 +304,90 @@ mod tests {
 
     const FIXTURE: &str = "github_pat_fixture_not_a_real_token";
 
+    /// What the two injected fields hold. Nothing in this module's tests goes
+    /// near the real Keychain or spawns `gh`.
+    type Source = Option<Box<dyn Fn() -> Result<Option<String>>>>;
+
+    fn answering(value: &str) -> Source {
+        let value = value.to_owned();
+        Some(Box::new(move || Ok(Some(value.clone()))))
+    }
+
+    fn empty() -> Source {
+        Some(Box::new(|| Ok(None)))
+    }
+
+    /// A token file that exists and answers, so a later source cannot pass a
+    /// precedence test by being the only one able to speak.
+    fn seeded_file(dir: &TempDir, value: &str) -> PathBuf {
+        let path = dir.path().join("sync-token");
+        std::fs::write(&path, format!("{value}\n")).unwrap();
+        path
+    }
+
+    /// Precedence is asserted, not assumed: every later source can also answer,
+    /// with a value the assertion would notice.
     #[test]
     fn the_environment_wins_and_reports_itself_as_the_source() {
+        let dir = TempDir::new().unwrap();
         let chain = TokenChain {
             env_value: Some(format!("{FIXTURE}\n")),
-            file_path: Some(PathBuf::from("/nonexistent/sync-token")),
-            ..TokenChain::default()
+            keychain: answering("from-the-keychain"),
+            file_path: Some(seeded_file(&dir, "from-the-file")),
+            gh: answering("from-gh"),
         };
         let (token, source) = resolve(&chain).unwrap();
         assert_eq!(token.as_str(), FIXTURE);
         assert_eq!(source, TokenSource::Env);
+    }
+
+    /// Second in D-02's order: ahead of the file and of `gh`, both of which
+    /// answer here.
+    #[test]
+    fn the_keychain_outranks_the_file_and_gh() {
+        let dir = TempDir::new().unwrap();
+        let chain = TokenChain {
+            env_value: None,
+            keychain: answering(FIXTURE),
+            file_path: Some(seeded_file(&dir, "from-the-file")),
+            gh: answering("from-gh"),
+        };
+        let (token, source) = resolve(&chain).unwrap();
+        assert_eq!(token.as_str(), FIXTURE);
+        assert_eq!(source, TokenSource::Keychain);
+    }
+
+    /// Fourth and last, and only once the other three had nothing.
+    #[test]
+    fn gh_answers_when_nothing_ahead_of_it_did() {
+        let dir = TempDir::new().unwrap();
+        let chain = TokenChain {
+            env_value: None,
+            keychain: empty(),
+            file_path: Some(dir.path().join("sync-token")),
+            gh: answering(&format!("  {FIXTURE}  ")),
+        };
+        let (token, source) = resolve(&chain).unwrap();
+        assert_eq!(token.as_str(), FIXTURE);
+        assert_eq!(source, TokenSource::GhCli);
+    }
+
+    /// T-3-11. An error from the Keychain means "the Keychain could not
+    /// answer", not "there is no token": falling through to a later source
+    /// would send the user off to re-issue a token they already have.
+    #[test]
+    fn a_keychain_error_stops_the_chain_instead_of_falling_through() {
+        let dir = TempDir::new().unwrap();
+        let err = resolve(&TokenChain {
+            env_value: None,
+            keychain: Some(Box::new(|| {
+                Err(AppError::Credentials("the login Keychain is locked".into()))
+            })),
+            file_path: Some(seeded_file(&dir, "from-the-file")),
+            gh: answering("from-gh"),
+        })
+        .expect_err("a locked Keychain is not an absent token");
+        assert!(err.to_string().contains("locked"), "{err}");
     }
 
     #[test]
@@ -150,8 +397,10 @@ mod tests {
         std::fs::write(&path, format!("  {FIXTURE}  \n")).unwrap();
 
         let chain = TokenChain {
+            env_value: None,
+            keychain: empty(),
             file_path: Some(path),
-            ..TokenChain::default()
+            gh: answering("from-gh"),
         };
         let (token, source) = resolve(&chain).unwrap();
         assert_eq!(token.as_str(), FIXTURE);
@@ -166,14 +415,73 @@ mod tests {
         std::fs::write(&path, "\n\n").unwrap();
 
         let err = resolve(&TokenChain {
+            env_value: None,
+            keychain: empty(),
             file_path: Some(path),
-            ..TokenChain::default()
+            gh: empty(),
         })
         .expect_err("nothing in the chain answered");
         let text = err.to_string();
         assert!(text.contains("AI_USAGEBAR_SYNC_TOKEN"), "{text}");
         assert!(text.contains("sync-token"), "{text}");
+        assert!(text.contains("gh auth login"), "{text}");
         assert!(text.contains("Contents: read/write"), "{text}");
+        // The Keychain is only one of D-02's four where it can exist.
+        #[cfg(target_os = "macos")]
+        assert!(text.contains(super::super::keychain::SERVICE), "{text}");
+    }
+
+    /// T-3-10. `store`'s file half, exercised on every platform — on macOS
+    /// `store` itself would write the real login Keychain, which no unit test
+    /// may touch.
+    #[test]
+    fn a_stored_token_file_is_created_at_mode_0600_in_its_own_directory() {
+        let dir = TempDir::new().unwrap();
+        // A directory that does not exist yet: `sync setup` may run before
+        // anything else has written to the config dir.
+        let path = dir.path().join("nested").join("sync-token");
+        store_file(&format!("{FIXTURE}\n"), &path).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FIXTURE);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+        }
+        // And nothing else was left in the directory at any mode — a `persist`
+        // that degraded into a copy would show up here.
+        let left: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("sync-token")]);
+
+        clear_file(&path).unwrap();
+        assert!(!path.exists());
+        clear_file(&path).expect("removing what is already gone is not a failure");
+    }
+
+    /// The platform half of [`store`]. On macOS it is the Keychain, which is
+    /// why that arm is exercised by the `#[ignore]`d round trip in
+    /// `tests/live.rs` instead of here.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn store_reports_the_file_as_the_destination_off_macos() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("sync-token");
+        assert_eq!(store(FIXTURE, &path).unwrap(), TokenSource::File);
+        assert_eq!(
+            resolve(&TokenChain {
+                file_path: Some(path.clone()),
+                ..TokenChain::default()
+            })
+            .unwrap()
+            .1,
+            TokenSource::File
+        );
+        clear(&path).unwrap();
+        assert!(!path.exists());
     }
 
     /// T-3-01: the value is never rendered, not even through a derived `Debug`.
