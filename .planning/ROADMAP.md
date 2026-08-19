@@ -129,6 +129,18 @@ pinned known-answer vectors for `(password, salt, params) → kek` and `(mk, pla
 the five adversarial tests; `docs/sync-format.md` recording the on-disk format, both calibration
 numbers, and the accepted metadata leakage (total size, sync timing, per-sync change volume).
 
+**Plans:** 8 plans across 3 waves (wave 2 runs 4 in parallel, wave 3 runs 3)
+
+Plans:
+- [ ] 1-01-PLAN.md — crate wiring, module tree, and the complete key hierarchy (tracer)
+- [ ] 1-02-PLAN.md — fixed 256 KiB chunker: frame, zstd, padding, seal, reassemble
+- [ ] 1-03-PLAN.md — pack format: blobs, sealed trailing header, content-addressed sharded name
+- [ ] 1-04-PLAN.md — snapshot root, manifest, and index object, each versioned
+- [ ] 1-05-PLAN.md — passphrase generation and strength gate, plus the rollback anchor
+- [ ] 1-06-PLAN.md — the seven adversarial tests, each asserting zero plaintext
+- [ ] 1-07-PLAN.md — pinned known-answer vectors for the KDF, AEAD, hash, and composed format
+- [ ] 1-08-PLAN.md — CAL-3 and CAL-1 calibrations, and `docs/sync-format.md`
+
 **Success Criteria** (what must be TRUE):
 1. A multi-megabyte fixture round-trips byte-exactly through chunk → zstd → seal → pack → unpack →
    open → reassemble, and sealing the same bytes twice produces **identical** ciphertext.
@@ -522,7 +534,7 @@ Assignment notes where a requirement could have gone elsewhere:
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Encrypted Bundle Core | 0/TBD | Not started | - |
+| 1. Encrypted Bundle Core | 0/8 | Not started | - |
 | 2. Bundle Scope, Local Index, Dry-Run Planning | 0/TBD | Not started | - |
 | 3. GitHub Auth and the Private-Repo Gate | 0/TBD | Not started | - |
 | 4. Push — Packs, Atomic Flip, GC, Rekey | 0/TBD | Not started | - |
