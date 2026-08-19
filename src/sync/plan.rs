@@ -20,10 +20,21 @@
 //!    check costs when it fails, so the "fixed chunks, no CDC" decision stays
 //!    measurable in the field rather than merely argued.
 //!
-//! This module never compresses and never encrypts. Chunk ids come from an
-//! injected function so the planner is testable without Phase 1's keys; plan
-//! 2-07 supplies the real `blake3::keyed_hash(name_key, plaintext)` at the one
-//! call site.
+//! This module never encrypts and transmits nothing. It *does* compress, for
+//! one reason: the only honest way to say what a push costs is to run Phase 1's
+//! real [`chunk::frame`] over each new chunk and add the AEAD's
+//! [`SEAL_OVERHEAD`]. A compression ratio applied to raw bytes cannot work here
+//! — `frame` pads every sealed chunk up to the next power of two so a
+//! ciphertext length cannot leak how compressible its plaintext was, which on
+//! this project's own measured bundle costs ~40% on top of zstd's output
+//! (`docs/sync-calibration.md`, CAL-4: 4.62x compressed, 3.31x stored). A
+//! ratio-based estimate is therefore wrong *low*, which for a number telling
+//! someone what a push will cost is the one direction it must never be wrong
+//! in.
+//!
+//! Chunk ids come from an injected function so the planner is testable without
+//! Phase 1's keys; [`build_with_keys`] supplies the real
+//! `blake3::keyed_hash(name_key, plaintext)` at the one call site.
 
 use std::collections::HashSet;
 use std::fs::File;
@@ -34,6 +45,7 @@ use chrono::{DateTime, Utc};
 
 use crate::config::{SyncCategory, SyncConfig};
 use crate::error::{AppError, Result};
+use crate::sync::crypto::Keys;
 use crate::sync::index::{FileRecord, Index};
 use crate::sync::scope::{self, FileEntry};
 use crate::sync::{CHUNK_SIZE, SyncRoots, chunk};
@@ -43,6 +55,14 @@ use crate::sync::{CHUNK_SIZE, SyncRoots, chunk};
 /// A re-export rather than a second literal: two modules agreeing on 256 KiB by
 /// coincidence is a bug that only shows up as a bundle nobody can re-chunk.
 pub const CHUNK_BYTES: u64 = CHUNK_SIZE as u64;
+
+/// What `crypto::Keys::seal` adds to a framed chunk: the 24-byte nonce it
+/// stores inline plus the 16-byte Poly1305 tag.
+///
+/// Both lengths are private to `crypto`, so this is the one place the sum is
+/// written down — and `sealing_a_chunk_costs_exactly_the_framed_size_plus_the_overhead`
+/// asserts it against a really-sealed chunk, so it cannot drift silently.
+pub const SEAL_OVERHEAD: u64 = 24 + 16;
 
 /// What one file contributes to a plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +76,9 @@ pub struct FilePlan {
     pub new_chunk_ids: Vec<[u8; 32]>,
     /// Plaintext bytes of `new_chunk_ids`.
     pub new_bytes: u64,
+    /// What those chunks occupy once framed and sealed — the bytes that would
+    /// really move. Measured, never a ratio on `new_bytes`; see the module docs.
+    pub new_stored_bytes: u64,
     /// True when the file was never opened — the D5 short-circuit hit.
     pub reused: bool,
 }
@@ -67,9 +90,15 @@ pub struct CategoryPlan {
     pub files: usize,
     pub raw_bytes: u64,
     pub new_bytes: u64,
+    /// The would-upload figure for this category: framed and sealed, not
+    /// `new_bytes` scaled by a ratio.
+    pub new_stored_bytes: u64,
     /// Bound-dropped files (transcripts only); structurally zero elsewhere.
     pub excluded_files: usize,
     pub excluded_bytes: u64,
+    /// The walk hit its entry cap, so `files`/`raw_bytes` are a floor. Carried
+    /// here so a report built from a plan need not re-walk the tree to learn it.
+    pub capped: bool,
 }
 
 /// What a push would send, and what it cost to work that out.
@@ -80,6 +109,9 @@ pub struct SyncPlan {
     pub new_chunk_ids: Vec<[u8; 32]>,
     pub total_raw_bytes: u64,
     pub total_new_bytes: u64,
+    /// The whole point of a dry-run: what a push would actually put on the
+    /// wire, summed over `new_chunk_ids`.
+    pub total_new_stored_bytes: u64,
     /// Files whose body was read. Zero on a true no-op — this is SYNC-02's
     /// evidence, and the only place a `File::open` is counted.
     pub files_opened: usize,
@@ -135,6 +167,7 @@ pub fn build<F: Fn(&[u8]) -> [u8; 32]>(
         new_chunk_ids: Vec::new(),
         total_raw_bytes: 0,
         total_new_bytes: 0,
+        total_new_stored_bytes: 0,
         files_opened: 0,
         append_check_miss_bytes: 0,
         index_rebuilt: index.was_rebuilt(),
@@ -144,6 +177,7 @@ pub fn build<F: Fn(&[u8]) -> [u8; 32]>(
     for category in SyncCategory::ALL {
         let scan = scope::collect(category, roots, cfg, now);
         let mut new_bytes = 0u64;
+        let mut new_stored_bytes = 0u64;
 
         // Pass one: the D5 short-circuit. `lookup` returning Some ends the work
         // for that file — no open, no read, no hash. Doing every hit first also
@@ -162,6 +196,7 @@ pub fn build<F: Fn(&[u8]) -> [u8; 32]>(
                         sealed_chunks: record.sealed_chunks,
                         new_chunk_ids: Vec::new(),
                         new_bytes: 0,
+                        new_stored_bytes: 0,
                         reused: true,
                     });
                 }
@@ -180,6 +215,7 @@ pub fn build<F: Fn(&[u8]) -> [u8; 32]>(
             )?;
             index.record(entry, file_plan.sealed_chunks, &file_plan.chunk_ids)?;
             new_bytes += file_plan.new_bytes;
+            new_stored_bytes += file_plan.new_stored_bytes;
             plan.new_chunk_ids
                 .extend(file_plan.new_chunk_ids.iter().copied());
             plan.file_plans.push(file_plan);
@@ -190,16 +226,43 @@ pub fn build<F: Fn(&[u8]) -> [u8; 32]>(
             files: scan.files.len(),
             raw_bytes: scan.bytes,
             new_bytes,
+            new_stored_bytes,
             excluded_files: scan.excluded_files,
             excluded_bytes: scan.excluded_bytes,
+            capped: scan.walk_capped,
         });
         plan.total_raw_bytes = plan.total_raw_bytes.saturating_add(scan.bytes);
         plan.total_new_bytes = plan.total_new_bytes.saturating_add(new_bytes);
+        plan.total_new_stored_bytes = plan.total_new_stored_bytes.saturating_add(new_stored_bytes);
     }
 
     plan.files_opened = counters.files_opened;
     plan.append_check_miss_bytes = counters.append_check_miss_bytes;
     Ok(plan)
+}
+
+/// [`build`] with Phase 1's real chunk-id function — the single call site where
+/// the bundle format and the planner meet.
+///
+/// The id is `blake3::keyed_hash(name_key, plaintext)` via
+/// [`Keys::chunk_id`], so the would-upload figure a dry-run prints is the one a
+/// push would actually send rather than a lookalike computed from a different
+/// address (T-2-32).
+///
+/// Takes `&Keys` rather than a raw master key on purpose: `Keys` holds its three
+/// subkeys in `Zeroizing`, keeps them private, and has a hand-written `Debug`
+/// that redacts. Nothing here copies key material, formats it, or lets it reach
+/// an error message — the closure borrows `keys` and returns an address (T-2-29).
+pub fn build_with_keys(
+    roots: &SyncRoots,
+    cfg: &SyncConfig,
+    index: &Index,
+    now: DateTime<Utc>,
+    keys: &Keys,
+) -> Result<SyncPlan> {
+    build(roots, cfg, index, now, |bytes| {
+        *keys.chunk_id(bytes).as_bytes()
+    })
 }
 
 /// Chunk one changed file, taking the append fast path when it verifies.
@@ -226,13 +289,15 @@ fn plan_file<F: Fn(&[u8]) -> [u8; 32]>(
 
     let mut new_chunk_ids = Vec::new();
     let mut new_bytes = 0u64;
+    let mut new_stored_bytes = 0u64;
     let mut size = from;
-    for (id, len) in fresh {
+    for (id, len, stored) in fresh {
         chunk_ids.push(id);
         size = size.saturating_add(len);
         if known.insert(id) {
             new_chunk_ids.push(id);
             new_bytes = new_bytes.saturating_add(len);
+            new_stored_bytes = new_stored_bytes.saturating_add(stored);
         }
     }
 
@@ -244,6 +309,7 @@ fn plan_file<F: Fn(&[u8]) -> [u8; 32]>(
         chunk_ids,
         new_chunk_ids,
         new_bytes,
+        new_stored_bytes,
         reused: false,
     })
 }
@@ -290,15 +356,24 @@ fn verified_prefix<F: Fn(&[u8]) -> [u8; 32]>(
 }
 
 /// Hash `path` from `from` to EOF in [`CHUNK_BYTES`] buffers, yielding
-/// `(id, plaintext_len)` per chunk. Never holds more than one chunk, so a
-/// 50 MB transcript is never resident.
+/// `(id, plaintext_len, stored_len)` per chunk. Never holds more than one chunk,
+/// so a 50 MB transcript is never resident.
+///
+/// `stored_len` is `frame(chunk).len() + SEAL_OVERHEAD` — the real thing, run
+/// here while the plaintext is in hand, because a second pass would mean
+/// re-reading every file.
+///
+/// ponytail: every chunk read is framed, not only the ones that turn out to be
+/// new, so the loop needs no view of `known`. The waste is exactly the
+/// within-run duplicate rate, which is ~0 on real payloads; if that ever stops
+/// being true, thread `&HashSet` in and skip the frame on a hit.
 fn chunk_from<F: Fn(&[u8]) -> [u8; 32]>(
     file: &mut File,
     path: &Path,
     from: u64,
     chunk_id: &F,
     counters: &mut Counters,
-) -> Result<Vec<([u8; 32], u64)>> {
+) -> Result<Vec<([u8; 32], u64, u64)>> {
     io_at(path, file.seek(SeekFrom::Start(from)))?;
     let mut out = Vec::new();
     let mut buf = Vec::with_capacity(CHUNK_BYTES as usize);
@@ -309,7 +384,8 @@ fn chunk_from<F: Fn(&[u8]) -> [u8; 32]>(
             break;
         }
         counters.bytes_read = counters.bytes_read.saturating_add(buf.len() as u64);
-        out.push((chunk_id(&buf), buf.len() as u64));
+        let stored = chunk::frame(&buf)?.len() as u64 + SEAL_OVERHEAD;
+        out.push((chunk_id(&buf), buf.len() as u64, stored));
         if (buf.len() as u64) < CHUNK_BYTES {
             break; // short read means EOF: `Take::read_to_end` fills otherwise
         }
@@ -740,6 +816,7 @@ mod tests {
             sealed_chunks: 0,
             new_chunk_ids: Vec::new(),
             new_bytes: 0,
+            new_stored_bytes: 0,
             reused: false,
         };
         let (after, counters) = against(&path, &cached);
@@ -785,5 +862,145 @@ mod tests {
         assert_eq!(plan.new_chunk_ids.len(), 1, "deduplicated across files");
         assert_eq!(plan.total_new_bytes, 4);
         assert_eq!(plan.total_raw_bytes, 8);
+    }
+
+    // ---- 2-07: the would-upload projection, and Phase 1's real chunker ----
+
+    /// Microseconds instead of a gibibyte and a second and a half. The AUR
+    /// `check()` runs this on an installer's machine.
+    const CHEAP: crate::sync::crypto::KdfParams = crate::sync::crypto::KdfParams {
+        m_kib: 8,
+        t: 1,
+        p: 1,
+    };
+
+    fn test_keys() -> Keys {
+        crate::sync::crypto::Keyfile::create_with_floor(b"a-test-passphrase", CHEAP, CHEAP.m_kib)
+            .expect("a cheap keyfile")
+            .1
+    }
+
+    /// The constant is a sum of two numbers `crypto` keeps private. Pin it
+    /// against a really-sealed chunk so it cannot drift into a quietly wrong
+    /// estimate.
+    #[test]
+    fn sealing_a_chunk_costs_exactly_the_framed_size_plus_the_overhead() {
+        let keys = test_keys();
+        for len in [1usize, 1_000, 100 * 1024, CHUNK_BYTES as usize] {
+            let data = pseudo(len, 5);
+            let framed = chunk::frame(&data).unwrap().len() as u64;
+            let sealed = chunk::seal_chunk(&keys, &data).unwrap().ciphertext.len() as u64;
+            assert_eq!(sealed, framed + SEAL_OVERHEAD, "len {len}");
+        }
+    }
+
+    /// The headline of plan 2-06: `frame` pads to the next power of two, so no
+    /// ratio on raw bytes is right — and a ratio is wrong *low*, the one
+    /// direction a "what will this cost" figure must never be wrong in.
+    #[test]
+    fn the_projection_is_the_framed_size_not_a_compression_ratio() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("compressible.bin");
+        // 256 KiB of one byte: zstd flattens it to a few hundred bytes, and
+        // `frame` then rounds that up to a power of two.
+        fs::write(&path, vec![b'a'; CHUNK_BYTES as usize]).unwrap();
+
+        let (plan, _) = from_scratch(&path);
+        let framed = chunk::frame(&vec![b'a'; CHUNK_BYTES as usize])
+            .unwrap()
+            .len() as u64;
+
+        // zstd's own output, for comparison: what a ratio-based estimate would
+        // have quoted.
+        let zstd_len = zstd::stream::encode_all(&vec![b'a'; CHUNK_BYTES as usize][..], 3)
+            .unwrap()
+            .len() as u64;
+
+        assert_eq!(
+            plan.new_bytes, CHUNK_BYTES,
+            "the plaintext is a whole chunk"
+        );
+        assert_eq!(plan.new_stored_bytes, framed + SEAL_OVERHEAD);
+        assert!(
+            framed.is_power_of_two(),
+            "the padding is what makes a ratio wrong: {framed}"
+        );
+        assert!(
+            plan.new_stored_bytes > zstd_len,
+            "padding and the AEAD are both counted: {} stored vs {zstd_len} compressed",
+            plan.new_stored_bytes
+        );
+    }
+
+    /// Incompressible bytes are the other end: zstd cannot shrink them, so the
+    /// stored size is *above* the plaintext. A ratio-based estimate would
+    /// under-report here too.
+    #[test]
+    fn an_incompressible_chunk_stores_more_than_its_plaintext() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("random.bin");
+        write_fixture(&path, CHUNK_BYTES as usize, 99);
+
+        let (plan, _) = from_scratch(&path);
+        assert!(
+            plan.new_stored_bytes > plan.new_bytes,
+            "{} stored vs {} raw",
+            plan.new_stored_bytes,
+            plan.new_bytes
+        );
+    }
+
+    #[test]
+    fn build_with_keys_uses_phase_ones_real_chunk_id_and_projects_the_same_bytes() {
+        let dir = TempDir::new().unwrap();
+        seed_tree(dir.path());
+        let index = index_at(dir.path());
+        let roots = roots_at(dir.path());
+        let keys = test_keys();
+
+        let plan = build_with_keys(&roots, &cfg(), &index, now(), &keys).unwrap();
+
+        // The ids are Phase 1's, not a stand-in: each is `chunk_id(plaintext)`.
+        assert_eq!(plan.files_opened, 2);
+        assert!(
+            plan.new_chunk_ids
+                .contains(keys.chunk_id(b"hello").as_bytes())
+        );
+        assert!(
+            plan.new_chunk_ids
+                .contains(keys.chunk_id(b"ten-bytes!").as_bytes())
+        );
+
+        // …and the would-upload total is the sum of the two sealed chunks.
+        let expected: u64 = [b"hello".as_slice(), b"ten-bytes!".as_slice()]
+            .iter()
+            .map(|b| chunk::seal_chunk(&keys, b).unwrap().ciphertext.len() as u64)
+            .sum();
+        assert_eq!(plan.total_new_stored_bytes, expected);
+        assert_eq!(plan.total_new_bytes, 15, "plaintext, for comparison");
+
+        let config = plan
+            .categories
+            .iter()
+            .find(|c| c.category == SyncCategory::Config)
+            .unwrap();
+        assert_eq!(config.new_stored_bytes, expected);
+        assert!(!config.capped);
+    }
+
+    #[test]
+    fn a_no_op_projects_zero_stored_bytes_under_the_real_chunker() {
+        let dir = TempDir::new().unwrap();
+        seed_tree(dir.path());
+        let index = index_at(dir.path());
+        let roots = roots_at(dir.path());
+        let keys = test_keys();
+
+        build_with_keys(&roots, &cfg(), &index, now(), &keys).unwrap();
+        let second = build_with_keys(&roots, &cfg(), &index, now(), &keys).unwrap();
+
+        assert_eq!(second.files_opened, 0);
+        assert_eq!(second.total_new_stored_bytes, 0);
+        assert!(second.is_empty());
     }
 }

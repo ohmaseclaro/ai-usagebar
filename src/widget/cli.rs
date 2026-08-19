@@ -169,6 +169,19 @@ pub enum SyncAction {
     /// What sync would carry: per-category file counts and raw bytes, plus
     /// when it last ran. Reads only — nothing is uploaded or written.
     Status,
+
+    /// Send the encrypted bundle to the private remote.
+    ///
+    /// This build has no transport, so only `--dry-run` does anything: it
+    /// measures a push — per category, file count, raw bytes, and the bytes
+    /// that would really upload — without performing one. Without the flag the
+    /// command refuses; it never half-executes.
+    Push {
+        /// Measure only. Prints what a push would send, uploads nothing, and
+        /// contacts no network.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(clap::Subcommand, Debug, Clone)]
@@ -439,6 +452,35 @@ mod tests {
     fn usage_subcommand_parses_machine_readable_mode() {
         let cli = Cli::parse_from(["ai-usagebar", "usage", "--json"]);
         assert!(matches!(cli.command, Some(Command::Usage { json: true })));
+    }
+
+    #[test]
+    fn sync_subcommands_parse_and_the_dry_run_flag_is_opt_in() {
+        let status = Cli::parse_from(["ai-usagebar", "sync", "status"]);
+        assert!(matches!(
+            status.command,
+            Some(Command::Sync {
+                action: SyncAction::Status
+            })
+        ));
+
+        let dry = Cli::parse_from(["ai-usagebar", "sync", "push", "--dry-run"]);
+        assert!(matches!(
+            dry.command,
+            Some(Command::Sync {
+                action: SyncAction::Push { dry_run: true }
+            })
+        ));
+
+        // Bare `push` parses and is refused at runtime, rather than being a
+        // parse error: the refusal gets to say why and point at `--dry-run`.
+        let bare = Cli::parse_from(["ai-usagebar", "sync", "push"]);
+        assert!(matches!(
+            bare.command,
+            Some(Command::Sync {
+                action: SyncAction::Push { dry_run: false }
+            })
+        ));
     }
 
     #[test]
