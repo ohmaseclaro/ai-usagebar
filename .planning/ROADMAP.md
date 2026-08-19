@@ -381,7 +381,28 @@ tests for asset `state` transitions.
 7. A long push prints advancing byte/object counts rather than a frozen terminal, and every failure
    path exits non-zero with an actionable message.
 
-**Plans**: TBD
+**Plans:** 7 plans across 3 waves (1 / 5 / 1). Wave 1's tracer creates every file and freezes
+every cross-module type in `push/mod.rs`, so the five wave-2 plans each own whole files, share
+none, and compile in isolation.
+
+Plans:
+- [ ] 4-01-PLAN.md — wave 1 — the six write verbs, the remote layout, and one file to the repo end to end via the CAS flip (tracer)
+- [ ] 4-02-PLAN.md — wave 2 — `SyncPlan` to packs, manifest, index object and root, plus the `chunk` table's first writer
+- [ ] 4-03-PLAN.md — wave 2 — the resume scan, four-at-a-time uploads, digest verification, and progress
+- [ ] 4-04-PLAN.md — wave 2 — the bounded, merging compare-and-swap on the pointer
+- [ ] 4-05-PLAN.md — wave 2 — retention and GC: what is live, and the warning that never fails a push
+- [ ] 4-06-PLAN.md — wave 2 — `sync rekey`: rewrap, publish, then verifiably destroy the old wrapper
+- [ ] 4-07-PLAN.md — wave 3 — the seven success criteria as seven named integration tests, and the user-facing docs
+
+**Two reconciliations with the scope list above, both recorded in `4-01-PLAN.md`'s source audit.**
+The **draft release** (steps 3 and 7) is dropped: a draft release has no git tag, so
+`GET /releases/tags/{tag}` cannot find it and the resume scan SYNC-05 requires would need a full
+release listing plus name matching — machinery bought to briefly hide ciphertext that the
+re-gate's incident path already deletes. Atomicity comes from the flip, not from draft state. The
+**`stream` feature** is not added to `reqwest`: CAL-1 was not run, so `PACK_TARGET` stays 32 MiB
+and `PackWriter::finish` already returns a `Vec<u8>`. The trigger is named — raising the pack
+target past ~256 MiB means adding `stream`, writing packs to a tempfile, **and** re-checking
+`pack.rs`'s single-chunk header ceiling at the same time.
 
 ---
 
@@ -579,7 +600,7 @@ Assignment notes where a requirement could have gone elsewhere:
 | 1. Encrypted Bundle Core | 0/8 | Not started | - |
 | 2. Bundle Scope, Local Index, Dry-Run Planning | 0/7 | Not started | - |
 | 3. GitHub Auth and the Private-Repo Gate | 0/7 | Planned | - |
-| 4. Push — Packs, Atomic Flip, GC, Rekey | 0/TBD | Not started | - |
+| 4. Push — Packs, Atomic Flip, GC, Rekey | 0/7 | Planned | - |
 | 5. Pull and Restore | 0/TBD | Not started | - |
 | 6. Surfaces and Ship | 0/5 | Planned | - |
 

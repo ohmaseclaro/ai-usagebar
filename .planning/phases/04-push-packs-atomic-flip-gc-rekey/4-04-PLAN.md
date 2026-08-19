@@ -176,4 +176,3 @@ Record the merge rule in full — what is carried forward, what is truncated and
 and how the `keyfile` field is chosen — because plan 4-05 depends on the pointer it receives
 already being the truncated one, and plan 4-06 depends on the `keyfile` rule.
 </output>
-</content>

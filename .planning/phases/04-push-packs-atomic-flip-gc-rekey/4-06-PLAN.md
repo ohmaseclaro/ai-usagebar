@@ -189,4 +189,3 @@ Record the exact four-step remote order and the confirming re-list, and state th
 residual (T-4-46) is accepted-and-disclosed rather than mitigated — Phase 6's README work needs to
 repeat it, and `docs/sync-format.md` §9 already says it.
 </output>
-</content>

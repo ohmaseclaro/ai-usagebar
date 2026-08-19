@@ -206,4 +206,3 @@ Record the full retention rule and the exclusion list, and state plainly how D2'
 record-before-pack ordering is enforced — it is structural, not sequential, and the next reader
 must not "simplify" it back into an ordered pair of steps.
 </output>
-</content>
