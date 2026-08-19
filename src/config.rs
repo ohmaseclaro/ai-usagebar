@@ -182,6 +182,16 @@ pub struct SyncConfig {
     pub transcript_days: u32,
     /// Byte backstop on transcripts, so a heavy month cannot balloon silently.
     pub transcript_max_bytes: u64,
+    /// The private GitHub repository the bundle is pushed to, as `owner/name`.
+    ///
+    /// **Named by the user; there is no default and nothing is derived** (D-01).
+    /// The sync token deliberately holds no permission that could create a
+    /// repository, so a guessed name could only ever produce a confusing 404.
+    ///
+    /// No token field lives here. A `Contents: write` token is a different class
+    /// of secret from the read-only provider API keys `config.toml` is allowed
+    /// to hold inline; it lives in the Keychain or a mode-0600 file.
+    pub repo: Option<String>,
 }
 
 impl Default for SyncConfig {
@@ -195,6 +205,7 @@ impl Default for SyncConfig {
             ],
             transcript_days: 30,
             transcript_max_bytes: 2 * 1024 * 1024 * 1024,
+            repo: None,
         }
     }
 }
@@ -1058,6 +1069,13 @@ impl Config {
                 "[supergrok] grok_binary must not be empty".into(),
             ));
         }
+        // A malformed repository name fails here, at load, rather than at the
+        // first request: the value is interpolated into a URL path, and a config
+        // error should not need a network round trip to surface.
+        if let Some(repo) = &self.sync.repo {
+            crate::sync::github::RepoRef::parse(repo)
+                .map_err(|e| AppError::Other(format!("[sync] repo — {e}")))?;
+        }
         let mut labels = HashSet::new();
         for account in &self.anthropic.accounts {
             validate_account_label(&account.label)?;
@@ -1220,6 +1238,31 @@ mod tests {
         assert!(!c.sync.includes(SyncCategory::Credentials));
         assert_eq!(c.sync.transcript_days, 7);
         assert_eq!(c.sync.transcript_max_bytes, 1024);
+        // D-01: absent unless the user names it. There is no default.
+        assert_eq!(c.sync.repo, None);
+    }
+
+    #[test]
+    fn sync_repo_round_trips_and_is_absent_when_unnamed() {
+        let f = write_toml("[sync]\nrepo = \"octocat/ai-usagebar-sync\"\n");
+        let c = Config::load_from(f.path()).unwrap();
+        assert_eq!(c.sync.repo.as_deref(), Some("octocat/ai-usagebar-sync"));
+
+        let f = write_toml("[sync]\ntranscript_days = 7\n");
+        assert_eq!(Config::load_from(f.path()).unwrap().sync.repo, None);
+    }
+
+    /// The value is interpolated into a URL path, so a malformed one fails at
+    /// load rather than at the first request.
+    #[test]
+    fn a_malformed_sync_repo_fails_at_load_naming_the_expected_shape() {
+        for bad in ["\"just-a-name\"", "\"a/b/c\"", "\"own er/name\"", "\"\""] {
+            let f = write_toml(&format!("[sync]\nrepo = {bad}\n"));
+            let err = Config::load_from(f.path()).expect_err("{bad} is not owner/name");
+            let text = err.to_string();
+            assert!(text.contains("[sync] repo"), "{bad}: {text}");
+            assert!(text.contains("owner/name"), "{bad}: {text}");
+        }
     }
 
     #[test]

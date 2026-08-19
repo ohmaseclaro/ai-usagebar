@@ -2,7 +2,8 @@
 //! state to a private git remote that is treated as fully hostile.
 //!
 //! Everything under this module is **pure and offline**: no network, no `$HOME`,
-//! no Keychain, no git. The whole format is exercisable by `cargo test` on a
+//! no Keychain, no git — with the single exception of [`github`], which is the
+//! transport and says so. The whole format is exercisable by `cargo test` on a
 //! machine with none of those, which is what lets it be adversary-tested before
 //! anything can transmit it.
 //!
@@ -19,6 +20,9 @@
 //! - [`transcripts`] — the bounded transcript selector.
 //! - [`index`] — the local `(path, size, mtime_ns, inode)` change-detection db.
 //! - [`plan`] — dry-run planning over a scan.
+//! - [`github`] — the GitHub transport: auth, the private-repo gate, and the
+//!   pairing record. The only module here that opens a socket — and in Phase 3
+//!   it can only `GET`.
 //! - [`report`] — the pure `sync status` model and its renderer.
 //! - [`cli`] — the `ai-usagebar sync …` entry point.
 //!
@@ -30,6 +34,7 @@ pub mod anchor;
 pub mod chunk;
 pub mod cli;
 pub mod crypto;
+pub mod github;
 pub mod index;
 pub mod model;
 pub mod pack;
