@@ -9,7 +9,7 @@
 //! ```
 //!
 //! Each hop's identifier is bound as associated data into the object it names:
-//! [`crate::sync::crypto::Keys::seal`] takes the [`ChunkId`] as AAD, and
+//! `Keys::seal` takes the [`ChunkId`] as AAD, and
 //! [`crate::sync::chunk::open_chunk`] rechecks
 //! that the plaintext really hashes to the id it was served under. Substituting
 //! a manifest or a chunk therefore fails its tag rather than quietly restoring

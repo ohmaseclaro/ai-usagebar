@@ -18,13 +18,13 @@
 //! — both decrypt to identical plaintext and the first upload simply wins — and
 //! it is *not* harmless for nonce safety. One id covering two distinct messages
 //! is exactly the input that would reuse a nonce, so
-//! [`crypto::Keys::seal`](crate::sync::crypto::Keys::seal) derives the nonce
+//! `crypto::Keys::seal` derives the nonce
 //! from the framed bytes it encrypts rather than from the id, and stores it
 //! inline. See its safety contract before changing either address.
 //!
 //! # Frame layout
 //!
-//! The bytes handed to [`crypto::Keys::seal`](crate::sync::crypto::Keys::seal),
+//! The bytes handed to `crypto::Keys::seal`,
 //! which prepends the 24-byte nonce it derives from them:
 //!
 //! | Offset | Size       | Field                                            |

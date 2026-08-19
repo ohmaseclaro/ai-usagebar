@@ -691,7 +691,7 @@ pub fn content_address(bytes: &[u8]) -> ChunkId {
 ///
 /// This is the *pre-flight*, for a surface that knows how much memory it has and
 /// can print something a user can act on. It is not the safety net:
-/// [`check_kdf_ceiling`] is, it runs inside [`Keyfile::open`] with no dependency
+/// `check_kdf_ceiling` is, it runs inside [`Keyfile::open`] with no dependency
 /// on a caller remembering anything, and it does not read the machine.
 pub fn check_memory_budget(m_kib: u32, available_kib: u64) -> Result<()> {
     if u64::from(m_kib) <= available_kib {
@@ -1005,9 +1005,14 @@ mod tests {
             "a refusal echoed the password"
         );
 
-        // The floor is real rather than argon2's own 8 KiB: that one is the
-        // smallest input the algorithm is defined for, not a security parameter.
-        assert!(MIN_KDF_MEMORY_KIB > 8);
+        // The floor is a real one rather than argon2's own 8 KiB, which is the
+        // smallest input the algorithm is defined for and not a security
+        // parameter at all. Asserted through `create` so it is the *behaviour*
+        // being pinned, not the constant's value.
+        assert!(
+            Keyfile::create(b"a twelve-char", CHEAP).is_err(),
+            "argon2's own floor must not be an acceptable place to write a bundle"
+        );
         assert!(MIN_KDF_MEMORY_KIB < KdfParams::default().m_kib);
 
         // …and the same refusal on the rewrap path, from a keyfile that exists.
