@@ -70,6 +70,9 @@ const SCHEDULED_TASKS: &str = "scheduled-tasks.json";
 /// `~/.claude/scheduled-tasks/` — Claude Code's own routine definitions, a
 /// different tree from the per-account registry above.
 const SCHEDULED_TASKS_DIR: &str = "scheduled-tasks";
+/// A chat session index. The sibling `scheduled-tasks.json` lives in the same
+/// folder but belongs to the routines category, so the two never double-count.
+const SESSION_PREFIX: &str = "local_";
 
 /// One collected file and the three quarters of D5's change-detection key that
 /// come from its metadata; the fourth is the path itself.
@@ -336,8 +339,21 @@ pub fn collect(
                 push_path(&org.join(SCHEDULED_TASKS), &mut scan);
             }
         }
-        // Task 2 of this plan.
-        SyncCategory::ChatIndex => {}
+        SyncCategory::ChatIndex => {
+            // D1: `claude-code-sessions/<account>/<org>/local_*.json`. Walking
+            // the root and filtering by name keeps `local-agent-mode-sessions/`
+            // on the shared D2 predicate — a Cowork transcript's path embeds an
+            // unreconstructable account suffix, so a copy renders as an empty
+            // chat. No file body is read; a stat per entry is the whole cost.
+            walk(&roots.desktop_data_dir.join(SESSIONS_DIR), &mut scan);
+            scan.files.retain(|f| {
+                f.path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(SESSION_PREFIX) && n.ends_with(".json"))
+            });
+            scan.bytes = scan.files.iter().map(|f| f.size).sum();
+        }
         // Owned by plan 2-04.
         SyncCategory::Transcripts => return super::transcripts::collect_bounded(roots, cfg, now),
     }
@@ -694,6 +710,107 @@ mod tests {
         let scan = scan_of(SyncCategory::Routines, &dir);
         assert!(scan.files.is_empty());
         assert_eq!(scan.bytes, 0);
+    }
+
+    // ---- chat_index: local_*.json only -------------------------------------
+
+    #[test]
+    fn the_chat_index_takes_local_session_files_from_every_account_and_nothing_else() {
+        let dir = TempDir::new().unwrap();
+        seed(
+            dir.path(),
+            "desktop/claude-code-sessions/acct-1/org-1/local_abc.json",
+            "{}",
+        );
+        seed(
+            dir.path(),
+            "desktop/claude-code-sessions/acct-2/org-2/local_def.json",
+            "{}",
+        );
+        seed(
+            dir.path(),
+            "desktop/claude-code-sessions/acct-1/org-1/scheduled-tasks.json",
+            "{}",
+        );
+        seed(
+            dir.path(),
+            "desktop/claude-code-sessions/acct-1/org-1/notes.json",
+            "{}",
+        );
+
+        let scan = scan_of(SyncCategory::ChatIndex, &dir);
+        assert_eq!(names(&scan), vec!["local_abc.json", "local_def.json"]);
+        assert_eq!(scan.bytes, scan.files.iter().map(|f| f.size).sum::<u64>());
+
+        let paths: Vec<String> = scan
+            .files
+            .iter()
+            .map(|f| f.path.to_string_lossy().into_owned())
+            .collect();
+        for keyed in ["acct-1", "org-1", "acct-2", "org-2"] {
+            assert!(
+                paths.iter().any(|p| p.contains(keyed)),
+                "{keyed}: {paths:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cowork_local_agent_mode_sessions_tree_contributes_nothing() {
+        let dir = TempDir::new().unwrap();
+        seed(
+            dir.path(),
+            "desktop/claude-code-sessions/acct-1/org-1/local_keep.json",
+            "{}",
+        );
+        // At the account level and below it — the shared predicate is
+        // component-level, so both are refused without a second rule here.
+        seed(
+            dir.path(),
+            "desktop/claude-code-sessions/local-agent-mode-sessions/acct-1/local_cowork.json",
+            "{}",
+        );
+        seed(
+            dir.path(),
+            "desktop/claude-code-sessions/acct-1/local-agent-mode-sessions/local_cowork.json",
+            "{}",
+        );
+
+        let scan = scan_of(SyncCategory::ChatIndex, &dir);
+        assert_eq!(names(&scan), vec!["local_keep.json"]);
+    }
+
+    #[test]
+    fn a_missing_sessions_root_is_an_empty_chat_index_scan() {
+        let dir = TempDir::new().unwrap();
+        let scan = scan_of(SyncCategory::ChatIndex, &dir);
+        assert!(scan.files.is_empty());
+        assert_eq!(scan.bytes, 0);
+        assert_eq!(scan.category, SyncCategory::ChatIndex);
+    }
+
+    #[test]
+    fn an_account_registry_lands_in_routines_and_never_in_the_chat_index() {
+        let dir = TempDir::new().unwrap();
+        seed(
+            dir.path(),
+            "desktop/claude-code-sessions/acct-1/org-1/scheduled-tasks.json",
+            "{}",
+        );
+        seed(
+            dir.path(),
+            "desktop/claude-code-sessions/acct-1/org-1/local_abc.json",
+            "{}",
+        );
+
+        assert_eq!(
+            names(&scan_of(SyncCategory::Routines, &dir)),
+            vec!["scheduled-tasks.json"]
+        );
+        assert_eq!(
+            names(&scan_of(SyncCategory::ChatIndex, &dir)),
+            vec!["local_abc.json"]
+        );
     }
 
     #[cfg(unix)]
