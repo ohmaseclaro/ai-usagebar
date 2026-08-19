@@ -39,6 +39,7 @@ codebase.
 - [Claude accounts](docs/claude-accounts.md)
 - [Format placeholders](docs/format-placeholders.md)
 - [Provider endpoints and live tests](docs/vendor-endpoints.md)
+- [GitHub sync setup](docs/sync-github.md)
 - [Encrypted sync bundle format](docs/sync-format.md)
 - [KDE Plasma 6 plasmoid](kde-plasmoid/README.md)
 
@@ -227,6 +228,19 @@ enabled = true
 
 See the [configuration reference](docs/configuration.md) for every provider,
 display option, account path, region, and API-key setting.
+
+## Sync (optional)
+
+Encrypted backup of your usage history and configuration to a private GitHub repository. Pairing and status checks are available now; pushing arrives in a later release.
+
+To set up:
+
+1. Create a private repository for your backup (`gh repo create owner/name --private`)
+2. Generate a fine-grained personal access token scoped to that repository, with **Contents: read/write** and **Metadata: read** permissions only
+3. Add the repository to your config: `[sync] repo = "owner/name"`
+4. Run `ai-usagebar sync setup` to authenticate and verify the repository
+
+Check status with `ai-usagebar sync status`. See [GitHub sync setup](docs/sync-github.md) and [bundle format](docs/sync-format.md) for details.
 
 ## Quick start
 

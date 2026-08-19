@@ -2,8 +2,8 @@
 
 The config file is `~/.config/ai-usagebar/config.toml`. All fields are optional.
 Claude, Codex, Z.AI, and OpenRouter are enabled by default; other providers are
-opt-in. The commented example shows the defaults and provider-specific
-settings.
+opt-in. The sync feature is opt-in. The commented example shows the defaults and
+provider-specific settings.
 
 ```toml
 [ui]
@@ -114,4 +114,24 @@ enabled = true             # disabled by default; enable once you've run `kiro-c
 # No API key: reads the AWS SSO OIDC session kiro-cli already wrote to its own
 # data.sqlite3 after you logged in there.
 # db_path = "/home/you/.local/share/kiro-cli/data.sqlite3"
+
+[sync]
+# repo = "owner/name"      # required for backup; no default. See docs/sync-github.md
 ```
+
+## Sync configuration
+
+### `[sync] repo`
+
+Value: `owner/name` (e.g. `alice/ai-usagebar-backup`)
+
+Required if you use the sync feature. There is no default. A missing or unset value is an error, not something the tool resolves for you, because the tool holds no permission to create repositories. Naming it is a one-time, explicit act.
+
+For token setup and repository requirements, see [Encrypted sync bundle format](docs/sync-github.md).
+
+The token itself is never a config key. It lives in one of four places in this order:
+
+1. `AI_USAGEBAR_SYNC_TOKEN` environment variable (useful for CI and headless restores)
+2. macOS Keychain item (macOS only)
+3. `~/.config/ai-usagebar/sync-token` file, mode 0600 (Linux and other platforms)
+4. `gh auth token` (GitHub CLI, if installed and logged in)
