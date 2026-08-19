@@ -540,6 +540,9 @@ chunker must still read the bundles it wrote with the first.
 
 ## 7. Calibrations
 
+Phase 2's two — CAL-4's measured compressed bundle size and CAL-2's profile
+churn — are recorded in [`sync-calibration.md`](sync-calibration.md).
+
 ### CAL-3 — Argon2id at the shipped parameters: measured
 
 Three runs, `m = 1 GiB / t = 3 / p = 1` and the two steps down, on:
