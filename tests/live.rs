@@ -53,15 +53,16 @@
 //!   extension, then asserts usage percent and plan. Set
 //!   `SUPERGROK_GROK_BINARY` to the trusted official executable.
 //!
-//! ## Calibration probes (encrypted sync, plans 1-08 and 2-06)
+//! ## Calibration and shape probes (encrypted sync, plans 1-08, 2-06 and 3-06)
 //!
-//! Four probes at the bottom of this file are not vendor smoke tests. They
-//! answer sizing questions the encrypted-sync format would otherwise have to
-//! guess at, and they live here because this is where the project keeps every
-//! test allowed to cost real seconds, real gibibytes, or a real network call —
-//! all of it behind `#[ignore]`, so `cargo test` and the AUR `check()` run
-//! neither. Their measured answers are written down in
-//! `docs/sync-calibration.md`; re-run one when its answer goes stale.
+//! Five probes at the bottom of this file are not vendor smoke tests. They
+//! answer sizing and API-shape questions the encrypted-sync format would
+//! otherwise have to guess at, and they live here because this is where the
+//! project keeps every test allowed to cost real seconds, real gibibytes, or a
+//! real network call — all of it behind `#[ignore]`, so `cargo test` and the
+//! AUR `check()` run neither. Their measured answers are written down in
+//! `docs/sync-calibration.md` and `docs/sync-format.md` §7; re-run one when its
+//! answer goes stale.
 //!
 //! - **CAL-3**, `cal3_argon2id_timing_at_production_parameters`: what Argon2id
 //!   actually costs at the shipped m = 1 GiB / t = 3 / p = 1, plus the two
@@ -85,6 +86,12 @@
 //!   and sealed size of this machine's default bundle, per category. Needs no
 //!   credential and no network:
 //!   `cargo test --release --test live -- --ignored --nocapture cal4_`
+//! - `permissions_shape_for_a_fine_grained_contents_token`: whether
+//!   `permissions.admin` on `GET /repos/{owner}/{repo}` is a property of the
+//!   token or of the user, which is what decides whether D-03's
+//!   over-permissioned-token warning can ever be correct. Credential-gated and
+//!   skips cleanly when unset — see its own doc comment for the exact token
+//!   shape it must be run with.
 
 use std::time::Duration;
 
@@ -731,7 +738,7 @@ async fn cal1_range_on_private_release_asset() {
         ))
         .header("authorization", format!("Bearer {token}"))
         .header("accept", "application/vnd.github+json")
-        .header("user-agent", CAL1_UA)
+        .header("user-agent", GITHUB_PROBE_UA)
         .send()
         .await
         .expect("the release lookup must reach api.github.com")
@@ -763,7 +770,7 @@ async fn cal1_range_on_private_release_asset() {
         .get(&asset_url)
         .header("authorization", format!("Bearer {token}"))
         .header("accept", "application/octet-stream")
-        .header("user-agent", CAL1_UA)
+        .header("user-agent", GITHUB_PROBE_UA)
         .header("range", "bytes=0-1023")
         .send()
         .await
@@ -784,7 +791,7 @@ async fn cal1_range_on_private_release_asset() {
         );
         response = client
             .get(&location)
-            .header("user-agent", CAL1_UA)
+            .header("user-agent", GITHUB_PROBE_UA)
             .header("range", "bytes=0-1023")
             .send()
             .await
@@ -816,8 +823,108 @@ async fn cal1_range_on_private_release_asset() {
     }
 }
 
-/// User agent for the CAL-1 probe. GitHub's API requires one.
-const CAL1_UA: &str = "ai-usagebar-cal1";
+/// **The `permissions` shape for a correctly-scoped fine-grained PAT** — is
+/// `permissions.admin` a property of the *token* or of the *user*?
+///
+/// D-03 wants `sync setup` to warn when the paired token carries more than it
+/// needs. Plan 3-04 wired `RepoFacts::admin_permission` up to
+/// `permissions.admin` on `GET /repos/{owner}/{repo}` and then deliberately
+/// warned on nothing, because for a classic token that field reports the
+/// **authenticated user's role on the repository**, not the token's grant — and
+/// D-01 has the user create the repository themselves, which makes them its
+/// admin. A warning built on that would fire on essentially every legitimate
+/// install and teach its reader to ignore warnings, which is a worse security
+/// outcome than no warning at all. Whether a *fine-grained* PAT narrows the
+/// field is undocumented, so this probe measures it instead of guessing.
+///
+/// **Run it with exactly the token `docs/sync-github.md` tells every user to
+/// create**: fine-grained, `Contents: Read and write`, `Metadata: Read`, no
+/// Administration, on a repository the user owns. Any other token answers a
+/// different question — a classic PAT, an org-owned repository, or a token with
+/// Administration granted each move the field for their own reasons, and a
+/// reading from one of those must not be recorded as the answer to this one.
+///
+/// ```bash
+/// GSD_PERM_TOKEN=github_pat_… \
+/// GSD_PERM_REPO=owner/name \
+///   cargo test --test live -- --ignored --nocapture \
+///     permissions_shape_for_a_fine_grained_contents_token
+/// ```
+///
+/// The output is the deliverable, not the assertions: it prints the whole
+/// `permissions` object plus the four fields `gate::assert_pushable` decides on,
+/// and **nothing else from the response**, which also carries owner and
+/// repository metadata that has no business in a terminal transcript. Read
+/// `admin`. If it is `true` for a token granted only Contents and Metadata, the
+/// field cannot detect an over-permissioned token and D-03's runtime warning is
+/// not implementable from this endpoint. If it is `false`, the warning becomes a
+/// one-line addition to `assert_pushable`'s warning list.
+///
+/// One read-only `GET`; it creates nothing and needs no throwaway anything.
+/// Skips with a printed message when either variable is absent.
+#[tokio::test]
+#[ignore = "live API; needs the sync PAT and its paired repo — run with --ignored"]
+async fn permissions_shape_for_a_fine_grained_contents_token() {
+    let (Some(token), Some(repo)) = (
+        non_empty_var("GSD_PERM_TOKEN"),
+        non_empty_var("GSD_PERM_REPO"),
+    ) else {
+        eprintln!(
+            "permissions_shape_for_a_fine_grained_contents_token: GSD_PERM_TOKEN and \
+             GSD_PERM_REPO (owner/name) must both be set — skipping; D-03's runtime \
+             warning stays unshipped and docs/sync-github.md's token recipe stays its \
+             sole enforcement"
+        );
+        return;
+    };
+
+    // Redirects are not followed, for the same reason CAL-1 does not follow
+    // them: a renamed repository answers `301` with a `Location`, and following
+    // it automatically would replay the bearer token to whatever that header
+    // names. A `301` here is a wrong `GSD_PERM_REPO`, and the assertion below
+    // says so.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let response = client
+        .get(format!("https://api.github.com/repos/{repo}"))
+        .header("authorization", format!("Bearer {token}"))
+        .header("accept", "application/vnd.github+json")
+        .header("user-agent", GITHUB_PROBE_UA)
+        .send()
+        .await
+        .expect("the repository lookup must reach api.github.com");
+
+    let status = response.status();
+    assert!(
+        status.is_success(),
+        "the repository lookup returned {status} — that is a broken probe, not an \
+         answer about `permissions`. Check GSD_PERM_REPO and the token's repository scope."
+    );
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .expect("the repository lookup must return JSON");
+
+    println!("permissions probe — {repo}");
+    println!("  permissions = {}", body["permissions"]);
+    for field in ["visibility", "private", "archived", "fork"] {
+        println!("  {field} = {}", body[field]);
+    }
+    println!(
+        "  D-03: `admin` above is the whole answer. true = the field reflects your role \
+         on the repository, not the token's grant, and the warning is not implementable \
+         here. false = it narrows to the grant, and the warning is one line in \
+         sync::github::gate::assert_pushable."
+    );
+}
+
+/// User agent for the two hand-rolled GitHub probes above. GitHub's API
+/// requires one.
+const GITHUB_PROBE_UA: &str = "ai-usagebar-probe";
 
 /// `Some` only for a variable that is both set and not blank — an exported but
 /// empty variable is how a half-finished setup usually looks, and it should
