@@ -129,17 +129,17 @@ pinned known-answer vectors for `(password, salt, params) → kek` and `(mk, pla
 the five adversarial tests; `docs/sync-format.md` recording the on-disk format, both calibration
 numbers, and the accepted metadata leakage (total size, sync timing, per-sync change volume).
 
-**Plans:** 8 plans across 3 waves (wave 2 runs 4 in parallel, wave 3 runs 3)
+**Plans:** 8 plans across 5 waves (1 / 2 / 2 / 2 / 1)
 
 Plans:
-- [ ] 1-01-PLAN.md — crate wiring, module tree, and the complete key hierarchy (tracer)
-- [ ] 1-02-PLAN.md — fixed 256 KiB chunker: frame, zstd, padding, seal, reassemble
-- [ ] 1-03-PLAN.md — pack format: blobs, sealed trailing header, content-addressed sharded name
-- [ ] 1-04-PLAN.md — snapshot root, manifest, and index object, each versioned
-- [ ] 1-05-PLAN.md — passphrase generation and strength gate, plus the rollback anchor
-- [ ] 1-06-PLAN.md — the seven adversarial tests, each asserting zero plaintext
-- [ ] 1-07-PLAN.md — pinned known-answer vectors for the KDF, AEAD, hash, and composed format
-- [ ] 1-08-PLAN.md — CAL-3 and CAL-1 calibrations, and `docs/sync-format.md`
+- [ ] 1-01-PLAN.md — wave 1 — crate wiring, module tree, and the complete key hierarchy (tracer)
+- [ ] 1-02-PLAN.md — wave 2 — fixed 256 KiB chunker: keyed plaintext id, frame, zstd, padding, seal
+- [ ] 1-05-PLAN.md — wave 2 — passphrase generation and strength gate, plus the rollback anchor
+- [ ] 1-03-PLAN.md — wave 3 — pack format: blobs, sealed header, trailer id, sharded name
+- [ ] 1-04-PLAN.md — wave 3 — snapshot root, manifest, and index object, each with a read ceiling
+- [ ] 1-06-PLAN.md — wave 4 — the nine adversarial tests, each asserting zero plaintext
+- [ ] 1-08-PLAN.md — wave 4 — CAL-3 and CAL-1 calibrations, and `docs/sync-format.md`
+- [ ] 1-07-PLAN.md — wave 5 — pinned known-answer vectors, after the last plan that may edit `src/`
 
 **Success Criteria** (what must be TRUE):
 1. A multi-megabyte fixture round-trips byte-exactly through chunk → zstd → seal → pack → unpack →

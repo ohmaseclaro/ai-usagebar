@@ -1,5 +1,5 @@
 ---
-phase: 1-encrypted-bundle-core
+phase: 01-encrypted-bundle-core
 plan: 05
 type: execute
 wave: 2
@@ -49,9 +49,9 @@ Output: `src/sync/passphrase.rs`, `src/sync/anchor.rs`.
 </execution_context>
 
 <context>
-@.planning/phases/1-encrypted-bundle-core/1-CONTEXT.md
+@.planning/phases/01-encrypted-bundle-core/1-CONTEXT.md
 @.planning/research/encryption.md
-@.planning/phases/1-encrypted-bundle-core/1-01-SUMMARY.md
+@.planning/phases/01-encrypted-bundle-core/1-01-SUMMARY.md
 @src/sync/crypto.rs
 @src/cache.rs
 @CLAUDE.md
@@ -205,6 +205,6 @@ Write the `<behavior>` assertions with `tempfile::TempDir`.
 </success_criteria>
 
 <output>
-Create `.planning/phases/1-encrypted-bundle-core/1-05-SUMMARY.md` when done. Record the `accept`
+Create `.planning/phases/01-encrypted-bundle-core/1-05-SUMMARY.md` when done. Record the `accept`
 signature — 1-06 drives the rollback adversarial case through it.
 </output>

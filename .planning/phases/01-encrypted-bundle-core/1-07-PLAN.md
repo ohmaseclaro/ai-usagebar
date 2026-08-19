@@ -1,9 +1,9 @@
 ---
-phase: 1-encrypted-bundle-core
+phase: 01-encrypted-bundle-core
 plan: 07
 type: execute
-wave: 3
-depends_on: [1-01, 1-02, 1-03, 1-04]
+wave: 5
+depends_on: [1-06]
 files_modified:
   - tests/sync_vectors.rs
 autonomous: true
@@ -12,11 +12,12 @@ must_haves:
   truths:
     - "A crate upgrade that silently changes a primitive's semantics fails a test instead of changing the on-disk format."
     - "The KDF, the AEAD, and the keyed hash are each pinned against a value published by their own specification, not against our own output."
-    - "The composed format has a regression pin that would catch an accidental frame-layout change."
+    - "The composed format has a regression pin that would catch an accidental frame-layout or context-string change."
   artifacts:
-    - tests/sync_vectors.rs with the primitive vectors and the composed-format pin, each labelled by provenance
+    - tests/sync_vectors.rs with the primitive vectors and the composed-format pins, each labelled by provenance
   key_links:
-    - "Each vector's comment names where the expected value came from — a pin whose provenance is unrecorded is indistinguishable from a snapshot of a bug"
+    - "This plan runs after 1-06, the last plan with edit authority over src/sync/ — pinning before that would guarantee a red build and invite regenerating until green"
+    - "Each vector's comment names where the expected value came from; a pin whose provenance is unrecorded is indistinguishable from a snapshot of a bug"
 ---
 
 <objective>
@@ -28,6 +29,11 @@ upgrade cannot silently change the on-disk format. **D-03 (D3)** asks for the sa
 A round-trip test cannot do this job. It stays self-consistent under any wrong-but-stable transform,
 so an `argon2` 0.6 bump or a mistyped BLAKE3 context string would pass it while making every existing
 bundle unreadable.
+
+This plan runs **after** 1-06 and in its own wave, for a specific reason worth stating: 1-06 holds
+edit authority over every `src/sync/` file and may change behaviour to close an attack. A pin
+generated before that lands would go red on merge, and the natural next move — regenerating it until
+green — is precisely the failure this plan exists to prevent.
 
 This plan writes tests only. It has no authority to edit `src/`.
 
@@ -41,10 +47,11 @@ Output: `tests/sync_vectors.rs`.
 </execution_context>
 
 <context>
-@.planning/phases/1-encrypted-bundle-core/1-CONTEXT.md
+@.planning/phases/01-encrypted-bundle-core/1-CONTEXT.md
 @.planning/research/encryption.md
-@.planning/phases/1-encrypted-bundle-core/1-01-SUMMARY.md
-@.planning/phases/1-encrypted-bundle-core/1-02-SUMMARY.md
+@.planning/phases/01-encrypted-bundle-core/1-01-SUMMARY.md
+@.planning/phases/01-encrypted-bundle-core/1-02-SUMMARY.md
+@.planning/phases/01-encrypted-bundle-core/1-06-SUMMARY.md
 @src/safe_storage.rs
 @CLAUDE.md
 </context>
@@ -94,30 +101,42 @@ rather than as independent vectors — nobody else publishes a vector for this f
 is that they change loudly, not that they are externally correct.
 
 **Key hierarchy.** From a fixed password, a fixed 16-byte salt, and fixed cheap parameters, pin the
-resulting 32-byte KEK. Then, from a fixed 32-byte master key, pin all three subkeys. These catch a
-context-string typo, a parameter reordering, and an `argon2` semantics change in one place.
+resulting 32-byte KEK. Then, from a fixed 32-byte master key, pin all three subkeys separately —
+chunk, name, and root. Pinning them individually is what catches a context string wired to the wrong
+field, which is otherwise invisible: the hierarchy still works, it is just a different hierarchy.
 
-**Chunk sealing.** From a fixed master key and a fixed short plaintext, pin the resulting chunk id
-and the full ciphertext. Then assert the same input twice yields the same bytes, mirroring
-`safe_storage.rs`'s `assert_eq!(encrypt(&k, b"same"), encrypt(&k, b"same"))` — determinism is a
-security-relevant property here, not a convenience.
+**Chunk id.** From a fixed master key and a fixed short plaintext, pin the resulting chunk id. This
+one is a *stable* pin: the id is a keyed hash of the raw plaintext, so it must not change under a
+zstd upgrade. Say so in the comment — if this pin ever moves, dedup has broken for every existing
+user, which is a far bigger event than a failing test.
+
+**Chunk ciphertext.** Pin the full ciphertext for that same input, and note the asymmetry with the id
+above: the ciphertext covers the compressed frame, so a zstd version or default change may legitimately
+move it while the id stays put. A failure here is a prompt to check what changed and re-pin
+deliberately; a failure on the id above is not.
+
+Assert the same input sealed twice yields the same bytes, mirroring `safe_storage.rs`'s
+`assert_eq!(encrypt(&k, b"same"), encrypt(&k, b"same"))` — determinism is a security-relevant
+property here, not a convenience.
 
 **Full round trip.** From a fixed master key and a fixed plaintext spanning more than one chunk, pin
 the pack's content address and the sealed manifest's chunk id. This is the pin that catches a
-frame-layout drift, a zstd level change, or a serialization-order change in the manifest.
+frame-layout drift or a serialization-order change in the manifest.
 
-Generate the expected values by running the implementation once, then paste them in. State that
-provenance in a comment on every one of these: it is a pin of current behaviour, and if it ever fails
-the question is which of the two changed and why — never "regenerate it until green".
+Generate the expected values by running the implementation once — against the tree as it stands after
+1-06 has merged — then paste them in. State that provenance in a comment on every one of these: it is
+a pin of current behaviour, and if it ever fails the question is which of the two changed and why,
+never "regenerate it until green".
 
 If any pin cannot be produced because the value looks wrong on inspection — a chunk id that does not
-match the documented frame layout, say — stop and record it as a blocker in the summary. This plan
-does not edit `src/`; a mismatch in a locked design is a finding for the verifier, not a quick fix.
+match a directly computed `keys.chunk_id(plaintext)`, say — stop and record it as a blocker in the
+summary. This plan does not edit `src/`; a mismatch in a locked design is a finding for the verifier,
+not a quick fix.
   </action>
   <verify>
     <automated>cargo test --test sync_vectors</automated>
   </verify>
-  <done>Every composed-format pin passes and is commented as a regression pin of current behaviour with the never-regenerate-to-green rule stated.</done>
+  <done>Every composed-format pin passes and is commented as a regression pin of current behaviour, with the id pin marked stable across zstd upgrades and the ciphertext pin marked not.</done>
 </task>
 
 </tasks>
@@ -133,10 +152,10 @@ does not edit `src/`; a mismatch in a locked design is a finding for the verifie
 
 | Threat ID | Category | Component | Severity | Disposition | Mitigation Plan |
 |---|---|---|---|---|---|
-| T-07-01 | Tampering | a crate upgrade silently changing key derivation | high | mitigate | KEK and all three subkeys pinned; the RFC 9106 vector guards the crate independently |
-| T-07-02 | Tampering | a context-string typo forking the key hierarchy | high | mitigate | A `derive_key` reference vector plus per-subkey pins |
-| T-07-03 | Denial of service | a zstd or serialization change breaking every existing bundle | high | mitigate | Pack address and manifest id pinned over a multi-chunk fixture |
-| T-07-04 | Repudiation | a pin regenerated to green, hiding a real regression | medium | mitigate | Every pin carries its provenance in a comment and an explicit instruction never to regenerate on failure |
+| T-07-01 | Tampering | a crate upgrade silently changing key derivation | high | mitigate | KEK and all three subkeys pinned individually; the RFC 9106 vector guards the crate independently |
+| T-07-02 | Tampering | a context string wired to the wrong subkey | high | mitigate | Per-subkey pins plus a `derive_key` reference vector |
+| T-07-03 | Denial of service | a zstd upgrade re-identifying every chunk | high | mitigate | The chunk-id pin is over raw plaintext and marked stable, so a moved id is a loud, explicit event |
+| T-07-04 | Repudiation | a pin regenerated to green, hiding a real regression | medium | mitigate | Every pin carries its provenance and an explicit instruction never to regenerate on failure; the plan runs after the last plan holding `src/` edit authority, so a red pin is never routine |
 </threat_model>
 
 <verification>
@@ -146,13 +165,13 @@ does not edit `src/`; a mismatch in a locked design is a finding for the verifie
 
 <success_criteria>
 1. Argon2id, BLAKE3 `keyed_hash` and `derive_key`, and XChaCha20-Poly1305 each pinned against a published specification value with the source cited.
-2. The KEK and all three subkeys pinned from fixed inputs.
-3. A chunk id and its full ciphertext pinned, plus a determinism assertion.
+2. The KEK and all three subkeys pinned individually from fixed inputs.
+3. A chunk id pinned over raw plaintext and labelled stable, plus a ciphertext pin labelled zstd-sensitive, plus a determinism assertion.
 4. A multi-chunk round trip pinned by pack address and manifest id.
 5. Every pin is labelled by provenance, and the composed pins are labelled as regression pins.
 </success_criteria>
 
 <output>
-Create `.planning/phases/1-encrypted-bundle-core/1-07-SUMMARY.md` when done. Record any vector that
+Create `.planning/phases/01-encrypted-bundle-core/1-07-SUMMARY.md` when done. Record any vector that
 could not be sourced, and any pin whose value looked wrong on inspection.
 </output>
