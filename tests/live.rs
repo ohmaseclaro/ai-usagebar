@@ -52,6 +52,26 @@
 //! - **SuperGrok**: asks the official Grok Build CLI's `x.ai/billing` ACP
 //!   extension, then asserts usage percent and plan. Set
 //!   `SUPERGROK_GROK_BINARY` to the trusted official executable.
+//!
+//! ## Calibration probes (encrypted sync, plan 1-08)
+//!
+//! Two probes at the bottom of this file are not vendor smoke tests. They
+//! answer sizing questions the encrypted-sync format would otherwise have to
+//! guess at, and they live here because this is where the project keeps every
+//! test allowed to cost real seconds, real gibibytes, or a real network call —
+//! all of it behind `#[ignore]`, so `cargo test` and the AUR `check()` run
+//! neither.
+//!
+//! - **CAL-3**, `cal3_argon2id_timing_at_production_parameters`: what Argon2id
+//!   actually costs at the shipped m = 1 GiB / t = 3 / p = 1, plus the two
+//!   steps down a user on constrained hardware would take. Needs nothing but a
+//!   release build:
+//!   `cargo test --release --test live -- --ignored --nocapture cal3_`
+//! - **CAL-1**, `cal1_range_on_private_release_asset`: whether a private-repo
+//!   release asset honours `Range:` after the redirect to signed storage.
+//!   Credential-gated and skips cleanly when unset — see its own doc comment
+//!   for the three variables and `docs/sync-format.md` for what the answer
+//!   changes.
 
 use std::time::Duration;
 
@@ -550,4 +570,253 @@ async fn minimax_live() {
             .as_ref()
             .map(|w| w.utilization_pct),
     );
+}
+
+// ---------------------------------------------------------------------------
+// Calibration probes — encrypted sync bundle format, plan 1-08.
+// ---------------------------------------------------------------------------
+
+/// **CAL-3** — what Argon2id really costs at the parameters this build ships.
+///
+/// The 1582 ms in the research is one Apple M3 Max number, and the shipped
+/// default plus the memory floor should not rest on it alone. This times the
+/// production parameters and then two steps down, so a user who must lower
+/// `--kdf-memory` on constrained hardware has a curve to choose from rather
+/// than a single point.
+///
+/// `#[ignore]`d because it allocates a gibibyte and takes seconds, and the AUR
+/// `check()` runs `cargo test` on other people's machines. Run it in release:
+/// a debug-build Argon2 timing measures the optimiser, not the KDF.
+///
+/// ```bash
+/// cargo test --release --test live -- --ignored --nocapture \
+///     cal3_argon2id_timing_at_production_parameters
+/// ```
+#[test]
+#[ignore = "calibration; allocates 1 GiB and takes seconds — run with --ignored --release"]
+fn cal3_argon2id_timing_at_production_parameters() {
+    use ai_usagebar::sync::crypto::{KdfParams, available_memory_kib, derive_kek};
+
+    /// The shipped default, spelled out. If it ever drifts from
+    /// [`KdfParams::default`], this probe calibrates something nobody runs.
+    const PRODUCTION: KdfParams = KdfParams {
+        m_kib: 1_048_576,
+        t: 3,
+        p: 1,
+    };
+    assert_eq!(
+        PRODUCTION,
+        KdfParams::default(),
+        "the first row must be the parameters this build actually ships"
+    );
+
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    let available = available_memory_kib()
+        .map(|kib| format!("{} MiB", kib / 1024))
+        .unwrap_or_else(|| "unreported on this platform".into());
+
+    println!(
+        "CAL-3 — {}/{}, {profile} profile, available memory {available}",
+        std::env::consts::ARCH,
+        std::env::consts::OS,
+    );
+    if cfg!(debug_assertions) {
+        println!("  WARNING: a debug-build number is meaningless — re-run with --release");
+    }
+
+    // A fixed salt and a fixed password: this measures work, not secrecy, and
+    // random inputs would only make two runs incomparable.
+    let salt = [0x5au8; 16];
+    let password = b"calibration only, never a real passphrase";
+
+    for m_kib in [PRODUCTION.m_kib, PRODUCTION.m_kib / 2, PRODUCTION.m_kib / 4] {
+        let params = KdfParams {
+            m_kib,
+            ..PRODUCTION
+        };
+        let started = std::time::Instant::now();
+        let kek = derive_kek(password, &salt, params).expect("derivation must succeed");
+        let elapsed = started.elapsed();
+        // Read the result so the derivation cannot be optimised away.
+        assert_eq!(kek.len(), 32);
+        println!(
+            "  m={:>5} MiB  t={}  p={}  ->  {:>6} ms",
+            m_kib / 1024,
+            params.t,
+            params.p,
+            elapsed.as_millis(),
+        );
+    }
+}
+
+/// **CAL-1** — does a private-repo release asset honour a `Range:` request
+/// after the redirect to signed storage?
+///
+/// It decides pack sizing. If ranged reads work, one chunk can be fetched out
+/// of a large pack and packs may grow; if they do not, fetching one chunk means
+/// fetching its whole pack, and `sync::pack::PACK_TARGET` stays at the recorded
+/// 32 MiB fallback where that waste is tolerable.
+///
+/// **Setup** — a throwaway private repository with one release carrying an
+/// asset a little over 1 MiB (large enough that a whole-body `200` is
+/// unmistakable, small enough to download inside the timeout), and a
+/// fine-grained read-only PAT scoped to it. Delete the repository and revoke
+/// the token afterwards.
+///
+/// ```bash
+/// GSD_CAL1_TOKEN=github_pat_… \
+/// GSD_CAL1_REPO=owner/throwaway-repo \
+/// GSD_CAL1_ASSET=payload.bin \
+///   cargo test --test live -- --ignored --nocapture \
+///     cal1_range_on_private_release_asset
+/// ```
+///
+/// Skips with a printed message when the token is absent, so it is never a hard
+/// failure on a machine that was not set up for it. Reading an environment
+/// variable inside an `#[ignore]`d live test is the same carve-out every other
+/// probe in this file already uses; nothing in the default `cargo test` set
+/// touches the network.
+#[tokio::test]
+#[ignore = "live API; needs a throwaway private repo and token — run with --ignored"]
+async fn cal1_range_on_private_release_asset() {
+    let Some(token) = non_empty_var("GSD_CAL1_TOKEN") else {
+        eprintln!(
+            "cal1_range_on_private_release_asset: GSD_CAL1_TOKEN is unset — skipping; \
+             the 32 MiB pack fallback recorded in docs/sync-format.md stands"
+        );
+        return;
+    };
+    let (Some(repo), Some(asset_name)) = (
+        non_empty_var("GSD_CAL1_REPO"),
+        non_empty_var("GSD_CAL1_ASSET"),
+    ) else {
+        eprintln!(
+            "cal1_range_on_private_release_asset: GSD_CAL1_REPO (owner/name) and \
+             GSD_CAL1_ASSET (the asset's file name) must both be set — skipping"
+        );
+        return;
+    };
+
+    // Redirects are *not* followed automatically: the hop to signed storage is
+    // the thing being measured, and following it silently would also replay the
+    // GitHub token to a storage host that neither needs nor should see it.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    // The asset's *API* url, not `browser_download_url`: the latter is an HTML
+    // endpoint a token cannot authenticate.
+    let release: serde_json::Value = client
+        .get(format!(
+            "https://api.github.com/repos/{repo}/releases/latest"
+        ))
+        .header("authorization", format!("Bearer {token}"))
+        .header("accept", "application/vnd.github+json")
+        .header("user-agent", CAL1_UA)
+        .send()
+        .await
+        .expect("the release lookup must reach api.github.com")
+        // A 401/404 here is a broken setup, and must never be recorded as
+        // "Range is unsupported".
+        .error_for_status()
+        .expect("the release lookup must succeed — check the repo name and the token's scope")
+        .json()
+        .await
+        .expect("the release lookup must return JSON");
+
+    let asset = release["assets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|a| a["name"].as_str() == Some(asset_name.as_str()))
+        .unwrap_or_else(|| {
+            panic!("the latest release of {repo} carries no asset named {asset_name:?}")
+        });
+    let asset_url = asset["url"].as_str().expect("asset api url").to_string();
+    let asset_size = asset["size"].as_u64().unwrap_or_default();
+
+    println!("CAL-1 — {repo} asset {asset_name:?}, {asset_size} bytes");
+    if asset_size <= 1024 * 1024 {
+        println!("  WARNING: the asset is under 1 MiB — a whole-body 200 will be hard to tell");
+    }
+
+    let mut response = client
+        .get(&asset_url)
+        .header("authorization", format!("Bearer {token}"))
+        .header("accept", "application/octet-stream")
+        .header("user-agent", CAL1_UA)
+        .header("range", "bytes=0-1023")
+        .send()
+        .await
+        .expect("the ranged asset request must reach api.github.com");
+
+    if response.status().is_redirection() {
+        let location = header_value(&response, "location")
+            .expect("a redirect response must carry a Location header");
+        // Only the host is printed: a signed storage URL carries its
+        // credential in the query string, and this output goes to a terminal.
+        println!(
+            "  {} -> signed storage at {}",
+            response.status(),
+            reqwest::Url::parse(&location)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string))
+                .unwrap_or_else(|| "an unparseable location".into()),
+        );
+        response = client
+            .get(&location)
+            .header("user-agent", CAL1_UA)
+            .header("range", "bytes=0-1023")
+            .send()
+            .await
+            .expect("the signed-storage request must succeed");
+    }
+
+    let status = response.status();
+    let content_range = header_value(&response, "content-range");
+    let content_length = header_value(&response, "content-length");
+    let received = response.bytes().await.expect("a readable body").len();
+
+    println!(
+        "  status {status}, content-range {content_range:?}, \
+         content-length {content_length:?}, {received} bytes received"
+    );
+    assert!(
+        status.is_success(),
+        "the ranged fetch failed with {status} — that is a broken probe, not an answer about Range"
+    );
+    if status.as_u16() == 206 && content_range.is_some() {
+        println!(
+            "  CAL-1 = Range IS honoured. Phase 3 may raise sync::pack::PACK_TARGET above 32 MiB."
+        );
+    } else {
+        println!(
+            "  CAL-1 = Range is NOT honoured ({received} of {asset_size} bytes). \
+             The 32 MiB PACK_TARGET fallback stands."
+        );
+    }
+}
+
+/// User agent for the CAL-1 probe. GitHub's API requires one.
+const CAL1_UA: &str = "ai-usagebar-cal1";
+
+/// `Some` only for a variable that is both set and not blank — an exported but
+/// empty variable is how a half-finished setup usually looks, and it should
+/// skip rather than send an empty bearer token.
+fn non_empty_var(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+}
+
+fn header_value(response: &reqwest::Response, name: &str) -> Option<String> {
+    response
+        .headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
 }
