@@ -73,11 +73,12 @@
 //!   Credential-gated and skips cleanly when unset — see its own doc comment
 //!   for the three variables and `docs/sync-format.md` for what the answer
 //!   changes.
-//! - **CAL-2**, `cal2_desktop_state_chunk_stability`: whether Claude Desktop's
-//!   LevelDB compaction rewrites the profile wholesale between app restarts,
-//!   which decides whether `credentials` dominates the daily sync cost. Records
-//!   a digest snapshot per invocation and diffs against the previous one, so
-//!   the restart is the user's to make and the probe never forces one:
+//! - **CAL-2**, `cal2_desktop_state_chunk_stability`: how much of a profile's
+//!   `desktop-state/` is new bytes the next time claude-acc captures it, which
+//!   decides whether `credentials` dominates the daily sync cost. Records a
+//!   digest snapshot per invocation and diffs against the previous one, so the
+//!   capture is the user's to make and the probe never forces one. Note it is
+//!   an *account switch*, not an app restart, that rewrites those bytes:
 //!   `AI_USAGEBAR_CAL2_PROFILE=… AI_USAGEBAR_CAL2_SNAPSHOT=… cargo test --test
 //!   live -- --ignored --nocapture cal2_`
 //! - **CAL-4**, `cal4_default_bundle_compressed_size`: the real zstd-compressed
@@ -837,13 +838,23 @@ fn header_value(response: &reqwest::Response, name: &str) -> Option<String> {
 // Calibration probes — bundle scope and sizing, plan 2-06.
 // ---------------------------------------------------------------------------
 
-/// **CAL-2** — does Claude Desktop's LevelDB compaction rewrite the profile
-/// wholesale between app restarts?
+/// **CAL-2** — how much of a profile's `desktop-state/` is new bytes the next
+/// time it is written?
 ///
 /// It decides whether `credentials` dominates the *daily* cost of a sync. The
-/// category is only ~24 MB across this machine's four profiles, but if every
-/// restart re-writes all of it, that 24 MB uploads again every day, and
-/// `sync status` owes the user that sentence.
+/// category is ~24 MB across this machine's four profiles, and if each rewrite
+/// is wholesale then each rewrite re-uploads all of it, which is a sentence
+/// `sync status` owes the user.
+///
+/// **Read the trigger carefully, because the obvious one is wrong.** What the
+/// bundle carries is not Claude Desktop's live data dir: it is
+/// `~/.claude-acc/profiles/<label>/desktop-state/`, a *snapshot copy* that
+/// [`crate::claude_desktop`]'s `snapshot_profile` stages into a tempdir and
+/// renames into place when an account is switched away from — with the app
+/// already quit. Quitting and relaunching Claude Desktop therefore does not
+/// touch these bytes at all; only a capture does. Measuring across a plain
+/// restart would report 0% churn and mean nothing by it, so the second run has
+/// to sit on the far side of an account switch.
 ///
 /// The probe hashes each file under an injected `desktop-state/` root at fixed
 /// 256 KiB offsets and records the digests. Run it again later and it compares
@@ -852,15 +863,16 @@ fn header_value(response: &reqwest::Response, name: &str) -> Option<String> {
 /// which is a property of the boundaries, not of the function that names them —
 /// so this stays independent of the sync key material entirely.
 ///
-/// **It never restarts anything.** Two invocations separated by a restart the
-/// user makes on their own schedule is the whole protocol:
+/// **It never restarts, quits or switches anything.** Two invocations separated
+/// by whatever the user does on their own schedule is the whole protocol:
 ///
 /// ```bash
 /// # 1. before — writes the baseline
 /// AI_USAGEBAR_CAL2_PROFILE=~/.claude-acc/profiles/<label>/desktop-state \
-/// AI_USAGEBAR_CAL2_SNAPSHOT=/tmp/cal2-a.json \
-///   cargo test --test live -- --ignored --nocapture cal2_
-/// # 2. quit Claude Desktop, relaunch it, let it settle, quit it again
+/// AI_USAGEBAR_CAL2_SNAPSHOT=~/.cache/ai-usagebar-cal2/<label>.json \
+///   cargo test --release --test live -- --ignored --nocapture cal2_
+/// # 2. use Claude Desktop on that account, then switch away from it — that
+/// #    switch is what re-captures the profile
 /// # 3. after — same two variables, same snapshot path: prints the churn
 /// ```
 ///
@@ -877,9 +889,9 @@ fn cal2_desktop_state_chunk_stability() {
         eprintln!(
             "cal2_desktop_state_chunk_stability: needs AI_USAGEBAR_CAL2_PROFILE (a \
              profile's desktop-state/ directory) and AI_USAGEBAR_CAL2_SNAPSHOT (a \
-             scratch .json path) — skipping. Run it once, restart Claude Desktop, \
-             run it again; see docs/sync-calibration.md for the fallback that \
-             applies until then."
+             scratch .json path) — skipping. Run it once, let an account switch \
+             re-capture that profile, run it again; see docs/sync-calibration.md \
+             for the fallback that applies until then."
         );
         return;
     };
@@ -904,8 +916,10 @@ fn cal2_desktop_state_chunk_stability() {
     let Some(previous) = cal2_load(&snapshot) else {
         cal2_store(&snapshot, &current);
         println!("  no prior snapshot — baseline written to the given path.");
-        println!("  Quit Claude Desktop, relaunch it, let it settle, quit it again,");
-        println!("  then re-run this exact command for the churn figure.");
+        println!("  Use Claude Desktop on this account and then switch away from it —");
+        println!("  the switch is what re-captures the profile — and re-run this");
+        println!("  exact command for the churn figure. A plain app restart will not");
+        println!("  move these bytes and would only produce a meaningless 0%.");
         return;
     };
 
@@ -951,15 +965,24 @@ fn cal2_desktop_state_chunk_stability() {
     for name in disappeared.iter().take(20) {
         println!("    - {name}");
     }
-    if changed_bytes * 2 > bytes {
+    if changed == 0 && appeared.is_empty() && disappeared.is_empty() {
+        // Not an answer. `snapshot_profile` renames a freshly staged copy into
+        // place, so a re-captured profile always has *some* new bytes — an
+        // identical tree means no capture happened between the two runs.
+        println!(
+            "  CAL-2 = INCONCLUSIVE: byte-for-byte identical, so this profile was \
+             not re-captured between the two runs. Switch away from this account \
+             (or run a capture) and re-run; do not record 0% as the answer."
+        );
+    } else if changed_bytes * 2 > bytes {
         println!(
             "  CAL-2 = the category churns wholesale. `sync status` must say that \
-             credentials re-uploads most of itself on every restart."
+             credentials re-uploads most of itself whenever the profile is captured."
         );
     } else {
         println!(
-            "  CAL-2 = compaction is partial. Dedup carries most of the category \
-             across a restart."
+            "  CAL-2 = the rewrite is partial. Dedup carries most of the category \
+             across a capture."
         );
     }
     cal2_store(&snapshot, &current);
