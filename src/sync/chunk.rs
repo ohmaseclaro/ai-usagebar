@@ -13,12 +13,19 @@
 //! upgrade boundary.
 //!
 //! Hashing the plaintext means two machines on different zstd versions may
-//! produce *different ciphertext* for one id. That is harmless: both decrypt to
-//! identical plaintext, and the first upload simply wins.
+//! produce *different ciphertext* for one id. State that precisely, because the
+//! sloppy version of it was a real vulnerability: it is harmless **for dedup**
+//! — both decrypt to identical plaintext and the first upload simply wins — and
+//! it is *not* harmless for nonce safety. One id covering two distinct messages
+//! is exactly the input that would reuse a nonce, so
+//! `crypto::Keys::seal` derives the nonce
+//! from the framed bytes it encrypts rather than from the id, and stores it
+//! inline. See its safety contract before changing either address.
 //!
 //! # Frame layout
 //!
-//! The bytes handed to [`crypto::Keys::seal`](crate::sync::crypto::Keys::seal):
+//! The bytes handed to `crypto::Keys::seal`,
+//! which prepends the 24-byte nonce it derives from them:
 //!
 //! | Offset | Size       | Field                                            |
 //! |--------|------------|--------------------------------------------------|
@@ -238,8 +245,11 @@ mod tests {
     /// Poly1305's tag, appended by every seal.
     const TAG_LEN: usize = 16;
 
+    /// The XChaCha20 nonce every seal stores inline, ahead of the ciphertext.
+    const NONCE_LEN: usize = 24;
+
     fn keys() -> Keys {
-        Keyfile::create(b"correct horse battery staple", CHEAP)
+        Keyfile::create_with_floor(b"correct horse battery staple", CHEAP, CHEAP.m_kib)
             .expect("keyfile creation")
             .1
     }
@@ -324,7 +334,7 @@ mod tests {
             long.ciphertext.len(),
             "the sealed size must not track the exact tail length"
         );
-        assert!((short.ciphertext.len() - TAG_LEN).is_power_of_two());
+        assert!((short.ciphertext.len() - NONCE_LEN - TAG_LEN).is_power_of_two());
     }
 
     #[test]

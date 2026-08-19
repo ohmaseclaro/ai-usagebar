@@ -20,7 +20,10 @@
 //! point takes [`KdfParams`] by argument rather than reading a default inside
 //! itself; that is the cheap-KDF test seam. Tests pass `{ m_kib: 8, t: 1, p: 1 }`
 //! and run in microseconds, which keeps the AUR `check()` inside its time budget.
-//! Production passes [`KdfParams::default`].
+//! Production passes [`KdfParams::default`]. Those parameters are bounded rather
+//! than trusted: [`MIN_KDF_MEMORY_KIB`] on the write path (with the floor itself
+//! as an argument, so the cheap seam survives it) and [`MAX_KDF_MEMORY_KIB`] on
+//! the read path, where `m_kib` arrives from a hostile remote.
 //!
 //! Secret hygiene is structural, not aspirational: key material lives in
 //! `Zeroizing`, [`Keys`] has a hand-written `Debug` that prints `<redacted>`,
@@ -76,6 +79,76 @@ impl Default for KdfParams {
             p: 1,
         }
     }
+}
+
+/// The smallest Argon2id working set a *new* keyfile may be written at: 8 MiB.
+///
+/// Argon2's own floor is `8 * p` KiB, which is not a security parameter — it is
+/// the smallest input the algorithm is defined for. Accepting it made the
+/// 12-character password floor in [`crate::sync::passphrase`] arithmetic against
+/// a guess rate nothing enforced: that figure is derived from what the *shipped*
+/// parameters buy, and at 8 KiB a 12-character password falls in an afternoon.
+///
+/// 8 MiB is 1/128 of the shipped default and a thousand times argon2's floor.
+/// The floor and the passphrase policy are also coupled directly — below
+/// [`KdfParams::default`]'s memory, `passphrase::check` accepts nothing short of
+/// generated strength — because a floor alone only moves the line, while the
+/// coupling makes lowering the KDF cost pay for itself in password strength.
+///
+/// Only new keyfiles. An existing bundle written below this stays openable
+/// forever: refusing to *read* it would destroy data to enforce a policy the
+/// user cannot retroactively satisfy.
+pub const MIN_KDF_MEMORY_KIB: u32 = 8 * 1024;
+
+/// The largest Argon2id working set this build will ever ask for: 4 GiB.
+///
+/// `m_kib` arrives from the keyfile, which arrives from a remote the format
+/// treats as hostile. `argon2` 0.5.3 sets `MAX_M_COST = u32::MAX` and allocates
+/// its blocks with an **infallible** `vec![]`, so one edited integer is a
+/// `handle_alloc_error` abort or an OOM kill — reached *before* the AAD binding
+/// gets its chance to make the unwrap fail, and in flat violation of the
+/// project's hard invariant that the widget always exits 0.
+///
+/// Four gibibytes is four times the shipped default and far past any parameter
+/// set a human would choose, so it costs a legitimate bundle nothing. This is a
+/// hard ceiling, not a fit-in-RAM check; [`check_memory_budget`] is the separate,
+/// actionable pre-flight a surface runs against the machine it is on.
+pub const MAX_KDF_MEMORY_KIB: u32 = 4 * 1024 * 1024;
+
+/// Refuse writing a new keyfile below `min_m_kib` — normally
+/// [`MIN_KDF_MEMORY_KIB`].
+///
+/// Only ever applied on the *write* path. Reading is deliberately unbounded
+/// below, so raising the floor later cannot strand a bundle already on a user's
+/// disk.
+fn check_kdf_floor(m_kib: u32, min_m_kib: u32) -> Result<()> {
+    if m_kib >= min_m_kib {
+        return Ok(());
+    }
+    Err(AppError::Other(format!(
+        "refusing to write a keyfile at {m_kib} KiB of key-derivation memory: \
+         the floor is {min_m_kib} KiB. Below it, guessing the password offline \
+         is cheap enough that the length rules stop meaning anything — and a \
+         bundle written now is attackable forever"
+    )))
+}
+
+/// Refuse an Argon2id memory parameter above [`MAX_KDF_MEMORY_KIB`], before
+/// anything allocates it.
+///
+/// Pure and clock-free, like everything else here. The parameters are public —
+/// they live in cleartext in the keyfile — so naming them is safe.
+fn check_kdf_ceiling(m_kib: u32) -> Result<()> {
+    if m_kib <= MAX_KDF_MEMORY_KIB {
+        return Ok(());
+    }
+    Err(AppError::Other(format!(
+        "this keyfile asks for {} MiB of key-derivation memory, above the \
+         {} MiB ceiling this build will allocate — refusing before the \
+         allocation rather than aborting inside it",
+        m_kib / 1024,
+        MAX_KDF_MEMORY_KIB / 1024
+    )))
 }
 
 /// Password + salt -> key-encryption key.
@@ -250,10 +323,25 @@ pub struct Keyfile {
 impl Keyfile {
     /// Draw a fresh master key and wrap it under `pw`. Returns both the keyfile
     /// to persist and the live subkeys, so the caller never pays the KDF twice.
+    ///
+    /// Refuses `k.m_kib` below [`MIN_KDF_MEMORY_KIB`]. **Every production caller
+    /// uses this**, not [`Keyfile::create_with_floor`].
     pub fn create(pw: &[u8], k: KdfParams) -> Result<(Keyfile, Keys)> {
+        Self::create_with_floor(pw, k, MIN_KDF_MEMORY_KIB)
+    }
+
+    /// [`Keyfile::create`] with the memory floor as an argument — the cheap-KDF
+    /// test seam, the same shape as `Cache::at` beside `Cache::for_vendor`.
+    ///
+    /// Tests wrap at `m_kib = 8` and run in microseconds, which is what keeps
+    /// the AUR `check()` inside its budget on an installer's machine; they pass
+    /// their own parameters as the floor. Production has no reason to call this:
+    /// a caller that wants a lower floor wants [`MIN_KDF_MEMORY_KIB`] lowered,
+    /// where the argument for it can be read.
+    pub fn create_with_floor(pw: &[u8], k: KdfParams, min_m_kib: u32) -> Result<(Keyfile, Keys)> {
         let mut mk = Zeroizing::new([0u8; 32]);
         fill(&mut mk[..])?;
-        let keyfile = Self::wrap(&mk, pw, k)?;
+        let keyfile = Self::wrap(&mk, pw, k, min_m_kib)?;
         Ok((keyfile, subkeys(&mk)))
     }
 
@@ -274,12 +362,31 @@ impl Keyfile {
     /// needs the old keyfile asset deleted from the remote, which Phase 4 owns —
     /// and even then, a keyfile already in git history stays unwrappable with
     /// the old password forever. Password change is not revocation.
+    /// Refuses `k.m_kib` below [`MIN_KDF_MEMORY_KIB`], exactly as
+    /// [`Keyfile::create`] does: a rewrap is the other way to choose the
+    /// parameters a bundle lives at, so a floor that only guarded `create` would
+    /// be a floor with a documented way around it.
     pub fn rewrap(&self, old_pw: &[u8], new_pw: &[u8], k: KdfParams) -> Result<Keyfile> {
-        let mk = self.unwrap_master_key(old_pw)?;
-        Self::wrap(&mk, new_pw, k)
+        self.rewrap_with_floor(old_pw, new_pw, k, MIN_KDF_MEMORY_KIB)
     }
 
-    fn wrap(mk: &[u8; 32], pw: &[u8], k: KdfParams) -> Result<Keyfile> {
+    /// [`Keyfile::rewrap`] with the memory floor as an argument. The test seam;
+    /// see [`Keyfile::create_with_floor`].
+    pub fn rewrap_with_floor(
+        &self,
+        old_pw: &[u8],
+        new_pw: &[u8],
+        k: KdfParams,
+        min_m_kib: u32,
+    ) -> Result<Keyfile> {
+        let mk = self.unwrap_master_key(old_pw)?;
+        Self::wrap(&mk, new_pw, k, min_m_kib)
+    }
+
+    fn wrap(mk: &[u8; 32], pw: &[u8], k: KdfParams, min_m_kib: u32) -> Result<Keyfile> {
+        check_kdf_floor(k.m_kib, min_m_kib)?;
+        check_kdf_ceiling(k.m_kib)?;
+
         let mut salt = [0u8; 16];
         let mut nonce = [0u8; NONCE_LEN];
         fill(&mut salt)?;
@@ -307,9 +414,11 @@ impl Keyfile {
     }
 
     fn unwrap_master_key(&self, pw: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
-        // Version gate *before* any cryptographic work: refusing a too-new
-        // bundle must not cost 1.5 s and a gibibyte first.
+        // Both gates run *before* any cryptographic work: refusing a too-new
+        // bundle must not cost 1.5 s and a gibibyte first, and refusing an
+        // absurd working set must not cost the allocation it is refusing.
         check_version(self.format, MAX_SUPPORTED_KEYFILE, "keyfile")?;
+        check_kdf_ceiling(self.kdf.m_kib)?;
 
         let salt = self.kdf.salt_bytes()?;
         let nonce = self.nonce_bytes()?;
@@ -372,27 +481,73 @@ impl Keys {
         ChunkId(*blake3::keyed_hash(&self.name, plaintext).as_bytes())
     }
 
-    /// Seal a chunk under its own id. Deterministic by construction: the nonce
-    /// is a function of the id, which is a function of the plaintext. Identical
-    /// plaintext therefore yields byte-identical ciphertext, which is what makes
-    /// dedup work at all and what keeps re-syncing unchanged data from creating
-    /// new git objects forever.
+    /// Seal `message` under `id`, with the nonce derived from **the message
+    /// itself** and stored inline as the first [`NONCE_LEN`] bytes — the same
+    /// framing [`Keys::seal_root`] uses.
     ///
-    /// The id is bound as associated data, so a chunk served under the wrong
-    /// name fails the tag.
-    pub fn seal(&self, id: &ChunkId, plaintext: &[u8]) -> Result<Vec<u8>> {
-        XChaCha20Poly1305::new((&*self.chunk).into())
+    /// # Safety contract: the nonce binds to the message, the AAD binds to the id
+    ///
+    /// A derived nonce is only safe under **nonce ↔ message** injectivity. This
+    /// used to derive the nonce from `id`, which addresses the *pre-image* the
+    /// caller framed and compressed rather than the bytes handed to the AEAD —
+    /// and zstd guarantees format compatibility across versions, not
+    /// byte-identical output. Two builds compressing one plaintext differently
+    /// therefore sealed two distinct messages under one
+    /// `(chunk_key, nonce, aad)`: Poly1305 one-time-key recovery and keystream
+    /// recovery, both reachable from an ordinary heterogeneous fleet. The nonce
+    /// is now `derive_key(CTX_NONCE, keyed_hash(name_key, message))[..24]`, so a
+    /// message that differs by one bit is sealed under a different nonce whether
+    /// or not its id moved.
+    ///
+    /// **Any future caller must preserve that.** The nonce may be derived only
+    /// from the exact bytes passed as `message`; the id may be anything that
+    /// addresses them, because it is authenticated as associated data rather
+    /// than trusted to be unique per message.
+    ///
+    /// `pub(crate)` because `chunk::seal_chunk` is the one caller that gets the
+    /// framing right. Callers outside this crate go through
+    /// [`crate::sync::chunk::seal_chunk`].
+    ///
+    /// Deterministic within a build: the same message yields the same nonce and
+    /// therefore byte-identical output, which is what makes dedup work at all
+    /// and what keeps re-syncing unchanged data from creating new git objects
+    /// forever.
+    pub(crate) fn seal(&self, id: &ChunkId, message: &[u8]) -> Result<Vec<u8>> {
+        let nonce = self.chunk_nonce(message);
+        let sealed = XChaCha20Poly1305::new((&*self.chunk).into())
             .encrypt(
-                &nonce_for(id).into(),
+                &nonce.into(),
                 Payload {
-                    msg: plaintext,
+                    msg: message,
                     aad: id.as_bytes(),
                 },
             )
-            .map_err(|_| AppError::Other("chunk encryption failed".into()))
+            .map_err(|_| AppError::Other("chunk encryption failed".into()))?;
+
+        let mut framed = Vec::with_capacity(NONCE_LEN + sealed.len());
+        framed.extend_from_slice(&nonce);
+        framed.extend_from_slice(&sealed);
+        Ok(framed)
     }
 
-    /// Open a chunk sealed under `id`.
+    /// A chunk's nonce: derived from the bytes actually encrypted, keyed so
+    /// nobody without `name_key` can predict it for a guessed message.
+    ///
+    /// See [`Keys::seal`] for why this takes the message rather than the id.
+    fn chunk_nonce(&self, message: &[u8]) -> [u8; NONCE_LEN] {
+        let derived = blake3::derive_key(
+            CTX_NONCE,
+            blake3::keyed_hash(&self.name, message).as_bytes(),
+        );
+        let mut nonce = [0u8; NONCE_LEN];
+        nonce.copy_from_slice(&derived[..NONCE_LEN]);
+        nonce
+    }
+
+    /// Open a chunk sealed under `id`. `framed` is `nonce ‖ ciphertext ‖ tag`,
+    /// and the length is validated before the split: the bytes arrive from a
+    /// remote an attacker may control, so a truncated chunk must be an error,
+    /// never a panic.
     ///
     /// This performs **no** `chunk_id(plaintext) == id` identity recheck, and
     /// that is deliberate. The id addresses the caller's *raw plaintext*, while
@@ -417,12 +572,17 @@ impl Keys {
     /// nobody without `name_key` can invert it or confirm a guess against it. It
     /// is an address, not a secret — CRYPTO-07 is about keys, passwords, and
     /// plaintext, none of which is here.
-    pub fn open(&self, id: &ChunkId, ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    pub fn open(&self, id: &ChunkId, framed: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+        if framed.len() < NONCE_LEN + TAG_LEN {
+            return Err(AppError::Other(format!("chunk {id} is truncated")));
+        }
+        let (nonce, sealed) = framed.split_at(NONCE_LEN);
+        let nonce: [u8; NONCE_LEN] = nonce.try_into().expect("length checked above");
         XChaCha20Poly1305::new((&*self.chunk).into())
             .decrypt(
-                &nonce_for(id).into(),
+                &nonce.into(),
                 Payload {
-                    msg: ciphertext,
+                    msg: sealed,
                     aad: id.as_bytes(),
                 },
             )
@@ -439,7 +599,11 @@ impl Keys {
     /// snapshots. It gets a fresh random 24-byte nonce, stored inline as the
     /// first `NONCE_LEN` bytes of the framed output; XChaCha's 192-bit nonce
     /// makes random generation safe with no counter accounting.
-    pub fn seal_root(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+    ///
+    /// `repo_id` is bound into the associated data, so a root belonging to
+    /// another bundle fails the tag here rather than depending on local state to
+    /// notice — see [`Keys::open_root`].
+    pub fn seal_root(&self, plaintext: &[u8], repo_id: &str) -> Result<Vec<u8>> {
         let mut nonce = [0u8; NONCE_LEN];
         fill(&mut nonce)?;
         let sealed = XChaCha20Poly1305::new((&*self.root).into())
@@ -447,7 +611,7 @@ impl Keys {
                 &nonce.into(),
                 Payload {
                     msg: plaintext,
-                    aad: ROOT_AAD,
+                    aad: &root_aad(repo_id),
                 },
             )
             .map_err(|_| AppError::Other("snapshot root encryption failed".into()))?;
@@ -458,10 +622,19 @@ impl Keys {
         Ok(framed)
     }
 
-    /// Open a framed snapshot root. Validates the length before slicing: the
-    /// bytes arrive from a remote an attacker may control, and a truncated root
-    /// must be an error, not a panic.
-    pub fn open_root(&self, framed: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    /// Open a framed snapshot root belonging to `repo_id`. Validates the length
+    /// before slicing: the bytes arrive from a remote an attacker may control,
+    /// and a truncated root must be an error, not a panic.
+    ///
+    /// **`repo_id` is the caller's expectation, read from local configuration —
+    /// never the value the remote claims.** It is bound as associated data, so a
+    /// root belonging to a different bundle fails the Poly1305 tag here. That
+    /// matters because the root is the entry point: two bundles sharing a master
+    /// key (a copied keyfile, a second remote for the same machine) would
+    /// otherwise open each other's roots, and a cross-bundle replay would depend
+    /// entirely on local anchor state to notice. Taking the id from the remote
+    /// would make the binding say nothing at all.
+    pub fn open_root(&self, framed: &[u8], repo_id: &str) -> Result<Zeroizing<Vec<u8>>> {
         if framed.len() < NONCE_LEN + TAG_LEN {
             return Err(AppError::Other("snapshot root is truncated".into()));
         }
@@ -472,7 +645,7 @@ impl Keys {
                 &nonce.into(),
                 Payload {
                     msg: sealed,
-                    aad: ROOT_AAD,
+                    aad: &root_aad(repo_id),
                 },
             )
             .map(Zeroizing::new)
@@ -480,18 +653,22 @@ impl Keys {
     }
 }
 
-/// Associated data for the snapshot root. A fixed literal, not the root's own
-/// address: the root is the mutable entry point and has no content address.
-const ROOT_AAD: &[u8] = b"ai-usagebar.sync.v1 root";
-
-/// A chunk's nonce, derived from its id. Never reused for two different
-/// plaintexts, because two different plaintexts get two different ids.
-fn nonce_for(id: &ChunkId) -> [u8; NONCE_LEN] {
-    let derived = blake3::derive_key(CTX_NONCE, id.as_bytes());
-    let mut nonce = [0u8; NONCE_LEN];
-    nonce.copy_from_slice(&derived[..NONCE_LEN]);
-    nonce
+/// Associated data for the snapshot root: a fixed literal scoping the format,
+/// concatenated with the repository this root belongs to.
+///
+/// The literal alone is not enough. The root is the mutable entry point and has
+/// no content address of its own, so without the `repo_id` its AAD is the same
+/// constant in every bundle in the world — and any two bundles sharing a master
+/// key would open each other's roots. `repo_id` is not length-prefixed because
+/// it is the last field: no other value follows it to be confused with.
+fn root_aad(repo_id: &str) -> Vec<u8> {
+    let mut aad = ROOT_AAD.to_vec();
+    aad.extend_from_slice(repo_id.as_bytes());
+    aad
 }
+
+/// The format-scoping half of [`root_aad`].
+const ROOT_AAD: &[u8] = b"ai-usagebar.sync.v1 root";
 
 /// Unkeyed BLAKE3, for naming an object whose bytes are already public
 /// ciphertext — a pack file, say.
@@ -505,11 +682,17 @@ pub fn content_address(bytes: &[u8]) -> ChunkId {
     ChunkId(*blake3::hash(bytes).as_bytes())
 }
 
-/// Refuse an Argon2 working set that does not fit, before allocating it.
+/// Refuse an Argon2 working set that does not fit *this machine*, before
+/// allocating it.
 ///
 /// Pure, and takes `available_kib` by argument: that is the seam, exactly as
 /// `Cache::at` exists so no test calls `Cache::for_vendor`. A 1 GB box must get
 /// an actionable refusal naming `--kdf-memory`, never an OOM abort.
+///
+/// This is the *pre-flight*, for a surface that knows how much memory it has and
+/// can print something a user can act on. It is not the safety net:
+/// `check_kdf_ceiling` is, it runs inside [`Keyfile::open`] with no dependency
+/// on a caller remembering anything, and it does not read the machine.
 pub fn check_memory_budget(m_kib: u32, available_kib: u64) -> Result<()> {
     if u64::from(m_kib) <= available_kib {
         return Ok(());
@@ -575,14 +758,20 @@ mod tests {
     };
 
     fn keys() -> Keys {
-        Keyfile::create(b"correct horse battery staple", CHEAP)
+        Keyfile::create_with_floor(b"correct horse battery staple", CHEAP, CHEAP.m_kib)
             .expect("keyfile creation")
             .1
     }
 
+    /// What a caller reads out of its own configuration and hands to
+    /// [`Keys::open_root`] — never a value taken from the remote.
+    const REPO_ID: &str = "usagebar-sync-abc123";
+
     #[test]
     fn password_round_trips_to_a_sealed_and_reopened_buffer() {
-        let (keyfile, keys) = Keyfile::create(b"correct horse battery staple", CHEAP).unwrap();
+        let (keyfile, keys) =
+            Keyfile::create_with_floor(b"correct horse battery staple", CHEAP, CHEAP.m_kib)
+                .unwrap();
 
         let plaintext = b"the quick brown fox".as_slice();
         let id = keys.chunk_id(plaintext);
@@ -608,6 +797,57 @@ mod tests {
         );
     }
 
+    /// The regression guard for the nonce-reuse blocker.
+    ///
+    /// `seal_chunk` addresses a chunk by its *raw plaintext* and encrypts that
+    /// plaintext's compressed frame. zstd guarantees format compatibility across
+    /// versions, not byte-identical output, so two builds can hand one id two
+    /// different messages. If the nonce were still derived from the id, those
+    /// two messages would be sealed under one `(chunk_key, nonce, aad)` — a
+    /// solvable Poly1305 key and `C_A ⊕ C_B = F_A ⊕ F_B`.
+    ///
+    /// Two zstd versions are not installable in a unit test, so the differing
+    /// framing is simulated directly: the same id, two different messages, which
+    /// is exactly the shape a zstd bump produces.
+    #[test]
+    fn two_framings_of_one_plaintext_are_sealed_under_different_nonces() {
+        let keys = keys();
+        let id = keys.chunk_id(b"one plaintext, two zstd builds");
+
+        // Same declared `true_len`, different compressed bytes — the collision a
+        // heterogeneous fleet produces.
+        let mut a = 23u32.to_le_bytes().to_vec();
+        a.extend_from_slice(b"\x09\x00\x00\x00 frame as vN wrote it");
+        let mut b = 23u32.to_le_bytes().to_vec();
+        b.extend_from_slice(b"\x0a\x00\x00\x00 frame as vN+1 wrote");
+
+        let (sealed_a, sealed_b) = (keys.seal(&id, &a).unwrap(), keys.seal(&id, &b).unwrap());
+        assert_ne!(
+            sealed_a[..NONCE_LEN],
+            sealed_b[..NONCE_LEN],
+            "two distinct messages were sealed under one nonce — the AEAD's \
+             one-time-key assumption is broken and both are recoverable"
+        );
+
+        // …and both still open under the id they were sealed with, so the nonce
+        // really did travel inline rather than being re-derived from the id.
+        assert_eq!(&**keys.open(&id, &sealed_a).unwrap(), &a[..]);
+        assert_eq!(&**keys.open(&id, &sealed_b).unwrap(), &b[..]);
+    }
+
+    #[test]
+    fn a_chunk_shorter_than_a_nonce_and_a_tag_errors_instead_of_panicking() {
+        let keys = keys();
+        let id = keys.chunk_id(b"addressable");
+        for len in [0, 1, NONCE_LEN, NONCE_LEN + TAG_LEN - 1] {
+            let err = keys
+                .open(&id, &vec![0u8; len])
+                .expect_err("a {len}-byte chunk must be refused, not indexed into")
+                .to_string();
+            assert!(err.contains("is truncated"), "at {len} bytes: {err}");
+        }
+    }
+
     #[test]
     fn the_three_subkeys_are_distinct() {
         let keys = keys();
@@ -618,7 +858,8 @@ mod tests {
 
     #[test]
     fn a_wrong_password_yields_an_error_and_no_plaintext() {
-        let (keyfile, _) = Keyfile::create(b"the real password", CHEAP).unwrap();
+        let (keyfile, _) =
+            Keyfile::create_with_floor(b"the real password", CHEAP, CHEAP.m_kib).unwrap();
         let err = keyfile
             .open(b"not the real password")
             .expect_err("a wrong password must not open the keyfile")
@@ -653,14 +894,14 @@ mod tests {
     fn a_root_sealed_twice_differs_but_both_copies_reopen() {
         let keys = keys();
         let plaintext = b"counter=7".as_slice();
-        let first = keys.seal_root(plaintext).unwrap();
-        let second = keys.seal_root(plaintext).unwrap();
+        let first = keys.seal_root(plaintext, REPO_ID).unwrap();
+        let second = keys.seal_root(plaintext, REPO_ID).unwrap();
 
         // Fresh random nonce per seal: the root's plaintext changes every sync,
         // so deterministic sealing would leak equality between snapshots.
         assert_ne!(first, second);
-        assert_eq!(&*keys.open_root(&first).unwrap(), plaintext);
-        assert_eq!(&*keys.open_root(&second).unwrap(), plaintext);
+        assert_eq!(&*keys.open_root(&first, REPO_ID).unwrap(), plaintext);
+        assert_eq!(&*keys.open_root(&second, REPO_ID).unwrap(), plaintext);
     }
 
     #[test]
@@ -673,9 +914,28 @@ mod tests {
             name: alice.name.clone(),
             root: Zeroizing::new([0x5a; 32]),
         };
-        let sealed = alice.seal_root(b"counter=7").unwrap();
-        assert!(mallory.open_root(&sealed).is_err());
-        assert!(alice.open_root(&sealed).is_ok());
+        let sealed = alice.seal_root(b"counter=7", REPO_ID).unwrap();
+        assert!(mallory.open_root(&sealed, REPO_ID).is_err());
+        assert!(alice.open_root(&sealed, REPO_ID).is_ok());
+    }
+
+    /// The root's AAD is scoped to the bundle, not only to the format.
+    ///
+    /// Two bundles can share a master key — a copied keyfile, or a second remote
+    /// added for the same machine — and with a fixed AAD literal each would open
+    /// the other's root. That makes a cross-bundle replay depend entirely on
+    /// local anchor state to notice, which is exactly the dependency F-3 removes.
+    #[test]
+    fn a_root_from_another_bundle_fails_the_tag_under_the_same_master_key() {
+        let keys = keys();
+        let sealed = keys.seal_root(b"counter=7", "bundle-a").unwrap();
+
+        assert!(
+            keys.open_root(&sealed, "bundle-b").is_err(),
+            "a root sealed for another bundle must fail the tag, not open"
+        );
+        // …and it is the scoping that refuses it, not a broken round trip.
+        assert_eq!(&*keys.open_root(&sealed, "bundle-a").unwrap(), b"counter=7");
     }
 
     #[test]
@@ -683,7 +943,7 @@ mod tests {
         let keys = keys();
         for len in [0, 1, NONCE_LEN, NONCE_LEN + TAG_LEN - 1] {
             assert!(
-                keys.open_root(&vec![0u8; len]).is_err(),
+                keys.open_root(&vec![0u8; len], REPO_ID).is_err(),
                 "a {len}-byte root must be refused, not indexed into"
             );
         }
@@ -691,9 +951,10 @@ mod tests {
 
     #[test]
     fn rewrap_under_a_new_password_preserves_the_subkeys() {
-        let (keyfile, original) = Keyfile::create(b"first password", CHEAP).unwrap();
+        let (keyfile, original) =
+            Keyfile::create_with_floor(b"first password", CHEAP, CHEAP.m_kib).unwrap();
         let rewrapped = keyfile
-            .rewrap(b"first password", b"second password", CHEAP)
+            .rewrap_with_floor(b"first password", b"second password", CHEAP, CHEAP.m_kib)
             .unwrap();
 
         // A fresh salt and nonce, so the bytes differ …
@@ -712,12 +973,62 @@ mod tests {
 
     #[test]
     fn rewrap_with_the_wrong_old_password_produces_no_keyfile() {
-        let (keyfile, _) = Keyfile::create(b"first password", CHEAP).unwrap();
+        let (keyfile, _) =
+            Keyfile::create_with_floor(b"first password", CHEAP, CHEAP.m_kib).unwrap();
         assert!(
             keyfile
-                .rewrap(b"guessed wrong", b"second password", CHEAP)
+                .rewrap_with_floor(b"guessed wrong", b"second password", CHEAP, CHEAP.m_kib)
                 .is_err()
         );
+    }
+
+    /// The write path refuses a KDF cost the passphrase policy is not calibrated
+    /// against — through both entry points, because a rewrap is the other way to
+    /// choose the parameters a bundle lives at.
+    ///
+    /// Deliberately asserted through `create`/`rewrap`, the functions production
+    /// calls, rather than through `check_kdf_floor`: a floor only guarding one
+    /// of the two is a floor with a documented way around it.
+    #[test]
+    fn a_new_keyfile_below_the_memory_floor_is_refused_through_both_entry_points() {
+        let below = KdfParams {
+            m_kib: MIN_KDF_MEMORY_KIB - 1,
+            t: 1,
+            p: 1,
+        };
+        let err = Keyfile::create(b"a twelve-char", below)
+            .expect_err("a keyfile below the floor must not be written")
+            .to_string();
+        assert!(err.contains("the floor is"), "{err}");
+        assert!(
+            !err.contains("a twelve-char"),
+            "a refusal echoed the password"
+        );
+
+        // The floor is a real one rather than argon2's own 8 KiB, which is the
+        // smallest input the algorithm is defined for and not a security
+        // parameter at all. Asserted through `create` so it is the *behaviour*
+        // being pinned, not the constant's value.
+        assert!(
+            Keyfile::create(b"a twelve-char", CHEAP).is_err(),
+            "argon2's own floor must not be an acceptable place to write a bundle"
+        );
+        assert!(MIN_KDF_MEMORY_KIB < KdfParams::default().m_kib);
+
+        // …and the same refusal on the rewrap path, from a keyfile that exists.
+        let (keyfile, _) = Keyfile::create_with_floor(b"first password", CHEAP, CHEAP.m_kib)
+            .expect("the seam still wraps cheaply");
+        assert!(
+            keyfile
+                .rewrap(b"first password", b"second password", below)
+                .is_err(),
+            "rewrap must apply the same floor create does"
+        );
+
+        // An *existing* bundle below the floor still opens: refusing to read it
+        // would destroy data to enforce a policy its owner cannot retroactively
+        // satisfy.
+        assert!(keyfile.open(b"first password").is_ok());
     }
 
     #[test]
@@ -732,14 +1043,15 @@ mod tests {
         assert_eq!(KdfParams::default().m_kib, 1_048_576);
         assert_ne!(stored, KdfParams::default());
 
-        let (keyfile, _) = Keyfile::create(b"stored params please", stored).unwrap();
+        let (keyfile, _) =
+            Keyfile::create_with_floor(b"stored params please", stored, stored.m_kib).unwrap();
         assert_eq!(keyfile.kdf.params(), stored);
         assert!(keyfile.open(b"stored params please").is_ok());
     }
 
     #[test]
     fn kdf_parameters_edited_in_transit_fail_to_unwrap() {
-        let (keyfile, _) = Keyfile::create(b"in transit", CHEAP).unwrap();
+        let (keyfile, _) = Keyfile::create_with_floor(b"in transit", CHEAP, CHEAP.m_kib).unwrap();
 
         // An attacker downgrading the work factor on the wire. The parameters
         // are bound as AEAD associated data, so the KEK they now describe is not
@@ -759,7 +1071,8 @@ mod tests {
 
     #[test]
     fn a_keyfile_above_the_read_ceiling_is_refused_before_any_cryptographic_work() {
-        let (keyfile, _) = Keyfile::create(b"future bundle", CHEAP).unwrap();
+        let (keyfile, _) =
+            Keyfile::create_with_floor(b"future bundle", CHEAP, CHEAP.m_kib).unwrap();
 
         // At the ceiling: accepted.
         assert_eq!(keyfile.format, MAX_SUPPORTED_KEYFILE);
@@ -777,6 +1090,37 @@ mod tests {
             .expect_err("a newer format must be refused")
             .to_string();
         assert!(err.contains("upgrade ai-usagebar"));
+    }
+
+    /// The ceiling is checked inside the unwrap, not left to a caller.
+    ///
+    /// `m_kib` comes from a keyfile a hostile remote may have edited, and
+    /// `argon2` 0.5.3 allows up to `u32::MAX` and allocates with an infallible
+    /// `vec![]` — so without this the attack is an abort, not an error, and the
+    /// widget stops exiting 0.
+    #[test]
+    fn a_keyfile_demanding_more_memory_than_the_ceiling_is_refused_before_allocating() {
+        let (keyfile, _) =
+            Keyfile::create_with_floor(b"a hostile remote", CHEAP, CHEAP.m_kib).unwrap();
+
+        let mut absurd = keyfile.clone();
+        absurd.kdf.m_kib = u32::MAX;
+        let err = absurd
+            .open(b"a hostile remote")
+            .expect_err("u32::MAX KiB is 4 TiB and must never be attempted")
+            .to_string();
+        assert!(err.contains("ceiling this build will allocate"), "{err}");
+        assert!(err.contains("4096 MiB"), "{err}");
+
+        // Exactly at the ceiling is allowed through; one KiB past it is not.
+        // Asserted on the gate itself, because letting `open` actually reach
+        // `derive_kek` at 4 GiB is precisely what a unit test must not do.
+        assert!(check_kdf_ceiling(MAX_KDF_MEMORY_KIB).is_ok());
+        assert!(check_kdf_ceiling(MAX_KDF_MEMORY_KIB + 1).is_err());
+
+        // Untouched, it still opens, so the refusal above is the gate rather
+        // than a keyfile that never worked.
+        assert!(keyfile.open(b"a hostile remote").is_ok());
     }
 
     #[test]

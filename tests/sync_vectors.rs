@@ -32,6 +32,15 @@
 //!   still open (the plaintext is unchanged and its id still matches); what is
 //!   lost is byte-identical re-sealing across the upgrade boundary.
 //!
+//!   Say that precisely, because the sloppy version of it — "one id covering
+//!   two ciphertexts is harmless" — was propagated as an invariant and was a
+//!   real vulnerability. It is harmless **for dedup**. It is not harmless for
+//!   nonce safety: one id covering two distinct messages is exactly the input
+//!   that reuses an AEAD nonce, which is why the chunk nonce is derived from the
+//!   framed bytes rather than from the id and travels inline ahead of them. Two
+//!   framings of one plaintext therefore differ in their *nonce* as well as in
+//!   their ciphertext.
+//!
 //! # Provenance, per pin
 //!
 //! Part 1's four vectors come from the primitives' **own specifications**, so
@@ -270,10 +279,15 @@ const MASTER: [u8; 32] = [
 /// the two can be compared against each other directly.
 const SHORT_PLAINTEXT: &[u8] = b"ai-usagebar sync vector";
 
-/// The literal associated data the snapshot root is sealed under, spelled out
+/// The format-scoping half of the snapshot root's associated data, spelled out
 /// rather than imported: a reader implemented from `docs/sync-format.md` §5 has
-/// only this string, and pinning it here catches a change to the constant.
+/// only this string, and pinning it here catches a change to the constant. The
+/// other half is the bundle's [`REPO_ID`], appended.
 const ROOT_AAD: &[u8] = b"ai-usagebar.sync.v1 root";
+
+/// The bundle identity a caller reads from its own configuration and hands to
+/// `open_root` — never a value taken from the remote.
+const REPO_ID: &str = "usagebar-sync-vector";
 
 /// A keyfile wrapping [`MASTER`], built **by hand from the documented format**
 /// rather than by `Keyfile::create`, which draws a random master key and so can
@@ -410,16 +424,24 @@ fn the_chunk_subkey_is_pinned_and_is_the_key_the_seal_path_uses() {
     );
 
     // The wiring, reproduced from docs/sync-format.md §3 rather than from
-    // `crypto.rs`: nonce = derive_key(CTX_NONCE, id)[..24], aad = id, msg = the
-    // framed chunk. If `seal` reached for `name` or `root` instead, this would
-    // differ while every round trip in the repository kept passing.
+    // `crypto.rs`: nonce = derive_key(CTX_NONCE, keyed_hash(name_key, framed))
+    // [..24], aad = id, msg = the framed chunk, and the nonce stored inline
+    // ahead of the ciphertext. If `seal` reached for `name` or `root` instead,
+    // this would differ while every round trip in the repository kept passing.
+    //
+    // The nonce is a function of the **framed bytes**, not of the id. That is
+    // the whole of the F-1 fix: the id addresses the raw plaintext, so deriving
+    // the nonce from it would let two zstd builds seal two distinct messages
+    // under one (chunk_key, nonce, aad).
     let keys = fixed_keys();
     let id = keys.chunk_id(SHORT_PLAINTEXT);
-    let nonce: [u8; 24] = blake3::derive_key(CTX_NONCE, id.as_bytes())[..24]
-        .try_into()
-        .expect("24 of 32 bytes");
+    let name_key = blake3::derive_key(CTX_NAME, &MASTER);
     let framed = frame(SHORT_PLAINTEXT).expect("framing");
-    let independently = XChaCha20Poly1305::new((&chunk_key).into())
+    let nonce: [u8; 24] =
+        blake3::derive_key(CTX_NONCE, blake3::keyed_hash(&name_key, &framed).as_bytes())[..24]
+            .try_into()
+            .expect("24 of 32 bytes");
+    let sealed = XChaCha20Poly1305::new((&chunk_key).into())
         .encrypt(
             &nonce.into(),
             Payload {
@@ -428,6 +450,8 @@ fn the_chunk_subkey_is_pinned_and_is_the_key_the_seal_path_uses() {
             },
         )
         .expect("sealing");
+    let mut independently = nonce.to_vec();
+    independently.extend_from_slice(&sealed);
 
     assert_eq!(
         hex(&seal_chunk(keys, SHORT_PLAINTEXT).expect("seal").ciphertext),
@@ -482,15 +506,17 @@ fn the_root_subkey_is_pinned_and_is_the_key_the_snapshot_root_uses() {
         "root_key moved: no existing snapshot root opens"
     );
 
-    // `nonce ‖ ciphertext ‖ tag`, with the fixed literal as associated data —
+    // `nonce ‖ ciphertext ‖ tag`, with `ROOT_AAD ‖ repo_id` as associated data —
     // docs/sync-format.md §5, reconstructed here rather than imported.
     let nonce = [0x37u8; 24];
+    let mut aad = ROOT_AAD.to_vec();
+    aad.extend_from_slice(REPO_ID.as_bytes());
     let sealed = XChaCha20Poly1305::new((&root_key).into())
         .encrypt(
             &nonce.into(),
             Payload {
                 msg: b"counter=7".as_slice(),
-                aad: ROOT_AAD,
+                aad: &aad,
             },
         )
         .expect("sealing a root by hand");
@@ -498,11 +524,20 @@ fn the_root_subkey_is_pinned_and_is_the_key_the_snapshot_root_uses() {
     framed.extend_from_slice(&sealed);
 
     assert_eq!(
-        &*fixed_keys().open_root(&framed).expect(
+        &*fixed_keys().open_root(&framed, REPO_ID).expect(
             "open_root rejected a root framed by hand under root_key — either \
              the subkey wiring or the root's associated data changed"
         ),
         b"counter=7"
+    );
+
+    // The `repo_id` half of the AAD is load-bearing, not decorative: the same
+    // bytes offered as another bundle's root must fail the tag.
+    assert!(
+        fixed_keys()
+            .open_root(&framed, "some-other-bundle")
+            .is_err(),
+        "the root's associated data is no longer scoped to the repository"
     );
 }
 
@@ -540,6 +575,11 @@ fn the_chunk_id_of_a_fixed_plaintext_is_pinned_and_must_survive_a_zstd_upgrade()
 /// above stays exactly where it is. A failure here is a prompt to find out what
 /// changed and re-pin deliberately, after checking that the id pin did *not*
 /// move; a failure on the id pin is not.
+///
+/// Re-pinned in 1-10: the first 24 bytes are now the chunk's nonce, derived from
+/// the framed bytes rather than from the id, and the whole tail shifted with it.
+/// The id pin above did not move — which is exactly the distinction the two
+/// kinds of pin exist to make legible.
 #[test]
 fn the_sealed_chunk_ciphertext_is_pinned_and_is_zstd_sensitive() {
     let keys = fixed_keys();
@@ -547,12 +587,28 @@ fn the_sealed_chunk_ciphertext_is_pinned_and_is_zstd_sensitive() {
 
     assert_eq!(
         hex(&blob.ciphertext),
-        "16097e0d469a39435c26aa600addcba7b6329cc877c1cf841ff7157100b1f121\
-         e9d8a14b87f2a3ce2474ec3417dd953c5705da7aabfc481756963c2967268ec9\
-         422d442e953ef9062bf56f04952a3da1",
+        "008f88feaa1e98132d608fddbc1c8cb8270887352e8e14376d71b1c15f4a2c48\
+         5daf5ceb8b4fec7cf17738a020975feec7da62d0b44c0b508294b849440d0521\
+         9841e0853a4fcba6b5b9311f462fc3aed95e6e9cda41a7c2ed04ef9b14cc8d41\
+         f0ff0de6048e1693",
         "the sealed bytes moved. Check the id pin first: if it held, this is a \
          zstd or framing change and the on-disk format now differs — a \
          compatibility decision, not a regeneration"
+    );
+
+    // The nonce travels inline, ahead of the ciphertext, and is a function of
+    // the framed bytes — not of the id. Pinned as a property rather than only as
+    // a prefix of the literal above, so a future change that re-derived it from
+    // the id would fail *here*, naming the reason, instead of only moving bytes.
+    let framed = frame(SHORT_PLAINTEXT).expect("framing");
+    let name_key = blake3::derive_key(CTX_NAME, &MASTER);
+    assert_eq!(
+        hex(&blob.ciphertext[..24]),
+        hex(
+            &blake3::derive_key(CTX_NONCE, blake3::keyed_hash(&name_key, &framed).as_bytes())[..24]
+        ),
+        "the chunk nonce is no longer derived from the bytes actually encrypted \
+         — two zstd builds can now seal two distinct messages under one nonce"
     );
 
     // Determinism, mirroring `safe_storage.rs`'s
@@ -695,11 +751,14 @@ fn the_multi_chunk_bundles_manifest_id_is_pinned_and_must_survive_a_zstd_upgrade
 /// compatibility decision (old packs still open; byte-identical re-sealing
 /// across the boundary is what is lost). If an id pin moved too, that is the
 /// bigger event and this pin is a symptom of it.
+///
+/// Re-pinned in 1-10 for the inline chunk nonce: every blob in the pack, and the
+/// sealed header itself, grew the 24 bytes. Both id pins held.
 #[test]
 fn the_multi_chunk_bundles_pack_address_is_pinned_and_is_zstd_sensitive() {
     assert_eq!(
         bundle().pack_address.to_string(),
-        "4c8e3c5a8e4141fd0b2f2397a7e25a4940605b6809ee33860176a9fb88f4557f",
+        "9b612506608d3304baa33ee4e32827b8923dfbdeeda9a3c2a66fa404a6f817a2",
         "the pack bytes moved. Check the two id pins first: if they held, this \
          is a zstd, framing or header-serialization change and the on-disk \
          format now differs — a compatibility decision, not a regeneration"

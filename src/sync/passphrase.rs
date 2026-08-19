@@ -12,6 +12,15 @@
 //! [`OFFLINE_ATTACK_NOTE`] explains the risk in words rather than printing a
 //! rule.
 //!
+//! **The floor and the KDF cost are one control, so [`check`] takes both.** That
+//! "rate the locked parameters buy" is the whole derivation of the number 12,
+//! and nothing used to hold the parameters to it: a bundle written at a lower
+//! `--kdf-memory` bought a cheaper guess while the length rule stayed put. Two
+//! halves close it — `crypto::MIN_KDF_MEMORY_KIB` refuses the absurd end
+//! outright, and below the shipped memory cost this module accepts nothing
+//! short of a generated passphrase, which is uncrackable at any cost. Lowering
+//! the KDF therefore costs password strength rather than security.
+//!
 //! **Only three ways a password enters the process:** a reader ([`read_line`],
 //! for a pipe or stdin), a mode-0600 file ([`read_from_file`]), and a TTY
 //! prompt, which belongs to whichever surface owns the terminal and is
@@ -34,6 +43,7 @@ use std::path::Path;
 use zeroize::Zeroizing;
 
 use crate::error::{AppError, Result};
+use crate::sync::crypto::KdfParams;
 
 /// Crockford base32: the digits and uppercase letters minus `I`, `L`, `O` and
 /// `U`, so nothing in a generated passphrase can be misread off a screen or
@@ -73,6 +83,13 @@ const TOO_SHORT: &str = "\
 Too short — at least 12 characters are required. A short password is guessed \
 offline in minutes; see the offline-attack note. Take the generated passphrase \
 instead if you have somewhere safe to keep it.";
+
+/// The message on a refusal under a lowered KDF cost.
+const WEAKENED_KDF: &str = "\
+Too short for a bundle at this key-derivation cost. Lowering the memory cost \
+makes every offline guess cheaper, and the length rules are calculated against \
+the full cost — so below it, only a generated passphrase is accepted. Take the \
+generated one, or put the memory cost back.";
 
 /// The message on a warning.
 const THIN: &str = "\
@@ -116,19 +133,33 @@ pub fn generate() -> Result<Zeroizing<String>> {
     Ok(out)
 }
 
-/// Judge a user-supplied password by length alone, measured in **characters**
-/// rather than bytes so a passphrase with non-ASCII is not flattered by its
-/// UTF-8 length.
+/// Judge a user-supplied password by length, measured in **characters** rather
+/// than bytes so a passphrase with non-ASCII is not flattered by its UTF-8
+/// length — **at the KDF cost `k` the bundle will actually be written at**.
 ///
 /// Length is a floor, not a score: no entropy estimator can tell a memorable
 /// phrase from a leaked one, and pretending otherwise would hand the user a
 /// green checkmark for `correcthorsebattery`. The real control is [`generate`].
-pub fn check(pw: &str) -> Strength {
-    match pw.chars().count() {
-        n if n < MIN_CHARS => Strength::Rejected(TOO_SHORT),
-        n if n < RECOMMENDED_CHARS => Strength::Weak(THIN),
-        _ => Strength::Strong,
+///
+/// `k` is not decoration. [`MIN_CHARS`] is arithmetic against the guess rate the
+/// *shipped* parameters buy, so a bundle written at a lower `--kdf-memory` moves
+/// that arithmetic without moving the rule — the two controls were calibrated
+/// against each other and enforced apart. Below [`KdfParams::default`]'s memory
+/// the trade has to be paid for on the other side: nothing short of generated
+/// strength is accepted, which is uncrackable at any KDF cost, so a user who
+/// lowers the cost cannot also weaken the password.
+pub fn check(pw: &str, k: KdfParams) -> Strength {
+    let n = pw.chars().count();
+    if n >= RECOMMENDED_CHARS {
+        return Strength::Strong;
     }
+    if k.m_kib < KdfParams::default().m_kib {
+        return Strength::Rejected(WEAKENED_KDF);
+    }
+    if n < MIN_CHARS {
+        return Strength::Rejected(TOO_SHORT);
+    }
+    Strength::Weak(THIN)
 }
 
 /// Read a password from a reader — a pipe, or stdin when the caller has already
@@ -204,11 +235,18 @@ mod tests {
         assert_eq!(seen.len(), 32, "all 32 characters must be reachable");
     }
 
+    /// The shipped cost, which is what [`MIN_CHARS`] is calibrated against.
+    const FULL: KdfParams = KdfParams {
+        m_kib: 1_048_576,
+        t: 3,
+        p: 1,
+    };
+
     #[test]
     fn a_password_below_the_floor_is_refused() {
-        assert!(matches!(check("short"), Strength::Rejected(_)));
-        assert!(matches!(check("elevenchars"), Strength::Rejected(_)));
-        let Strength::Rejected(msg) = check("short") else {
+        assert!(matches!(check("short", FULL), Strength::Rejected(_)));
+        assert!(matches!(check("elevenchars", FULL), Strength::Rejected(_)));
+        let Strength::Rejected(msg) = check("short", FULL) else {
             panic!("must be rejected");
         };
         assert!(msg.contains("12 characters"));
@@ -216,7 +254,7 @@ mod tests {
 
     #[test]
     fn a_password_between_the_floor_and_the_recommendation_warns_about_diceware() {
-        let Strength::Weak(msg) = check("fifteenchars123") else {
+        let Strength::Weak(msg) = check("fifteenchars123", FULL) else {
             panic!("15 characters must warn, not reject or pass");
         };
         assert!(msg.contains("diceware"));
@@ -225,9 +263,48 @@ mod tests {
 
     #[test]
     fn twenty_characters_is_strong() {
-        assert_eq!(check("twenty-characters-!!"), Strength::Strong);
+        assert_eq!(check("twenty-characters-!!", FULL), Strength::Strong);
         // And the recommended path clears the gate it recommends.
-        assert_eq!(check(&generate().unwrap()), Strength::Strong);
+        assert_eq!(check(&generate().unwrap(), FULL), Strength::Strong);
+    }
+
+    /// The coupling. `MIN_CHARS` is arithmetic against the guess rate the
+    /// shipped parameters buy, so a bundle written cheaper has to pay for it in
+    /// password strength instead — and a generated passphrase is 100 bits,
+    /// uncrackable at any KDF cost.
+    #[test]
+    fn a_lowered_kdf_cost_accepts_nothing_short_of_a_generated_passphrase() {
+        let lowered = KdfParams {
+            m_kib: FULL.m_kib / 2,
+            ..FULL
+        };
+
+        // Everything the full cost merely warns about is refused outright.
+        for pw in ["fifteenchars123", "nineteen-chars-abcd"] {
+            let Strength::Rejected(msg) = check(pw, lowered) else {
+                panic!("{pw:?} must be refused below the shipped KDF cost");
+            };
+            assert!(msg.contains("only a generated passphrase is accepted"));
+            assert!(matches!(check(pw, FULL), Strength::Weak(_)));
+        }
+
+        // …and generated strength still clears it, at any cost.
+        assert_eq!(check(&generate().unwrap(), lowered), Strength::Strong);
+        assert_eq!(
+            check(
+                &generate().unwrap(),
+                KdfParams {
+                    m_kib: 8,
+                    t: 1,
+                    p: 1
+                }
+            ),
+            Strength::Strong
+        );
+
+        // The gate is the *default* memory, not a re-typed literal: raising the
+        // shipped parameters must raise this with them.
+        assert_eq!(FULL, KdfParams::default());
     }
 
     #[test]
@@ -236,7 +313,7 @@ mod tests {
         let twelve = "ααααααααββββ";
         assert_eq!(twelve.chars().count(), 12);
         assert!(twelve.len() > 12);
-        assert!(matches!(check(twelve), Strength::Weak(_)));
+        assert!(matches!(check(twelve, FULL), Strength::Weak(_)));
     }
 
     #[test]

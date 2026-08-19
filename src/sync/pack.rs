@@ -28,8 +28,8 @@
 //! unkeyed address"); this is the object that would have broken it first.
 //!
 //! **In the trailer.** [`read_header`] needs that id *before* it can decrypt,
-//! because the id derives the nonce and is bound as associated data. So the id
-//! is written in the clear, immediately before the length. Writing it costs
+//! because the id is bound as associated data. So the id is written in the
+//! clear, immediately before the length. Writing it costs
 //! nothing: it is a keyed hash, so an attacker without `name_key` cannot
 //! recompute it from the header he is staring at, and substituting some other id
 //! simply breaks the tag. Without it the reader is not merely slower, it is
@@ -286,7 +286,7 @@ mod tests {
     };
 
     fn keys() -> Keys {
-        Keyfile::create(b"correct horse battery staple", CHEAP)
+        Keyfile::create_with_floor(b"correct horse battery staple", CHEAP, CHEAP.m_kib)
             .expect("keyfile creation")
             .1
     }
@@ -398,7 +398,7 @@ mod tests {
 
         // Not a random 32 bytes: a genuinely valid id of a genuinely sealed
         // object in this very pack. It still fails, because the id is bound as
-        // associated data and derives the nonce.
+        // associated data.
         let other = read_header(&keys, &pack).unwrap().entries[0].id;
         let id_at = pack.len() - TRAILER_LEN;
         pack[id_at..id_at + ID_LEN].copy_from_slice(other.as_bytes());

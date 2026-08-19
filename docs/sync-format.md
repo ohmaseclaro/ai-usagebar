@@ -52,9 +52,10 @@ single-threaded implementation.
 | `root_key` | `ai-usagebar.sync.v1 snapshot-root-key` | sealing and opening the snapshot root |
 
 A fourth context string, `ai-usagebar.sync.v1 chunk-nonce`, is **not** a subkey:
-it is applied to a chunk's (public) id to derive that chunk's nonce, and is
-listed here because a reader needs it. The `v1` token in all four is
-load-bearing — a future v2 hierarchy must not be able to collide with v1's.
+it is applied to `keyed_hash(name_key, <the bytes being sealed>)` to derive that
+chunk's nonce (§3), and is listed here because a reader needs it. The `v1` token
+in all four is load-bearing — a future v2 hierarchy must not be able to collide
+with v1's.
 
 **The KDF parameters are bound as associated data**, which is what makes a
 downgrade fail rather than succeed weakly. The AAD for the master-key wrap is
@@ -74,6 +75,25 @@ the difference.
 A reader must use the parameters **stored in the keyfile it is opening**, never
 its own compiled default. A bundle initialised at a lower `--kdf-memory` stays
 openable; one initialised higher stays strong.
+
+**`m_kib` is bounded on both sides, and the two bounds are not symmetrical.**
+
+- **Writing** a new keyfile — at initialisation or at a password change — is
+  refused below **8 MiB**. Argon2's own floor is `8 * p` KiB, which is the
+  smallest input the algorithm is defined for rather than a security parameter,
+  and the 12-character password rule in §9 is arithmetic against the guess rate
+  the *shipped* parameters buy. The two are also coupled directly: below the
+  default memory cost, a user-supplied password is refused unless it is of
+  generated strength (20 characters, 100 bits), which is uncrackable at any KDF
+  cost. Lowering the cost therefore trades against password strength instead of
+  against security.
+- **Reading** is refused above **4 GiB**, and is deliberately unbounded below.
+  `m_kib` reaches a reader from a keyfile a hostile remote may have edited, and
+  an implementation whose Argon2 allocates infallibly turns one edited integer
+  into an abort — before the AAD binding gets a chance to reject it. Refuse the
+  value before allocating for it. Nothing is refused for being *too low* on
+  read: a bundle written before a floor existed must stay openable, or raising
+  a floor destroys data.
 
 ---
 
@@ -152,8 +172,16 @@ properties, both of which a later "optimisation" would happily undo:
   format takes Borg's, because keying costs nothing.
 
 The consequence of hashing plaintext is that two machines running different
-zstd versions may produce *different ciphertext* for the same id. That is
-harmless: both decrypt to identical plaintext, and the first upload wins.
+zstd versions may produce *different ciphertext* for the same id. State that
+precisely, because the sloppy version of it was a real vulnerability:
+
+- **Harmless for dedup.** Both decrypt to identical plaintext, and the first
+  upload wins.
+- **Not harmless for nonce safety.** One id covering two distinct messages is
+  exactly the input that reuses an AEAD nonce. That is why the nonce below is
+  derived from the framed bytes actually encrypted rather than from the id, and
+  is stored inline: two framings of one plaintext get two nonces, so the reuse
+  cannot arise.
 
 ### Frame layout
 
@@ -179,16 +207,32 @@ zstd grows past the cap is left unpadded rather than truncated.
 ### Sealing
 
 ```text
-nonce      = blake3::derive_key("ai-usagebar.sync.v1 chunk-nonce", id)[..24]
-ciphertext = XChaCha20-Poly1305(key = chunk_key, nonce, aad = id, msg = frame)
+nonce  = blake3::derive_key("ai-usagebar.sync.v1 chunk-nonce",
+                            blake3::keyed_hash(name_key, frame))[..24]
+sealed = nonce ‖ XChaCha20-Poly1305(key = chunk_key, nonce, aad = id, msg = frame)
 ```
 
-Deterministic by construction: the nonce is a function of the id, which is a
-function of the plaintext. Identical plaintext therefore yields byte-identical
-ciphertext, which is what makes dedup work and what stops a re-sync of unchanged
-data from creating new remote objects forever. Two different plaintexts get two
-different ids and therefore two different nonces, so a nonce is never reused
-across distinct messages under `chunk_key`.
+The 24-byte nonce is stored inline as the first bytes of the sealed blob, the
+same framing the snapshot root uses (§5). A reader cannot re-derive it — it is a
+keyed hash of the plaintext it is about to recover — so it has to travel.
+
+**The nonce is derived from the bytes actually encrypted, never from the id.**
+This is the property that keeps the AEAD safe, and it is not the same property
+as determinism. A derived nonce is only sound under **nonce ↔ message**
+injectivity. The id addresses the *raw plaintext*, while the message sealed is
+that plaintext's compressed frame, and zstd guarantees format compatibility
+across versions rather than byte-identical output. Deriving the nonce from the
+id therefore let two builds seal two *distinct* messages under one
+`(chunk_key, nonce, aad)` — a solvable Poly1305 one-time key, hence forgery, and
+`C_A ⊕ C_B = F_A ⊕ F_B` with an identical 4-byte `true_len` prefix handing over
+free known keystream. Hashing the frame instead closes it: a message that
+differs by one byte gets a different nonce whether or not its id moved. A nonce
+is never reused across distinct messages under `chunk_key`.
+
+Still deterministic within a build: the same plaintext frames to the same bytes,
+which derive the same nonce, which yield byte-identical output. That is what
+makes dedup work and what stops a re-sync of unchanged data from creating new
+remote objects forever.
 
 Binding the id as associated data means a chunk served under the wrong name
 fails its tag.
@@ -250,8 +294,8 @@ sealed manifest instead.
   exactly the oracle keyed chunk ids exist to deny. **Nothing in this format is
   ever sealed under an unkeyed address.**
 - *In the trailer, in the clear.* A reader needs that id *before* it can
-  decrypt, because the id derives the nonce and is bound as associated data.
-  Writing it down costs nothing — it is a keyed hash, so an attacker without
+  decrypt, because the id is bound as associated data. Writing it down costs
+  nothing — it is a keyed hash, so an attacker without
   `name_key` cannot recompute it from the header he is staring at, and
   substituting any other id simply breaks the tag. Without it the reader is not
   merely slower, it is impossible to write.
@@ -303,8 +347,22 @@ chunk therefore fails its tag rather than quietly restoring something else.
 ### Root — the one mutable object
 
 Sealed under `root_key` with a **fresh random 24-byte nonce**, stored inline as
-the first 24 bytes of the framed output, and a fixed literal as associated data:
-`ai-usagebar.sync.v1 root`. The framing is `nonce ‖ ciphertext ‖ tag`.
+the first 24 bytes of the framed output. The framing is `nonce ‖ ciphertext ‖
+tag`, and the associated data is a fixed literal scoping the format,
+concatenated with the bundle's identifier:
+
+```text
+aad = "ai-usagebar.sync.v1 root" ‖ repo_id
+```
+
+**The `repo_id` in that AAD is the reader's own, read from local configuration —
+never the one the served root claims.** The literal alone would be the same
+constant in every bundle in the world, so any two bundles sharing a master key —
+a copied keyfile, a second remote added for the same machine — would open each
+other's roots, and a cross-bundle replay would rest entirely on local anchor
+state to notice. Binding the expected `repo_id` makes a repository swap fail the
+Poly1305 tag instead. `repo_id` is not length-prefixed because it is the last
+field: nothing follows it to be confused with.
 
 This is the one place the deterministic-nonce rule is inverted, and deliberately:
 every other object's nonce is derived from its content address because identical
@@ -327,16 +385,18 @@ content address of its own — hence the fixed AAD literal.
 
 - `counter` is the monotonic snapshot counter the rollback anchor compares
   against (§9).
-- `repo_id` pins the repository's identity *inside* the plaintext, so swapping
-  the whole repository for a different one is detectable on top of the wrong
-  keyfile simply failing to unwrap.
+- `repo_id` pins the repository's identity *inside* the plaintext as well as in
+  the associated data above, and a reader must check the two agree. The AAD
+  proves the writer meant this bundle; the recheck proves the two copies were
+  not written to disagree.
 - `chunker` and `kdf` are **informational duplicates**. The authoritative copy of
   the KDF parameters is the keyfile's, where they are bound as associated data
   and cannot be edited in transit. They are repeated here because the root is
   the *first* object a reader touches, so an unknown chunker or an unsupported
-  KDF configuration can be refused before a single pack is fetched. If the two
-  copies disagree the keyfile wins — but the disagreement itself is worth
-  reporting, because it means somebody rewrote something.
+  KDF configuration can be refused before a single pack is fetched. A reader
+  uses the keyfile's parameters and is not required to compare the two copies —
+  `kdf` here sits inside the root's authenticated plaintext and the keyfile's is
+  AAD-bound, so a disagreement is not something a remote can manufacture.
 - `manifest_chunks` is ordered, and is the only place the manifest's chunk order
   is recorded.
 
@@ -562,6 +622,11 @@ passphrase (100 bits, straight from the OS CSPRNG) is the default path, a
 user-supplied password is the exception, and a supplied one under 12 characters
 is refused outright.
 
+That 12 is not a round number: it is arithmetic against the guess rate the
+shipped Argon2id parameters buy, so it means nothing unless those parameters are
+held to. **Below the default memory cost, a user-supplied password is refused
+unless it is of generated strength** — see §1. The two controls are one control.
+
 **Changing the password is not revocation.** A rewrap unwraps the master key
 under the old password and rewraps *the same* master key under the new one — 48
 bytes rewritten instead of the whole bundle. The data keys do not change. Anyone
@@ -595,8 +660,20 @@ the moment of the very first fetch can serve an old snapshot and it will be
 taken. Every fetch afterwards is protected. Closing it would require carrying a
 counter out of band, which is a different trade than this design makes.
 
-Two consequences a caller must respect:
+Three consequences a caller must respect:
 
+- **The anchor file must be named after the remote, never after the remote's
+  `repo_id`.** Whatever locates the anchor comes from local configuration — the
+  remote's URL or account — because sharding it as `anchors/<repo_id>.json` is
+  the obvious way to hold several bundles and it silently nullifies the whole
+  mechanism. A root carrying a `repo_id` this machine has never seen would
+  resolve to an absent file, which reads as first contact, which is accepted
+  before any `repo_id` comparison happens. **An unrecognised `repo_id` must read
+  as a mismatch, not as first contact.** First contact is a property of this
+  machine and that remote; nothing the remote says may manufacture it. (The
+  *repo-swap* half of this is closed independently, and cryptographically, by
+  binding the expected `repo_id` into the root's associated data — §5. The
+  rollback half cannot be, which is why this rule exists.)
 - **The anchor lives in the config directory, never the cache.** The cache is
   documented as wipeable and users, packagers, and `rm -rf ~/.cache/*` treat it
   that way. A wiped anchor is a free rollback: it silently downgrades the next
