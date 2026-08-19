@@ -211,8 +211,18 @@ pub fn read_header(keys: &Keys, pack: &[u8]) -> Result<PackHeader> {
         .map_err(|_| AppError::Other("pack header is not a readable header".into()))?;
     check_version(header.format, MAX_SUPPORTED_PACK_HEADER, "pack header")?;
 
-    let blob_region = start as u64;
-    for entry in &header.entries {
+    entries_within(&header.entries, start as u64)?;
+    Ok(header)
+}
+
+/// Every entry must lie inside the blob region, which ends where the sealed
+/// header begins.
+///
+/// Split out so it can be tested against a crafted entry list directly: a header
+/// whose entries point past the pack cannot be produced through [`PackWriter`],
+/// only forged, and a check nothing exercises is a check nobody can trust.
+fn entries_within(entries: &[PackEntry], blob_region: u64) -> Result<()> {
+    for entry in entries {
         let end = entry
             .offset
             .checked_add(u64::from(entry.clen))
@@ -223,7 +233,7 @@ pub fn read_header(keys: &Keys, pack: &[u8]) -> Result<PackHeader> {
             ));
         }
     }
-    Ok(header)
+    Ok(())
 }
 
 /// The ciphertext slice one entry names, bounds-checked against `pack`.
@@ -497,6 +507,37 @@ mod tests {
         assert!(read_header(&keys, &pack[..pack.len() - 1_024]).is_err());
         // And a pack too short to even hold a trailer.
         assert!(read_header(&keys, &pack[..TRAILER_LEN - 1]).is_err());
+    }
+
+    #[test]
+    fn a_header_length_larger_than_the_pack_is_refused_before_any_allocation() {
+        let keys = keys();
+        let (_, _, mut pack) = three_blob_pack(&keys);
+
+        // T-03-05: the trailer is attacker-controlled, so it can claim a 4 GiB
+        // header inside a few-kilobyte pack.
+        let len_at = pack.len() - LEN_LEN;
+        pack[len_at..].copy_from_slice(&u32::MAX.to_le_bytes());
+        let err = read_header(&keys, &pack).expect_err("an impossible length must be refused");
+        assert!(err.to_string().contains("runs past the start"));
+    }
+
+    #[test]
+    fn an_entry_reaching_past_the_blob_region_is_refused() {
+        // Directly, because such a header cannot be produced by `PackWriter` —
+        // only forged by whoever serves the pack.
+        let entry = |offset: u64, clen: u32| PackEntry {
+            id: ChunkId::from_bytes([7u8; 32]),
+            offset,
+            clen,
+            true_len: 1,
+        };
+
+        assert!(entries_within(&[entry(0, 100), entry(100, 900)], 1_000).is_ok());
+        // One byte past the end of the blob region is one byte too far.
+        assert!(entries_within(&[entry(0, 100), entry(100, 901)], 1_000).is_err());
+        // And the addition itself cannot be made to wrap into a passing check.
+        assert!(entries_within(&[entry(u64::MAX, 1)], 1_000).is_err());
     }
 
     #[test]
