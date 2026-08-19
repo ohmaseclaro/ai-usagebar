@@ -494,7 +494,22 @@ gate.
 5. The README documents the fine-grained PAT recipe and states plainly that there is no password
    recovery and that changing the password is not revocation.
 
-**Plans**: TBD
+**Plans:** 5 plans across 3 waves (3 / 1 / 1). Wave 1's tracer freezes the
+`sync status --json` key set, so the wave-2 menu-bar plan parses a contract it never has to
+re-derive. No two plans in a wave share a file: 6-01 owns the Swift pair plus the sync CLI,
+6-03 owns the widget, 6-04 owns the TUI.
+
+Plans:
+- [ ] 6-01-PLAN.md — wave 1 — `sync status --json` end to end into a menu-bar state row (tracer, D-01/D-03/D-04)
+- [ ] 6-03-PLAN.md — wave 1 — the widget exit-0 gate: injected sync-shaped failures, plus a structural unreachability test (UX-06, D-03)
+- [ ] 6-04-PLAN.md — wave 1 — the TUI Sync section: category toggles and last-sync through the overlay's one `toml_edit` save path (D-04)
+- [ ] 6-02-PLAN.md — wave 2 — menu-bar push/pull triggers and the CLI's non-interactive refusal (UX-05, D-01/D-02)
+- [ ] 6-05-PLAN.md — wave 3 — README limits, the release checklist, and both `.SRCINFO`s regenerated before tagging *(checkpoint; the tag is a human action)*
+
+**Note:** `sync status` ships text-only today. 6-01 adds `--json` as the surfaces' contract;
+that is Phase 6 work, not an assumption about Phases 3–5. Where a plan needs a field Phases
+3–5 may or may not have shipped — a `repo` key, a non-interactive flag — it states it as a
+`<precondition>` and adopts the existing spelling rather than inventing a second one.
 
 ---
 
@@ -566,7 +581,7 @@ Assignment notes where a requirement could have gone elsewhere:
 | 3. GitHub Auth and the Private-Repo Gate | 0/7 | Planned | - |
 | 4. Push — Packs, Atomic Flip, GC, Rekey | 0/TBD | Not started | - |
 | 5. Pull and Restore | 0/TBD | Not started | - |
-| 6. Surfaces and Ship | 0/TBD | Not started | - |
+| 6. Surfaces and Ship | 0/5 | Planned | - |
 
 **Security audits required:** Phases 1, 2, 3, 4, 5.
 
