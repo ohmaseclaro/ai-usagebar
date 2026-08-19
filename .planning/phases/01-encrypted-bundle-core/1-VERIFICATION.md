@@ -1,7 +1,7 @@
 ---
 phase: 01-encrypted-bundle-core
 verified: 2026-08-19T21:40:00Z
-status: gaps_found
+status: human_needed
 score: 10/11 must-haves verified (6/6 roadmap success criteria; 4/5 post-audit change claims)
 behavior_unverified: 0
 overrides_applied: 0
@@ -9,7 +9,9 @@ re_verification:
   previous_status: human_needed
   previous_score: 6/6 roadmap success criteria (11/11 must-haves)
   previous_verified_at_tree: pre-1-10 (VERIFICATION.md written 15:25; 1-10 landed 15:55, 1-11 at 16:20)
-  gaps_closed: []
+  gaps_closed:
+    - "docs/sync-format.md lines 389-394: the pre-F-1 nonce rule and the pre-F-3 AAD literal were rewritten to state the shipped behaviour (nonce from the exact bytes sealed, never the id; root AAD = ROOT_AAD || repo_id), with an explicit warning against reintroducing the removed flaw for a new object kind. Commit 7f82bd5. Docs only — no code, pin, ciphertext, or format version moved; gate re-run green at 1104 passed / 0 failed."
+    - ".planning/phases/01-encrypted-bundle-core/1-HUMAN-UAT.md line 3: stale '1095 tests pass' refreshed to 1104."
   gaps_remaining: []
   regressions:
     - "docs/sync-format.md §5 line 390 still carries the pre-F-1 nonce rule verbatim — the exact behaviour the security audit removed as a nonce-reuse vulnerability. Present at commit ed56b39 (the audit commit) and unchanged through both remediation rounds."
