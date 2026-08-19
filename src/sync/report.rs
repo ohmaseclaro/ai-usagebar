@@ -708,13 +708,17 @@ mod tests {
             transcript_days: 30,
             transcript_max_bytes: 0,
         };
-        let plan = plan::build_with_keys(&roots, &cfg, &index, Utc::now(), &keys).unwrap();
+        // Fixed, not the wall clock: `now` is only a reference point for the
+        // transcript bounds, and a test that reads the clock is a test that can
+        // fail on a date nobody chose.
+        let now = DateTime::from_timestamp(1_760_000_000, 0).unwrap();
+        let plan = plan::build_with_keys(&roots, &cfg, &index, now, &keys).unwrap();
         assert_eq!(plan.files_opened, 2);
         assert!(plan.total_new_stored_bytes > 0);
         let stored = plan.total_new_stored_bytes;
 
         let report = DryRunReport {
-            status: build_status(&roots, &cfg, Some(&index), Utc::now(), Some(plan)),
+            status: build_status(&roots, &cfg, Some(&index), now, Some(plan)),
             no_key: None,
         };
         let text = render_dry_run(&report);
@@ -726,10 +730,10 @@ mod tests {
         );
 
         // …and a second dry-run over the untouched tree sends nothing.
-        let again = plan::build_with_keys(&roots, &cfg, &index, Utc::now(), &keys).unwrap();
+        let again = plan::build_with_keys(&roots, &cfg, &index, now, &keys).unwrap();
         assert_eq!(again.files_opened, 0);
         let report = DryRunReport {
-            status: build_status(&roots, &cfg, Some(&index), Utc::now(), Some(again)),
+            status: build_status(&roots, &cfg, Some(&index), now, Some(again)),
             no_key: None,
         };
         assert!(render_dry_run(&report).contains("would send nothing"));
