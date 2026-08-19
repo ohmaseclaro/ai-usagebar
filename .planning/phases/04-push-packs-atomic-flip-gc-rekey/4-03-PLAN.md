@@ -178,8 +178,13 @@ form. Follow the existing `cal1_range_on_private_release_asset` shape exactly: r
 repository, and asset from environment variables, **skip with a printed message when they are
 absent** so it is never a hard failure, and print the findings with `--nocapture` rather than
 asserting a shape we are guessing at. Print the reproduction command in the test's doc comment.
-Nothing in `src/` may depend on the outcome; this probe records reality so a later phase can act
-on it.
+
+Be precise about what this probe is for, because the obvious phrasing is false: `src/` **does**
+branch on `state` — the resume scan skips only on the uploaded literal and deletes on everything
+else. What the probe establishes is that the branch fails in the safe direction whatever GitHub
+actually reports, since every unrecognised state re-uploads. Nothing in `src/` may be *relaxed* on
+the strength of it. In particular the size check stays: `state` is not authoritative, and a future
+reader must not drop a check believing that it is.
   </action>
   <verify>
     <automated>cargo test --lib sync::push::progress</automated>

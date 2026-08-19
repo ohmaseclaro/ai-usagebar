@@ -12,6 +12,7 @@ must_haves:
   truths:
     - "The pointer `PUT` always carries the `sha` the read returned, so two machines pushing concurrently cannot interleave (REPO-07)."
     - "A 409 re-reads the remote pointer, rebuilds this run's snapshot record on top of what is now there, and retries **once** — then reports rather than looping (D3)."
+    - "A 422 caused by a `PUT` that omitted `sha` against an existing file arrives here as a conflict and takes the same path, rather than surfacing as an unrecognised hard error at the last step of a long push."
     - "The rebuild merges: the competing machine's snapshot records survive the retry, and no pack either pointer references is dropped from the list."
     - "A second 409 on the retry fails with an actionable message telling the user another machine is pushing and to re-run."
     - "A first push sends no `sha` at all, and a `sha` of null is never sent in its place."
@@ -20,7 +21,7 @@ must_haves:
     - src/sync/push/pointer.rs — `load`, `commit` with its bounded conflict path, and the merge rule
   key_links:
     - "`commit` is the single linearization point of the whole format; every other step is invisible to a reader"
-    - "The `rebuild` closure comes from the orchestrator, so the merge rule lives here and the ordering lives there — neither plan edits the other's file"
+    - "The merge rule is **specified** in 4-01's orchestrator, where the closure is written, and **enforced here**, where it is tested — neither plan edits the other's file, and a closure edit that breaks a rule fails this plan's tests"
     - "A losing race never triggers a delete: prune runs after `commit` returns, against the pointer that landed"
 ---
 
@@ -65,6 +66,7 @@ Output: `pointer::commit` with a bounded, merging retry.
     - After a 409, the retried pointer's snapshot list is still ordered oldest to newest and still no longer than `keep_snapshots`.
     - A second 409 on the retry returns an error naming another machine and telling the user to re-run; no third attempt is made.
     - A `PUT` answered with 401, 403, or 404 is returned unchanged with Phase 3's actionable text and is not retried.
+    - A `PUT` answered with 422 because the path already exists reaches `commit` as `GithubError::Conflict` — classified in `write::put_contents`, not here — and takes the same single re-read-and-rebuild path a 409 takes.
     - `load` refuses a pointer whose `format` is above the ceiling, and one whose `repo_id` is not the caller's own, before either reaches a merge.
   </behavior>
   <action>
@@ -89,10 +91,12 @@ is a loop over *the same* function rather than a special case. The sequence:
 The shared `with_retry` helper deliberately does **not** retry a `Conflict`, which is what leaves
 this bounded retry as the only path — do not add a second one, and do not relax the helper.
 
-**The merge rule, which is the part that has to be right.** `rebuild` produces a pointer from
-whatever the remote currently holds, and the orchestrator's implementation of it appends this
-run's `SnapshotRecord` to the remote's list. Constrain it here, in `commit`'s doc comment and by a
-test, so a future edit to the closure cannot silently break the invariant:
+**The merge rule, which is the part that has to be right — and which this plan enforces rather
+than owns.** `rebuild` produces a pointer from whatever the remote currently holds, and its
+implementation is written in plan 4-01's orchestrator, in `push/mod.rs`, a file this plan does not
+touch. Three rules govern it. They are stated there and restated here because *here* is where they
+are tested: record them in `commit`'s doc comment, and drive this plan's tests with a closure that
+reproduces them, so an edit to the real closure that breaks one fails in this file.
 
 - Snapshot records the caller did not produce are **carried forward**, never dropped. The
   competing machine's snapshot references packs that exist; discarding its record makes those
@@ -125,7 +129,7 @@ Every test drives `mockito::Server::new_async()` with both `Endpoints` fields po
   <verify>
     <automated>cargo test --lib sync::push::pointer</automated>
   </verify>
-  <done>`cargo test --lib sync::push::pointer` is green. A 409 produces exactly one re-read and one retry; a second 409 produces an actionable error and no third attempt. A competing snapshot record present at the re-read is present in the retried body. A first push's body carries no `sha` field. Nothing in the file issues a delete. `load`'s version and `repo_id` refusals still hold.</done>
+  <done>`cargo test --lib sync::push::pointer` is green. A 409 produces exactly one re-read and one retry; a 422-on-an-existing-path takes the same route; a second conflict produces an actionable error and no third attempt. A competing snapshot record present at the re-read is present in the retried body. A first push's body carries no `sha` field. Nothing in the file issues a delete. `load`'s version and `repo_id` refusals still hold. The three merge rules are recorded in `commit`'s doc comment and each has a test driving a closure that reproduces it.</done>
   <reversibility rating="one-way">Getting the merge rule wrong deletes another machine's backup, and the deletion happens on that machine's next prune rather than here, so it would surface long after this code ran. The carry-forward rule comes from `github-transport.md` §5.2 and D3 and is not to be relaxed.</reversibility>
   <precondition>Plan 4-01 is merged: `pointer::load`, `pointer::commit`'s signature and no-conflict path, `Pointer`, `SnapshotRecord`, `write::{get_contents, put_contents}`, and `GithubError::Conflict` all exist as `4-01-SUMMARY.md` records them.</precondition>
 </task>
@@ -172,7 +176,8 @@ loops. No packs are dropped from the pointer and nothing is deleted on either pa
 <output>
 Create `.planning/phases/04-push-packs-atomic-flip-gc-rekey/4-04-SUMMARY.md` when done.
 
-Record the merge rule in full — what is carried forward, what is truncated and from which end,
-and how the `keyfile` field is chosen — because plan 4-05 depends on the pointer it receives
-already being the truncated one, and plan 4-06 depends on the `keyfile` rule.
+Record the merge rule in full as tested — what is carried forward, what is truncated and from
+which end, and how the `keyfile` field is chosen — and name 4-01's orchestrator as where the real
+closure lives. Plan 4-05 depends on the pointer it receives already being the truncated one, and
+plan 4-06 depends on the `keyfile` rule.
 </output>

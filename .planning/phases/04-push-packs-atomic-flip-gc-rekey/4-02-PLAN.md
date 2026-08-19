@@ -115,13 +115,14 @@ file does.
   <name>Task 2: `SyncPlan` to `PushBundle` — packing, manifest, index object, root</name>
   <files>src/sync/push/packer.rs</files>
   <behavior>
-    - A plan whose new chunks total ~160 MiB of plaintext produces 5 or 6 packs, not thousands of objects — asserted as a pack count against `PACK_TARGET`.
+    - A plan whose new chunks total ~160 MiB of sealed bytes produces `ceil(total / PACK_MAX)` packs — the expected count computed from the governing constant, never written as a literal — and not thousands of objects.
     - Every produced pack is under `PACK_MAX`, and every pack's `id` equals `content_address` of its own bytes.
     - Re-running `build` over an unchanged tree with a populated `chunk` table produces zero new packs and a `PushBundle` whose `referenced_packs` still names every pack the snapshot needs.
     - A chunk present in the `chunk` table is neither re-sealed nor re-packed, even when the file that owns it failed its append check.
     - The manifest reassembles through `Manifest::open`, and the root opens through `Root::open` under the caller's own `repo_id`.
     - `counter` is exactly one above the previous snapshot's, and one above the local anchor's high-water mark on a first push.
-    - A worst-case pack — `PACK_TARGET` filled entirely with the smallest blobs the format admits — produces a header that still seals as a single chunk.
+    - A worst-case pack — filled to `PACK_MAX` with the smallest blobs the format admits — produces a header that still seals as a single chunk.
+    - Every chunk id in the root's `manifest_chunks` resolves through the index object, and every id in `PushBundle.index_chunks` names a pack this bundle produces or already references.
   </behavior>
   <action>
 Fill `packer::build(ctx: &PushCtx<'_>, plan: &SyncPlan) -> Result<PushBundle>`, whose signature
@@ -133,20 +134,28 @@ chunk shared with an append-check failure free rather than re-uploaded. For the 
 bytes from the file the plan names, seal through `chunk::seal_chunk`, and push into a
 `PackWriter`. Before each push, ask `pack::should_seal(writer.len_bytes(), blob.ciphertext.len())`
 and, when it says so, `finish` the writer into a `BuiltPack` and start a new one. Use
-`pack::PACK_TARGET` and `pack::should_seal` as they are. **Do not introduce a second size
-literal and do not raise `PACK_TARGET`** — `docs/sync-format.md` §7 records that CAL-1 was not
-run, so 32 MiB is the standing answer, and the entry-count ceiling below is a function of it.
+`pack::should_seal` exactly as it is and introduce no second size rule.
+
+**Know which constant you are actually working against.** `should_seal` compares against
+`pack::PACK_MAX` = 48 MiB and never reads `PACK_TARGET`, so packs fill to 48 MiB and
+`PACK_TARGET` = 32 MiB is advisory. Every size expectation in this file's tests is therefore
+derived from `PACK_MAX`. **Raise neither constant** — `docs/sync-format.md` §7 records that CAL-1
+was not run, so the recorded fallback stands, and the entry-count ceiling below is a function of
+`PACK_MAX`.
 
 **The header ceiling, which is the one thing in this plan that is easy to get quietly wrong.**
 The pack header is still a single sealed chunk: `pack.rs` seals it through `chunk::seal_chunk`,
 which Phase 1's gap-closure 1-09 deliberately did not reach when it made manifests and index
-objects multi-chunk. At 32 MiB of 256 KiB chunks a pack holds about 128 entries against a limit
-in the thousands, so today it is slack rather than a limit. Write the test that keeps it that
-way: construct a pack filled to `PACK_TARGET` with the **smallest** blobs the format admits,
-serialize its header, and assert the header's JSON is comfortably inside one `CHUNK_SIZE` frame.
-Name in the test's own doc comment that the upgrade path, if this ever fails, is a format-2
-multi-chunk header through the same `chunk::seal_all` / `reassemble` pair the manifest now uses —
-and that raising the pack target is what would break it.
+objects multi-chunk. At 48 MiB of 256 KiB chunks a pack holds about 192 entries against a limit
+in the thousands, so today it is slack rather than a limit.
+
+Write the test that keeps it that way, and build the case at **`PACK_MAX`**: fill a pack to
+`PACK_MAX` with the **smallest** blobs the format admits, serialize its header, and assert the
+header's JSON is comfortably inside one `CHUNK_SIZE` frame. Building the case at `PACK_TARGET`
+would understate the real worst case by half again, and a guard that understates its case is a
+guard that passes on the day it should fail. Name in the test's own doc comment that the upgrade
+path, if this ever fails, is a format-2 multi-chunk header through the same `chunk::seal_all` /
+`reassemble` pair the manifest now uses — and that raising `PACK_MAX` is what would break it.
 
 **Chunk bookkeeping.** As each pack is finished, record every entry it holds through
 `Index::record_chunks`, mapping the `PackEntry`'s `id`, `offset`, `clen`, and `true_len` against
@@ -154,18 +163,28 @@ the pack's own content address. Record after `finish`, not before: the pack's id
 until its header is sealed, and a row written against a pack id that never materialised is a
 pointer to nothing.
 
-**The three objects.** Build `model::Manifest` from `plan.file_plans` — path, mode, `true_len`,
-and the ordered chunk id list, all of which `FilePlan` already carries — and `seal` it. Build
-`model::IndexObject` from every entry across every pack this snapshot references, with
-`supersedes` naming the index-object chunk ids the previous snapshot used, and `seal` it. Both
-`seal` calls return `Vec<Blob>` because both objects span as many chunks as they need; pack those
-blobs like any others. Then build `model::Root::new` with the manifest's chunk ids in order, the
-caller's `repo_id`, the keyfile's `KdfParams`, and `ctx.now`, and `seal` it.
+**The three objects, and the order they have to be built in.** This is one sentence in prose and
+three passes in code, and getting the order wrong produces a bundle Phase 5 cannot read while
+every test in this file still passes.
 
-The index object's own chunks are the bootstrap: collect their `(id, pack, offset, clen,
-true_len)` into `RemoteIndexEntry` values for `PushBundle.index_chunks`. Without them a reader
-holding the pointer can resolve nothing, so assert in a test that every id in `index_chunks`
-appears in some pack this bundle either produces or already references.
+1. Build `model::Manifest` from `plan.file_plans` — path, mode, `true_len`, and the ordered chunk
+   id list, all of which `FilePlan` already carries — `seal` it, and **pack its blobs**. `seal`
+   returns `Vec<Blob>` because the manifest spans as many chunks as it needs. Finish the writer.
+2. *Only now* build `model::IndexObject`, over every pack entry this snapshot references — the
+   data chunks **and** the manifest's chunks, which is exactly why step 1 comes first. Skip that
+   ordering and the root's `manifest_chunks` name ids the index object does not describe, so a
+   restore cannot find the manifest at all. `supersedes` names the index-object chunk ids the
+   previous snapshot used. `seal` it, pack its blobs into their own pack, finish.
+3. The index object's own chunks are necessarily **not** described by the index object — nothing
+   describes itself — and that is precisely why `PushBundle.index_chunks` exists as a plaintext
+   bootstrap in the pointer. Collect their `(id, pack, offset, clen, true_len)` into
+   `RemoteIndexEntry` values. That last pack goes into `referenced_packs` like any other.
+4. Build `model::Root::new` with the manifest's chunk ids in order, the caller's `repo_id`, the
+   keyfile's `KdfParams`, and `ctx.now`, and `seal` it.
+
+Two tests, both of which fail on the wrong ordering and neither of which any other plan would
+catch: every id in the root's `manifest_chunks` resolves through the index object, and every id in
+`index_chunks` names a pack this bundle either produces or already references.
 
 **`counter`.** One above the previous snapshot's, read by opening the newest root the pointer
 carries; one above the local anchor's high-water mark on a first push. Do **not** advance the
@@ -196,8 +215,8 @@ fixture small. Every test injects its roots through `SyncRoots::at` and its inde
   <verify>
     <automated>cargo test --lib sync::push::packer</automated>
   </verify>
-  <done>`cargo test --lib sync::push::packer` is green. A plan crossing `PACK_TARGET` several times produces that many packs and no more. Every pack is under `PACK_MAX` and self-addressing. A worst-case header still seals as one chunk, proven by a test that would fail if `PACK_TARGET` were raised. `referenced_packs` includes reused packs. The manifest and root round-trip through Phase 1's own `open` entry points. `PACK_TARGET` and `PACK_MAX` are unchanged.</done>
-  <reversibility rating="costly">`PushBundle`'s contents are what upload, pointer, and prune all consume. Raising `PACK_TARGET` here would be one-way: it changes every future pack boundary and re-opens the single-chunk header ceiling that 1-09 did not reach.</reversibility>
+  <done>`cargo test --lib sync::push::packer` is green. A plan crossing `PACK_MAX` several times produces that many packs and no more, with the expected count derived from the constant rather than written as a literal. Every pack is at or under `PACK_MAX` and self-addressing. A worst-case header built at `PACK_MAX` still seals as one chunk. Every `manifest_chunks` id resolves through the index object, and every `index_chunks` id names a pack the bundle covers. `referenced_packs` includes reused packs. The manifest and root round-trip through Phase 1's own `open` entry points. Both `PACK_TARGET` and `PACK_MAX` are unchanged.</done>
+  <reversibility rating="costly">`PushBundle`'s contents are what upload, pointer, and prune all consume. Raising `PACK_MAX` here would be one-way: it changes every future pack boundary and re-opens the single-chunk header ceiling that 1-09 did not reach. `PACK_TARGET` is advisory and `should_seal` does not read it, so a guard on the target would not catch the change.</reversibility>
   <precondition>Plan 4-01 is merged: `PushCtx`, `PushBundle`, `BuiltPack`, and `RemoteIndexEntry` exist with the signatures `4-01-SUMMARY.md` records. Task 1 of this plan is merged before task 2 runs — `build` calls `known_chunks` and `record_chunks`.</precondition>
 </task>
 
@@ -218,7 +237,7 @@ fixture small. Every test injects its roots through `SyncRoots::at` and its inde
 |---|---|---|---|---|---|
 | T-4-12 | Tampering | a poisoned `chunk` table claiming a chunk is present | high | mitigate | `known_chunks` fails towards not-known on every malformed input, so the worst a poisoned row buys is a re-upload; a row cannot cause a chunk to be *omitted* from `referenced_packs`, which is derived from the plan's own id list |
 | T-4-13 | Tampering | `referenced_packs` missing a reused pack | critical | mitigate | Reused chunks' packs are resolved and included, and a test asserts a second push over an unchanged tree still names every pack; omitting them is the exact input that makes prune delete live data |
-| T-4-14 | Denial of service | an oversized pack header | high | mitigate | The worst-case-header test pins the single-chunk ceiling to the current `PACK_TARGET`, so raising the target cannot silently reintroduce the failure 1-09 removed |
+| T-4-14 | Denial of service | an oversized pack header | high | mitigate | The worst-case-header test is built at `PACK_MAX`, the constant `should_seal` actually compares against, so raising the real pack ceiling cannot silently reintroduce the failure 1-09 removed. A guard built at the advisory `PACK_TARGET` would understate the case by half again |
 | T-4-15 | Information disclosure | plaintext or a chunk id in an error or a log line | high | mitigate | Errors carry a path and an io source only, following 2-05's single `io_at` helper; nothing in this module prints |
 | T-4-16 | Information disclosure | plaintext held longer than needed | medium | mitigate | One reused chunk-sized buffer, as 2-05's `chunk_from` already does; sealed output replaces plaintext rather than accumulating beside it |
 | T-4-17 | Tampering | a new object kind sealed under `chunk_key` | high | mitigate | Only the format's four existing kinds are sealed; the deferred AAD object-type separator stays untriggered, and the executor is instructed to stop rather than add a fifth |
@@ -247,6 +266,7 @@ Create `.planning/phases/04-push-packs-atomic-flip-gc-rekey/4-02-SUMMARY.md` whe
 
 Record the measured pack count and total bytes for the test fixture, the measured worst-case
 header size against the `CHUNK_SIZE` ceiling, and the three `Index` accessor signatures. State
-plainly whether `PACK_TARGET` was touched, and whether any new object kind was sealed under
-`chunk_key`.
+plainly that the worst-case header was built at `PACK_MAX`, whether either pack constant was
+touched, and whether any new object kind was sealed under `chunk_key`. Record the object build
+order — manifest packed, then index object, then root — because Phase 5 walks it in reverse.
 </output>

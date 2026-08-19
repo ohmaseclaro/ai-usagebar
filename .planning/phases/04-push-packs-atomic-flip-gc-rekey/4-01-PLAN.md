@@ -27,6 +27,7 @@ must_haves:
     - "Killing the run after the upload and before the pointer `PUT` leaves the remote pointer byte-identical to what it was; nothing a reader resolves through has changed (SYNC-04, D3)."
     - "The push re-runs `fetch_facts` + `assert_pushable` itself and calls `PushClearance::assert_fresh` before the first byte — a clearance from `sync setup` is never carried in."
     - "A repo that reads private on the first gate and public on the re-gate aborts before the flip, deletes the assets this run uploaded, and names the credentials to rotate."
+    - "`Asset` carries `created_at` and `push/mod.rs` carries `PRUNE_GRACE`, so prune can refuse to delete anything young enough to be another machine's in-flight upload."
     - "Every remote write routes through one retry helper that honours `Retry-After` and `x-ratelimit-reset` and never retries a 4xx that is not a rate-limited 403 (D7)."
     - "No test opens a socket to a host that is not an injected `Endpoints` base, spawns a process, or reads a real `$HOME`."
     - "Nothing in the phase seals a **new kind of object** under `chunk_key`, so the deferred AAD object-type separator stays untriggered."
@@ -42,7 +43,7 @@ must_haves:
     - "**Every cross-module type lives in `push/mod.rs`, never in a sibling.** Five wave-2 plans each own one file; a type declared in `packer.rs` and consumed by `upload.rs` would make two worktrees uncompilable"
     - "`write.rs` is created and *filled* here, not stubbed: `list_assets` and `delete_asset` are needed by 4-03 and 4-05, which are in the same wave and cannot edit each other's files"
     - "`pointer::commit` takes a rebuild closure, so 4-04 adds the 409 arm inside `pointer.rs` without touching the orchestrator that supplies the closure"
-    - "`prune` receives the pointer that actually **landed**, so it structurally cannot delete a pack a competing pointer references"
+    - "`prune` receives the pointer that actually **landed** *and* refuses anything younger than `PRUNE_GRACE` — the landed pointer covers a competitor that already committed, the grace window covers one whose pack is uploaded but not yet flipped. Neither alone is sufficient"
 ---
 
 <objective>
@@ -108,7 +109,7 @@ Phase-wide coverage audit. Every source item maps to a plan.
 | CONTEXT | D5 rekey re-wraps and verifiably deletes the old keyfile asset | 4-06 |
 | CONTEXT | D6 per-asset progress; non-TTY degrades to periodic lines | 4-03 |
 | CONTEXT | D7 honour `Retry-After` and `x-ratelimit-*`; never retry a 4xx that is not a rate-limited 403 | 4-01 |
-| CONTEXT | Risk: the pack header is single-chunk and its slack tracks `PACK_TARGET` | 4-02 (the ceiling assertion, and `PACK_TARGET` left at 32 MiB) |
+| CONTEXT | Risk: the pack header is single-chunk and its slack tracks the pack size ceiling — which is `PACK_MAX`, not `PACK_TARGET` | 4-02 (the worst-case assertion, built at `PACK_MAX`), 4-07 (both constants pinned) |
 | CARRIED | Phase 3: `PushClearance` must be re-earned inside the push | 4-01 |
 | CARRIED | Phase 2: the `chunk` table has no writer | 4-02 |
 | CARRIED | Phase 1: the AAD object-type separator is deferred, and a new object kind under `chunk_key` triggers it | 4-01 (the layout adds no such object — stated, and asserted in 4-07) |
@@ -125,12 +126,14 @@ tag, created once. Atomicity is unaffected: it comes from the flip (D3), not fro
 
 *The `stream` feature is not added to `reqwest`.* ROADMAP asks for it "so a large pack is not
 buffered in RAM", reasoning from the research's ~1.9 GiB packs. CAL-1 was not run
-(`docs/sync-format.md` §7), so its recorded fallback stands and `PACK_TARGET` is **32 MiB** with
-`PACK_MAX` 48 MiB. `PackWriter::finish` already returns a `Vec<u8>`, so a `Vec` body needs no new
-feature, no tempfile, and no `cargo machete` churn; peak upload memory is 4 × 48 MiB. **The
-trigger is named:** if a future phase runs CAL-1 positive and raises `PACK_TARGET` past ~256 MiB,
-add the `stream` feature, write packs to a `NamedTempFile`, and re-check `pack.rs`'s single-chunk
-header ceiling at the same time.
+(`docs/sync-format.md` §7), so its recorded fallback stands. Note which constant actually governs:
+`pack::should_seal` compares against **`PACK_MAX` = 48 MiB** and never reads `PACK_TARGET`, so
+packs fill to 48 MiB and `PACK_TARGET` = 32 MiB is advisory. `PackWriter::finish` already returns
+a `Vec<u8>`, so a `Vec` body needs no new feature, no tempfile, and no `cargo machete` churn; peak
+upload memory is 4 × 48 MiB. **The trigger is named:** if a future phase runs CAL-1 positive and
+raises **`PACK_MAX`** past ~256 MiB, add the `stream` feature, write packs to a `NamedTempFile`,
+and re-check `pack.rs`'s single-chunk header ceiling at the same time — that ceiling is a function
+of `PACK_MAX`, not of the target.
 </source_audit>
 
 <tasks>
@@ -141,28 +144,48 @@ header ceiling at the same time.
   <behavior>
     - `ensure_release` against a mock returning 200 for the tag yields that release id and issues no `POST`.
     - `ensure_release` against a mock returning 404 for the tag issues one `POST /releases` and yields the created id.
-    - `list_assets` parses `id`, `name`, `size`, `state`, and an optional `digest`, and tolerates the field being absent.
+    - `list_assets` parses `id`, `name`, `size`, `state`, `created_at`, and an optional `digest`, and tolerates only the digest being absent.
     - `upload_asset` sends its body to the **uploads** base, not the api base, with `Content-Type: application/octet-stream`.
     - `upload_asset` against a mock returning 422 with an `already_exists` error re-lists and returns the existing asset rather than failing.
     - `download_asset` follows the redirect to signed storage and the second request carries **no** `Authorization` header.
     - `download_asset` refuses a body larger than the asset cap without allocating it.
     - `get_contents` on 404 yields `None`; on 200 it yields the blob `sha` and the decoded bytes; a body past the pointer cap is refused.
     - `put_contents` with `Some(sha)` sends that `sha`; with `None` it omits the field entirely.
+    - `put_contents` against a mock answering 422 because the path already exists yields `GithubError::Conflict`, not `Unexpected`.
     - `with_retry` retries a `RateLimited` up to its attempt cap, sleeping the delay `http::retry_delay` computed, and returns the last error rather than looping.
     - `with_retry` returns immediately on `Unauthorized`, `Forbidden`, `NotFound`, and `Conflict` — no second attempt is made, asserted by a mock expecting exactly one hit.
   </behavior>
   <action>
-Add `pub mod write;` to `src/sync/github/mod.rs`. That is the **only** edit this plan makes to
-that file — plan 3-01's guard test reads `include_str!("mod.rs")` and fails if a request-body
-call site appears in it, and that guard keeps doing its job precisely because Phase 4's writes
-land in their own module. Rust allows an inherent `impl Client` block in a sibling module of the
-same crate, so `write.rs` extends `Client` without reopening `mod.rs`.
+Add `pub mod write;` to `src/sync/github/mod.rs`, and **fix the guard test that lives there**.
+Rust allows an inherent `impl Client` block in a sibling module of the same crate, so `write.rs`
+extends `Client` without reopening `mod.rs` — which means plan 3-01's guard survives this plan
+untouched while the claim it is named for stops being true. It reads `include_str!("mod.rs")` and
+proves that `Client` exposes no method carrying a request body; as of this plan `Client` has six,
+in the file next door, and the test is still green. A green test making a false claim is worse
+than no test.
+
+Rewrite it to assert what is now true and still worth enforcing: **request bodies live only in
+`write.rs`.** Have it `read_dir` over `concat!(env!("CARGO_MANIFEST_DIR"), "/src/sync/github")`,
+skip `write.rs`, and fail if any other file in that directory carries a request-body call site
+outside a string literal. Reading the crate's own source is hermetic — it is present wherever
+`cargo test` runs, including inside `makepkg`'s `check()` — and a directory walk covers files
+added later, which the per-file `include_str!` form does not. Rename the test and rewrite its doc
+comment to the new claim, and keep the failure message loud: a body call site outside `write.rs`
+means an upload path grew somewhere it will not be reviewed as one.
 
 Create `src/sync/github/write.rs`. It is the only file in the crate that sends a request body,
 and it says so in its module doc.
 
-`pub struct Asset { pub id: u64, pub name: String, pub size: u64, pub state: String, pub digest: Option<String> }`
-deserialized from GitHub's release-asset JSON. `state` is a `String` rather than an enum: the
+`pub struct Asset { pub id: u64, pub name: String, pub size: u64, pub state: String, pub created_at: DateTime<Utc>, pub digest: Option<String> }`
+deserialized from GitHub's release-asset JSON.
+
+`created_at` is **not** decoration and is not optional: it is the field prune's grace window is
+computed from. Without it prune cannot distinguish a pack no snapshot references because it is
+garbage from a pack no snapshot references *yet* because another machine uploaded it thirty
+seconds ago and has not flipped — and deleting the second is D2's single worst outcome. It is
+frozen here because `Asset` is a frozen type and plan 4-05 cannot add a field to it.
+
+`state` is a `String` rather than an enum: the
 research rates its transitions MEDIUM confidence, and an enum that panics or errors on an
 undocumented value would turn a surprise into an outage. Callers compare it against the literal
 for the uploaded state. `digest` is `Option` because GitHub does not populate it on every asset;
@@ -224,6 +247,14 @@ stale one is the compare-and-swap that yields 409. Serialize the request with a 
 the same request as no `sha`. Returns the new blob `sha` from the response, which the caller
 keeps for its next flip.
 
+**Classify a 422 from this endpoint as a conflict.** GitHub answers a stale `sha` with 409, but
+answers a `PUT` that *omits* `sha` against a path that already exists with 422 — which is exactly
+the first-push-with-lost-local-state case. Left unclassified it surfaces as an unrecognised hard
+error at the last step of a long push, when the correct response is the same re-read-and-rebuild
+retry a 409 gets. Map a 422 from `put_contents`, and only from `put_contents`, onto
+`GithubError::Conflict` before returning. No new variant is added: plan 3-01 froze `Conflict` for
+precisely this arm.
+
 `pub(crate) async fn with_retry<T, F, Fut, S, SFut>(attempts: u32, sleep: S, now: DateTime<Utc>, op: F) -> Result<T>`
 is D7 in one place. `op` is an async closure returning `Result<T>`; `sleep` is an injected
 async fn taking a `Duration`, so **no test sleeps**. Retry only when the error is
@@ -273,7 +304,10 @@ would leave two wave-2 worktrees unable to compile, because neither owns the oth
 
 Constants: `POINTER_PATH` = the literal `sync/pointer.json`, `RELEASE_TAG` = the literal
 `ai-usagebar-sync-v1`, `POINTER_VERSION` = 1 and `MAX_SUPPORTED_POINTER` = 1 (read through
-`sync::check_version`, at-or-below like every other object).
+`sync::check_version`, at-or-below like every other object). Plus `PRUNE_GRACE`, a
+`chrono::Duration` of 24 hours: no asset younger than this is ever deleted. It lives here rather
+than in `prune.rs` because it is the load-bearing half of a safety property two plans reason
+about — see step 8 below.
 
 Naming, as pure functions: `pack_asset_name(&ChunkId) -> String` rendering `pack-` then the 64
 hex characters then `.bin`, and `keyfile_asset_name(&ChunkId) -> String` rendering `keyfile-`
@@ -353,8 +387,36 @@ orchestrator, and it runs in this order, which is D3 and is not negotiable:
 7. `pointer::commit` — the compare-and-swap `PUT`. **This is the only commit point.** An
    interruption anywhere above leaves the remote exactly as it was: the packs are
    content-addressed, immutable, and referenced by nothing.
+
+   The `rebuild` closure this step hands to `commit` is written **here**, in this file, and it is
+   the most safety-critical function in the phase because it decides what survives a race. Three
+   rules, each with a failure mode that destroys data rather than erroring:
+
+   - *Carry forward every snapshot record this run did not produce.* On a conflict `rebuild` is
+     called again with the competing machine's pointer; dropping its records makes its packs
+     unreferenced, which makes the next prune delete them, which strands its backup. Append this
+     run's record to whatever list arrives — never replace the list.
+   - *Truncate to `cfg.keep_snapshots` from the **oldest** end only.* Doing it inside the pointer
+     being written is what makes D2's mandatory order structural: the snapshot record is dropped
+     by the flip itself, strictly before step 8 deletes anything.
+   - *Take `keyfile` from the pointer that arrived*, not from local state, unless this run is the
+     one changing it — which only `rekey` is. A push republishing a stale keyfile name points
+     every future reader at an asset a rekey has already deleted.
+
+   Plan 4-04 owns `pointer.rs` and the conflict loop that calls this closure a second time. It
+   does **not** own this closure; its tests drive `commit` with one reproducing these three rules,
+   so a future edit here that breaks one fails there.
 8. `prune::run` against the pointer that actually landed. Any error from it becomes
    `prune_warning`, never a returned `Err`.
+
+   **The landed pointer is not sufficient on its own, and neither this plan nor 4-05 may claim it
+   is.** It covers a competitor that has already committed. It does nothing about one mid-push:
+   machine 2 uploads pack `P` and has not flipped; machine 1 commits, prunes, sees `P` referenced
+   by no snapshot, deletes it; machine 2 then flips a pointer naming `P` — a live snapshot
+   pointing at deleted data, D2's single worst outcome, reached with neither machine doing
+   anything wrong. The second half of the mitigation is an **age floor**: nothing younger than
+   `PRUNE_GRACE` is ever deleted, which is why `Asset` carries `created_at`. The cost is that
+   genuine garbage lingers a day; the alternative is an unrestorable backup.
 
 **`push/pointer.rs`** — `pub async fn load(client, repo, expect_repo_id, now) -> Result<(Option<Pointer>, Option<String>)>`
 routing through `write::get_contents`, probing `format` before deserializing (a newer pointer may
@@ -370,12 +432,29 @@ this file and fills the 409 arm — the closure exists from the tracer precisely
 re-read-and-rebuild retry without touching the orchestrator that supplies it.
 
 **`push/packer.rs`**, **`push/upload.rs`**, **`push/prune.rs`**, **`push/rekey.rs`** — created
-with their frozen signatures and a working minimum sufficient for this tracer:
-`packer::build(ctx, plan) -> Result<PushBundle>` handling the straight-line case;
-`upload::run(ctx, release_id, packs, progress) -> Result<(usize, usize, u64)>` uploading each pack
-sequentially with no resume scan; `prune::run(ctx, release_id, pointer, keep) -> Result<usize>`
-returning zero deletions; `rekey::run(...)` returning a not-yet-implemented error. Each file's
-module doc names the plan that fills it. The gaps are functional; the architecture is whole.
+with their frozen signatures and a working minimum sufficient for this tracer. Write every
+signature out in full; an elided one is a signature two worktrees will each guess differently.
+
+- `packer::build(ctx: &PushCtx<'_>, plan: &SyncPlan) -> Result<PushBundle>` — handle the
+  straight-line case.
+- `upload::run(ctx: &PushCtx<'_>, release_id: u64, packs: &[BuiltPack], progress: &mut dyn Progress) -> Result<(usize, usize, u64)>`
+  — upload each pack sequentially, no resume scan.
+- `prune::plan_deletions(pointer: &Pointer, assets: &[Asset], keep: usize, now: DateTime<Utc>, grace: Duration) -> (Pointer, Vec<u64>)`
+  — pure, with `now` and `grace` as parameters rather than reads. Return the pointer unchanged and
+  no deletions.
+- `prune::run(ctx: &PushCtx<'_>, release_id: u64, landed: &Pointer, keep: usize) -> Result<usize>`
+  — return zero deletions.
+- `prune::run_on_demand(ctx: &PushCtx<'_>, release_id: u64, keep: usize) -> Result<usize>` — the
+  `sync prune` entry point, which gates, loads the pointer, publishes the truncated one, and only
+  then deletes. It must exist **here** because task 3 dispatches `SyncAction::Prune` to it, and
+  plan 4-05, which fills it, does not own `cli.rs`. Return zero deletions for now.
+- `rekey::run(ctx: &PushCtx<'_>, release_id: u64, old_pw: &Zeroizing<String>, new_pw: &Zeroizing<String>) -> Result<String>`
+  — returning the new keyfile asset's name. Return a not-yet-implemented error for now. Both
+  passwords arrive as arguments because the prompting happens at the CLI in task 3, which owns the
+  terminal; nothing under `push/` reads a password or an environment variable.
+
+Each file's module doc names the plan that fills it. The gaps are functional; the architecture is
+whole.
 
 **`push/progress.rs`** — `pub trait Progress { fn start(&mut self, assets: usize, total_bytes: u64); fn asset_done(&mut self, index: usize, name: &str, bytes: u64); fn finish(&mut self); }`
 plus `pub struct Silent;` implementing it as no-ops, which is what every test passes. The
@@ -388,13 +467,20 @@ pointer path and that its `sha` precondition is the format's single linearizatio
 `Pointer` / `SnapshotRecord` / `RemoteIndexEntry` JSON with every field's type; the ordering of
 `snapshots`; the bootstrap chain a reader walks (pointer → keyfile asset → newest sealed root →
 `index_chunks` → the index object → manifest chunks → data chunks); why the container is
-plaintext and what an attacker editing it can and cannot achieve; and that the pack-header
-single-chunk ceiling is unchanged because `PACK_TARGET` is unchanged. Someone holding only this
-page must be able to write a reader — that is the standard the rest of the document already
-holds itself to.
+plaintext and what an attacker editing it can and cannot achieve. Someone holding only this page
+must be able to write a reader — that is the standard the rest of the document already holds
+itself to.
+
+Also correct **§4**, which today says a writer "aims for `PACK_TARGET` = 32 MiB and is sealed
+before a blob would carry it past `PACK_MAX` = 48 MiB". Only the second half is implemented:
+`pack::should_seal` compares against `PACK_MAX` alone, so packs fill to 48 MiB and `PACK_TARGET`
+governs nothing in the sealing decision. Record that plainly — `PACK_TARGET` is advisory, and
+`PACK_MAX` is the constant the header-entry ceiling is a function of. The whole point of the risk
+`4-CONTEXT.md` carries forward is that somebody will one day raise a pack size constant, and a
+document naming the wrong one sends them to the wrong guard. Do not change either value.
   </action>
   <verify>
-    <automated>cargo test --lib -- sync::push::pointer sync::push::mod</automated>
+    <automated>cargo test --lib -- sync::push::pointer sync::push::tests</automated>
   </verify>
   <done>`src/sync/push/` holds six files plus `mod.rs`. Every cross-module type is declared in `push/mod.rs` and none in a sibling. `pointer::load` and `pointer::commit` work against mockito for the no-conflict path, sending no `sha` on a first push and the loaded `sha` afterwards. `docs/sync-format.md` carries a §10 from which a reader could be written. The crate builds with the four unfilled modules present.</done>
   <reversibility rating="one-way">The remote layout — asset names, the pointer path, and the pointer JSON — is what every future reader and every already-pushed bundle depends on. Changing it after a user has pushed once means their bundle is unreadable by the next build unless a migration is written. It is versioned (`POINTER_VERSION`) so it *can* evolve, but the v1 shape ships once.</reversibility>
@@ -434,6 +520,13 @@ prints `PushOutcome`: packs uploaded, packs skipped, bytes, snapshots kept, pack
 `prune_warning` on its own clearly-marked line when present. **A run whose only failure is the
 prune step exits 0** — that is D2 in the exit code, and it is the one place where getting it
 wrong is silent.
+
+**The rekey arm owns the password prompts.** Nothing under `src/sync/push/` reads a password;
+`rekey::run` takes both as `Zeroizing<String>` arguments. Prompt for the old and then the new
+password here, through the same prompt seam plan 3-07 established for `sync setup` — TTY, stdin,
+or a mode-0600 file, never a command-line argument and never an environment variable, which is
+Phase 1's rule and is not relaxed. Apply Phase 1's strength floor to the new one through
+`sync::passphrase` before calling `rekey::run`, so a refused password costs no network round trip.
 
 The error path prints Phase 3's `http::actionable` text and nothing else: no token, no prefix of
 one, no header dump, no response body echoed unsanitized. Where a remote-supplied string does
@@ -482,7 +575,7 @@ and a fixed `now`, against `mockito`. None calls `run`, `Config::load`, `SyncRoo
 | T-4-08 | Repudiation | a lost `PUT` response retried | medium | mitigate | A 409 is never retried inside `with_retry`; the compare-and-swap is re-driven only by `pointer::commit`'s own rebuild path (plan 4-04), so a stale write can never clobber a newer one |
 | T-4-09 | Information disclosure | remote error text rendered to the terminal | medium | mitigate | Remote-supplied strings route through `sanitize_untrusted_field`; the CLI prints `http::actionable` and never a raw body or header map |
 | T-4-10 | Information disclosure | token or passphrase in output | critical | mitigate | Nothing in `push/` or `write.rs` formats a header map or a key; a test asserts the rendered outcome contains no substring of either |
-| T-4-11 | Tampering | an unreferenced-but-live pack deleted | critical | mitigate | Prune runs only after a successful flip and only against the pointer that **landed**; it is structurally handed the committed pointer rather than the one this run built |
+| T-4-11 | Tampering | an unreferenced-but-live pack deleted | critical | mitigate | Two halves, neither sufficient alone: prune runs only after a successful flip and only against the pointer that **landed** (covers a competitor that already committed), *and* refuses any asset younger than `PRUNE_GRACE` (covers a competitor mid-push whose pack is uploaded but not yet referenced). `Asset.created_at` exists for the second half |
 | T-4-SC | Tampering | dependency surface | low | accept | Zero new crates and zero new features. `reqwest` 0.12, `serde_json`, `base64`, `chrono`, `zeroize`, `tokio` (`rt` supplies `JoinSet`), and `mockito` are all declared today. `Cargo.toml` is **not** in this plan's `files_modified`; if the executor believes it needs an edit there, that is a signal the design drifted, not a step to take |
 </threat_model>
 
@@ -520,5 +613,7 @@ re-derive them from the diff.
 State explicitly, because two later plans depend on it: **prune is handed the pointer that
 landed**, and **`prune_warning` is an `Option` on the outcome, never an `Err`**.
 
-State whether `PACK_TARGET` was touched. It must not have been.
+State whether `PACK_TARGET` or `PACK_MAX` was touched — neither must have been — and record which
+of the two `pack::should_seal` actually compares against, because 4-02 and 4-07 both build guards
+against that answer.
 </output>

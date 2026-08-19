@@ -11,6 +11,7 @@ requirements: [CRYPTO-04]
 must_haves:
   truths:
     - "`sync rekey` under a new password unwraps the **same** master key and rewrites only the keyfile — not one pack byte moves (CRYPTO-04)."
+    - "The visibility gate is re-earned **inside** the rekey, before the wrapped master key leaves the machine — a repository flipped public between `sync setup` and this command never receives it."
     - "The new keyfile is uploaded and the pointer flipped to it **before** the old asset is deleted, so an interruption never leaves a bundle with no reachable keyfile."
     - "The old keyfile asset is **verifiably** gone: the delete is followed by a re-list that confirms its absence, and a failure to confirm is reported as a failure, not as success (D5)."
     - "A wrong old password fails before anything is uploaded, with Phase 1's single indistinguishable message."
@@ -63,6 +64,8 @@ Output: `rekey::run` and the `sync rekey` body.
   <behavior>
     - A keyfile rewrapped under a new password opens to the same three subkeys as the original opened to under the old one — asserted by sealing a chunk before and after and comparing the ciphertext byte for byte.
     - A wrong old password fails before any request is issued, with the same message a corrupted keyfile gets.
+    - Against a mock reporting the repository public, the run refuses before issuing any request that carries a body, and no keyfile asset is created.
+    - The request order against a mock begins with the visibility read, before the keyfile upload.
     - A new password under Phase 1's floor is refused by Phase 1's own gate; the floor is not re-implemented and not lowered.
     - The request order against a mock is: upload the new keyfile, flip the pointer, delete the old asset, re-list to confirm — and a test asserts that order, not just the set.
     - A run interrupted after the upload but before the flip leaves the pointer naming the **old** keyfile, which still opens under the old password.
@@ -72,8 +75,10 @@ Output: `rekey::run` and the `sync rekey` body.
     - The rendered output contains neither password, nor any keyfile byte, nor an eight-character prefix of either.
   </behavior>
   <action>
-Fill `rekey::run`, whose signature plan 4-01 froze, taking the context, the old password, the new
-password, and the release id.
+Fill `rekey::run(ctx: &PushCtx<'_>, release_id: u64, old_pw: &Zeroizing<String>, new_pw: &Zeroizing<String>) -> Result<String>`,
+whose signature plan 4-01 froze, returning the new keyfile asset's name. Both passwords arrive as
+arguments: the prompting happens in `sync::cli`'s rekey arm, which owns the terminal, and nothing
+under `src/sync/push/` reads a password or an environment variable.
 
 **Rewrap first, offline.** Read the local keyfile, and call Phase 1's
 `Keyfile::rewrap(old_pw, new_pw, params)`. Do not re-derive, re-generate, or re-implement any part
@@ -83,6 +88,14 @@ it would look like success. A wrong old password fails here, before a single req
 single indistinguishable message — there is nothing useful to tell apart and nothing an attacker
 should learn from the difference. Apply Phase 1's strength gate to the new password through
 `sync::passphrase`; do not restate the floor and do not lower it.
+
+**Then the gate, before anything leaves the machine.** `gate::fetch_facts`,
+`gate::assert_pushable` with `cfg.includes(SyncCategory::Credentials)`, and
+`PushClearance::assert_fresh` — the same sequence and the same incident path as 4-01's push step 1.
+This command uploads the **wrapped master key**, the single most valuable object in the bundle,
+and a repository can be flipped public from the web UI between `sync setup` and now. A clearance
+obtained at setup is not accepted here for exactly the reason it is not accepted for a push. This
+is not a second rule for a second command: every write path in the crate re-earns the clearance.
 
 **Then the ordered remote sequence, and the order is the whole safety property.**
 
@@ -133,7 +146,7 @@ the AUR `check()` runs these on an installer's machine.
   <verify>
     <automated>cargo test --lib sync::push::rekey</automated>
   </verify>
-  <done>`cargo test --lib sync::push::rekey` is green. A chunk sealed before the rekey and one sealed after are byte-identical, proving the data subkeys did not move. The four remote steps happen in order, asserted as an order. A surviving old asset at the confirming re-list is a failure. No pack asset is touched on any path. The local keyfile is replaced atomically at mode 0600 only after the flip. The rendered output states that this is not revocation, and contains no password, key, or keyfile byte.</done>
+  <done>`cargo test --lib sync::push::rekey` is green. The gate runs before any request carrying a body, and a public repository refuses with no keyfile asset created. A chunk sealed before the rekey and one sealed after are byte-identical, proving the data subkeys did not move. The four remote steps happen in order, asserted as an order. A surviving old asset at the confirming re-list is a failure. No pack asset is touched on any path. The local keyfile is replaced atomically at mode 0600 only after the flip. The rendered output states that this is not revocation, and contains no password, key, or keyfile byte.</done>
   <reversibility rating="one-way">A rekey that generated a new master key instead of rewrapping the old one orphans every pack on the remote and reports success. There is no password recovery and no escrow by design, so the failure is unrecoverable and silent. `Keyfile::rewrap` is Phase 1's and is called, never approximated.</reversibility>
   <precondition>Plan 4-01 is merged: `PushCtx`, `Pointer`, `rekey::run`'s signature, `push::keyfile_asset_name`, `pointer::commit`, and `write::{upload_asset, delete_asset, list_assets}` exist as `4-01-SUMMARY.md` records them, and `SyncAction`'s rekey variant is already dispatched.</precondition>
   <precondition>Phase 1 and Phase 3 are merged: `crypto::Keyfile::{open, rewrap}`, `sync::passphrase`'s generation and strength floor, and 3-07's local keyfile path all exist. Read `3-07-SUMMARY.md` for where the keyfile is written; this plan replaces that file and must not invent a second location.</precondition>
@@ -155,6 +168,7 @@ the AUR `check()` runs these on an installer's machine.
 
 | Threat ID | Category | Component | Severity | Disposition | Mitigation Plan |
 |---|---|---|---|---|---|
+| T-4-43b | Information disclosure | the wrapped master key uploaded to a repository that has turned public | critical | mitigate | The gate re-runs `fetch_facts` + `assert_pushable` + `assert_fresh` before the first body-carrying request, taking the same incident path a push does; no clearance from `sync setup` is accepted, and a test asserts the refusal precedes any upload |
 | T-4-43 | Denial of service | a new master key generated instead of a rewrap | critical | mitigate | `Keyfile::rewrap` is called, never approximated, and a test seals a chunk before and after and compares the ciphertext byte for byte — a changed master key changes it |
 | T-4-44 | Denial of service | the old keyfile deleted before the flip | critical | mitigate | Upload, then flip, then delete, then confirm; a test asserts the order rather than the set, and an interruption before the flip leaves the pointer naming the old keyfile, which still opens |
 | T-4-45 | Repudiation | reporting success while the old wrapper survives | critical | mitigate | The confirming re-list is mandatory and its failure is an error naming the asset — D5's "verifiably delete", not "attempt to delete" |
@@ -185,7 +199,7 @@ opens.
 <output>
 Create `.planning/phases/04-push-packs-atomic-flip-gc-rekey/4-06-SUMMARY.md` when done.
 
-Record the exact four-step remote order and the confirming re-list, and state that the old-password
-residual (T-4-46) is accepted-and-disclosed rather than mitigated — Phase 6's README work needs to
+Record the exact sequence — the gate, then the four remote steps, then the confirming re-list —
+and state that the old-password residual (T-4-46) is accepted-and-disclosed rather than mitigated — Phase 6's README work needs to
 repeat it, and `docs/sync-format.md` §9 already says it.
 </output>

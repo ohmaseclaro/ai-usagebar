@@ -2,7 +2,7 @@
 phase: 04-push-packs-atomic-flip-gc-rekey
 plan: 07
 type: execute
-wave: 3
+wave: 4
 depends_on: ["4-01", "4-02", "4-03", "4-04", "4-05", "4-06"]
 files_modified:
   - tests/sync_push_e2e.rs
@@ -18,6 +18,7 @@ must_haves:
     - "A stale-`sha` 409 re-plans, and no asset the competing pointer references is deleted (REPO-07)."
     - "Repeated syncs of a growing file leave the asset list smaller than the cumulative history (SYNC-07)."
     - "The whole protocol is exercised against `mockito` with no real token, no real `$HOME`, and no network."
+    - "**Both** pack size constants are pinned, and the guard names `PACK_MAX` as the one that governs — a guard on the advisory `PACK_TARGET` alone stays green through exactly the change it exists to catch."
     - "The user-facing document says what push does, what prune deletes, that a password change is not revocation, and that a multi-gigabyte bundle rewritten often is the profile GitHub's acceptable-use policy warns about."
   artifacts:
     - tests/sync_push_e2e.rs — one test per ROADMAP success criterion, each named after it
@@ -72,6 +73,7 @@ Output: `tests/sync_push_e2e.rs`, and the user-facing half of `docs/sync-github.
     - Re-running that killed push uploads only the packs that were missing or in a non-uploaded state, deletes the zombie, and reaches the same final pointer.
     - A stale-`sha` 409 on the pointer `PUT` re-reads, re-plans, and lands a pointer containing both machines' snapshot records; a prune immediately afterwards deletes none of the competing machine's packs.
     - A rekey against the same fixture leaves every pack asset byte-identical and the old keyfile asset absent.
+    - An unreferenced pack asset created inside `PRUNE_GRACE` survives a prune, and the same asset aged past the window does not — the in-flight-competitor guard, driven through the real orchestrator rather than only `plan_deletions`.
     - Twelve pushes of a growing file leave the release holding fewer assets than the cumulative number ever uploaded, and every asset the final pointer names is present.
     - A push driven with a recording progress reporter emits advancing asset and byte counts, and every failure path returns a non-zero exit with a message that names an action.
   </behavior>
@@ -112,8 +114,13 @@ known kinds. Keep the check crude and the failure message loud, and have that me
 do: introducing a fifth kind is the trigger for the deferred AAD object-type separator, which is a
 versioned format change and not an edit.
 
-Add a second such test asserting `pack::PACK_TARGET` still reads 32 MiB, with a message pointing at
-the single-chunk pack-header ceiling that tracks it and at 4-02's worst-case header test.
+Add a second such test pinning **both** pack size constants — `pack::PACK_TARGET` at 32 MiB and
+`pack::PACK_MAX` at 48 MiB. Pinning only the target would be worse than pinning nothing:
+`pack::should_seal` compares against `PACK_MAX` and never reads `PACK_TARGET`, so a guard on the
+target stays green while someone raises the real ceiling to 512 MiB and re-breaks the exact
+single-chunk pack-header gap 1-09 did not reach — the one risk `4-CONTEXT.md` singles out. Have the
+failure message name `PACK_MAX` as the governing constant and point at 4-02's worst-case header
+test as the thing to re-run before either value moves.
 
 Nothing in this file reads a real `$HOME`, a real token, the real Keychain, or the network.
   </action>
@@ -166,9 +173,9 @@ In `README.md`, extend the sync section 3-05 added with one line per new command
 not duplicate the content; a second copy is a second thing to keep true.
   </action>
   <verify>
-    <automated>cargo test --test sync_push_e2e</automated>
+    <automated>grep -q keep_snapshots docs/sync-github.md && grep -q 'sync prune' docs/sync-github.md && grep -q 'sync rekey' docs/sync-github.md && grep -qi revocation docs/sync-github.md && grep -qi 'acceptable.use' docs/sync-github.md && grep -q sync-github README.md</automated>
   </verify>
-  <done>`docs/sync-github.md` documents push, resume, retention and `keep_snapshots`, `sync prune`, `sync rekey` with the not-revocation statement, and the acceptable-use note. The README links to it without duplicating it. Nothing in either document contradicts `docs/sync-format.md` §9 or §10.</done>
+  <done>The verify grep passes: `docs/sync-github.md` names `keep_snapshots`, `sync prune`, and `sync rekey`, carries the not-revocation statement and the acceptable-use note, and the README links to it. Nothing in either document contradicts `docs/sync-format.md` §9 or the §10 this phase adds, and neither duplicates the other.</done>
   <precondition>Plan 3-05 is merged, so `docs/sync-github.md` and the README's sync section exist to extend rather than create.</precondition>
 </task>
 
@@ -189,7 +196,7 @@ not duplicate the content; a second copy is a second thing to keep true.
 | T-4-51 | Denial of service | a test reading a real `$HOME`, token, or network | high | mitigate | Every test builds its roots from a `TempDir` and points both `Endpoints` fields at one mockito server; cheap KDF parameters throughout, so `makepkg`'s `check()` cannot fail on an installer's config or time out |
 | T-4-52 | Repudiation | a green suite that proves nothing because a module is still stubbed | high | mitigate | The plan depends on all six predecessors and its precondition says so; the request-count and byte-count assertions fail against a stub that issues no requests |
 | T-4-53 | Tampering | a fifth object kind sealed under `chunk_key` slipping in later | high | mitigate | A source-reading guard test fails loudly and its message names the deferred AAD object-type separator as the required response |
-| T-4-54 | Tampering | `PACK_TARGET` raised without re-checking the header ceiling | high | mitigate | A guard test pins the value and its message points at 4-02's worst-case header test |
+| T-4-54 | Tampering | a pack size ceiling raised without re-checking the header ceiling | high | mitigate | The guard pins **both** `PACK_TARGET` and `PACK_MAX` and names `PACK_MAX` as the governing constant, because `should_seal` compares against it and a target-only guard would stay green through precisely the change it exists to catch |
 | T-4-55 | Information disclosure | documentation implying a rekey revokes access | high | mitigate | The document repeats the command's own words, and `docs/sync-format.md` §9 is named as the authority so the two cannot drift apart quietly |
 | T-4-56 | Information disclosure | documentation omitting the acceptable-use risk | low | mitigate | A short, factual note with the two built-in mitigations named |
 | T-4-SC | Tampering | dependency surface | low | accept | Zero new crates; `mockito`, `tempfile`, and `pretty_assertions` are dev-dependencies today. `Cargo.toml` is not in `files_modified` |
