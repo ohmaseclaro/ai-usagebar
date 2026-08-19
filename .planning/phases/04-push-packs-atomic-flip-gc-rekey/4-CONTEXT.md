@@ -105,3 +105,29 @@ in the pack.
 
 The upgrade path, if needed, is a format-2 multi-chunk header via the same
 `chunk::seal_all`/`reassemble` pair the manifest now uses.
+
+---
+
+## Defect found by Phase 5 planning — the manifest must not carry absolute local paths
+
+`4-02` as drafted builds the manifest from `FilePlan.path`, which is an **absolute local path
+containing the pushing user's home directory and username**. Two consequences, both fatal to the
+milestone's actual purpose:
+
+1. **It is unresolvable on a second machine.** A different username, or a different home layout,
+   and nothing in the bundle maps to a destination.
+2. **Restore is required to reject it.** Phase 5's D5 treats an absolute path in the manifest as
+   hostile input — the traversal defence exists because the bundle is attacker-controllable. So
+   the bundle would only be restorable by disabling the very check that protects the machine
+   restoring it.
+
+It also leaks the username to anyone who obtains the repo, which the format otherwise avoids.
+
+**Fix at the source, in `4-02`:** the manifest stores a **root-prefixed relative encoding** —
+category root plus the path beneath it — never an absolute path. This is a one-expression change
+in `src/sync/push/packer.rs`, and it must happen here rather than in Phase 5, because a bundle
+pushed with absolute paths is a bundle no correct restore can read.
+
+Phase 5's `5-01` was drafted to own this fix. With `4-02` doing it correctly, `5-01`'s job
+becomes **verifying** the encoding rather than changing it — and a test asserting no manifest
+entry is absolute or contains `..` belongs on both sides of the boundary.
