@@ -137,10 +137,20 @@ pub struct SyncRoots {
     pub desktop_profiles_dir: PathBuf,
     /// `~/.claude`, parent of `scheduled-tasks/` and `projects/`.
     pub claude_home: PathBuf,
+    /// The change-detection index db. In the *cache* dir in production — it is
+    /// a wipeable hint, not durable state — and inside the injected tree under
+    /// [`SyncRoots::at`], so no test writes to an installer's real `$XDG`.
+    pub index_file: PathBuf,
 }
 
 impl SyncRoots {
-    /// Test seam: every root explicit, none derived.
+    /// Test seam: every root explicit.
+    ///
+    /// [`index_file`](SyncRoots::index_file) is the one exception — derived
+    /// from `config_dir` rather than passed, so the six existing callers keep
+    /// compiling and every one of them still lands inside its own `TempDir`.
+    /// Production never takes this path; [`resolve`](SyncRoots::resolve) puts
+    /// the index in the cache directory where plan 2-01 put it.
     pub fn at(
         config_file: PathBuf,
         config_dir: PathBuf,
@@ -150,6 +160,7 @@ impl SyncRoots {
     ) -> Self {
         Self {
             config_file,
+            index_file: config_dir.join("sync").join("index.sqlite3"),
             config_dir,
             desktop_data_dir,
             desktop_profiles_dir,
@@ -184,6 +195,7 @@ impl SyncRoots {
             desktop_data_dir: desktop.data_dir,
             desktop_profiles_dir: desktop.profiles_dir,
             claude_home: crate::cache::home_dir()?.join(".claude"),
+            index_file: index::default_path()?,
         })
     }
 }

@@ -88,7 +88,12 @@ pub enum GithubError {
 /// Every variant is a failure. None of them may land on a success-shaped value.
 impl From<GithubError> for AppError {
     fn from(err: GithubError) -> Self {
-        let body = err.to_string();
+        // [`actionable`], not `to_string()`. This is the **only** conversion
+        // between a `GithubError` and the error a user reads, so it is the one
+        // place D-06's "every failure path names the fix" can be enforced
+        // rather than remembered — and until plan 3-07 wired it, `actionable`
+        // had no call site at all and the whole message table was unreachable.
+        let body = actionable(&err);
         match err {
             GithubError::Unauthorized { .. } => AppError::Credentials(body),
             GithubError::RateLimited { .. } => AppError::Http { status: 429, body },
