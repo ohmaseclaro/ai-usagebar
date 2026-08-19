@@ -55,6 +55,22 @@ const EXCLUDED_DIRS: [&str; 4] = [
 const EXCLUDED_SUFFIXES: [&str; 3] = [".lock", ".tmp", "-journal"];
 const EXCLUDED_PREFIX: &str = ".tmp.";
 
+// Names owned by claude-acc's profile store and Claude Desktop's data dir.
+// They mirror the private consts in [`crate::claude_desktop`] (`META_JSON`,
+// `TOKEN_CACHE`, `TOKEN_CACHE_V2`, `DESKTOP_STATE`, `SESSIONS_DIR`) and
+// `claude_desktop::merge::SCHEDULED_TASKS`. Restated here rather than reached
+// for as a literal at each use site: if that layout moves, both blocks move.
+const META_JSON: &str = "meta.json";
+const TOKEN_CACHE: &str = "config-tokenCache";
+const TOKEN_CACHE_V2: &str = "config-tokenCacheV2";
+const DESKTOP_STATE: &str = "desktop-state";
+const SESSIONS_DIR: &str = "claude-code-sessions";
+/// The per-account registry, one per `<account>/<org>/`.
+const SCHEDULED_TASKS: &str = "scheduled-tasks.json";
+/// `~/.claude/scheduled-tasks/` — Claude Code's own routine definitions, a
+/// different tree from the per-account registry above.
+const SCHEDULED_TASKS_DIR: &str = "scheduled-tasks";
+
 /// One collected file and the three quarters of D5's change-detection key that
 /// come from its metadata; the fourth is the path itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,6 +257,34 @@ fn walk_bounded(root: &Path, out: &mut CategoryScan, max_entries: usize) {
     }
 }
 
+/// Immediate subdirectories, by directory listing alone — a profile is a
+/// directory, exactly as [`crate::claude_desktop::load_profiles`] already
+/// defines one, and an account is a directory whether or not its profile was
+/// ever captured.
+///
+/// A symlinked directory is not returned, on the same rule as [`walk`]:
+/// `file_type` comes from `read_dir`, which does not traverse the link, so a
+/// link planted in the store cannot pull an arbitrary host tree into the scan.
+/// An unreadable directory reads as empty rather than as an error.
+fn subdirs(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|entry| entry.path())
+        .collect()
+}
+
+/// Every `<sessions_root>/<account>/<org>/`.
+fn account_org_dirs(sessions_root: &Path) -> Vec<PathBuf> {
+    subdirs(sessions_root)
+        .iter()
+        .flat_map(|account| subdirs(account))
+        .collect()
+}
+
 /// Scan one category against the injected roots.
 ///
 /// `now` is threaded in because the transcripts arm's D3 bounds are
@@ -266,8 +310,34 @@ pub fn collect(
             scan.bytes = scan.files.iter().map(|f| f.size).sum();
             push_path(&roots.config_file, &mut scan);
         }
-        // Owned by plan 2-02.
-        SyncCategory::Credentials | SyncCategory::Routines | SyncCategory::ChatIndex => {}
+        SyncCategory::Credentials => {
+            // D1: per profile, `meta.json`, both token caches and
+            // `desktop-state/` — and nothing else in the store. A profile
+            // without a readable meta.json is skipped rather than failing the
+            // other accounts, exactly as `load_profiles` already treats one.
+            for profile in subdirs(&roots.desktop_profiles_dir) {
+                let meta = profile.join(META_JSON);
+                if !meta.is_file() {
+                    continue;
+                }
+                push_path(&meta, &mut scan);
+                push_path(&profile.join(TOKEN_CACHE), &mut scan);
+                push_path(&profile.join(TOKEN_CACHE_V2), &mut scan);
+                walk(&profile.join(DESKTOP_STATE), &mut scan);
+            }
+        }
+        SyncCategory::Routines => {
+            // D1: Claude Code's own routine definitions, plus each account's
+            // registry. The account and org levels are enumerated by listing,
+            // not from a profile's meta.json, so an account that was never
+            // captured still has its routines carried.
+            walk(&roots.claude_home.join(SCHEDULED_TASKS_DIR), &mut scan);
+            for org in account_org_dirs(&roots.desktop_data_dir.join(SESSIONS_DIR)) {
+                push_path(&org.join(SCHEDULED_TASKS), &mut scan);
+            }
+        }
+        // Task 2 of this plan.
+        SyncCategory::ChatIndex => {}
         // Owned by plan 2-04.
         SyncCategory::Transcripts => return super::transcripts::collect_bounded(roots, cfg, now),
     }
@@ -456,6 +526,195 @@ mod tests {
             vec![".credentials.json", ".credentials.json", "config.toml"]
         );
         assert_eq!(scan.bytes, scan.files.iter().map(|f| f.size).sum::<u64>());
+    }
+
+    fn scan_of(cat: SyncCategory, dir: &TempDir) -> CategoryScan {
+        collect(cat, &roots_at(dir), &SyncConfig::default(), Utc::now())
+    }
+
+    // ---- credentials: the four D1 profile members, and nothing else --------
+
+    #[test]
+    fn a_profile_yields_its_meta_both_token_caches_and_the_whole_desktop_state_tree() {
+        let dir = TempDir::new().unwrap();
+        seed(dir.path(), "profiles/gmail/meta.json", "{}");
+        seed(dir.path(), "profiles/gmail/config-tokenCache", "x");
+        seed(dir.path(), "profiles/gmail/config-tokenCacheV2", "x");
+        seed(dir.path(), "profiles/gmail/desktop-state/Cookies", "x");
+        seed(
+            dir.path(),
+            "profiles/gmail/desktop-state/Local Storage/leveldb/000003.log",
+            "x",
+        );
+        // The rest of a profile directory is not a D1 member.
+        seed(dir.path(), "profiles/gmail/config.json", "{}");
+
+        let scan = scan_of(SyncCategory::Credentials, &dir);
+        assert_eq!(
+            names(&scan),
+            vec![
+                "000003.log",
+                "Cookies",
+                "config-tokenCache",
+                "config-tokenCacheV2",
+                "meta.json",
+            ]
+        );
+        assert_eq!(scan.bytes, scan.files.iter().map(|f| f.size).sum::<u64>());
+    }
+
+    #[test]
+    fn every_profile_is_collected_and_one_without_meta_json_does_not_fail_the_others() {
+        let dir = TempDir::new().unwrap();
+        // Four accounts is this user's normal case, not an edge case.
+        for label in ["gmail", "hotmail", "struct", "toptal"] {
+            seed(dir.path(), &format!("profiles/{label}/meta.json"), "{}");
+            seed(
+                dir.path(),
+                &format!("profiles/{label}/config-tokenCache"),
+                "x",
+            );
+        }
+        // Hand-mangled: no readable meta.json, skipped as `load_profiles` does.
+        seed(dir.path(), "profiles/broken/config-tokenCache", "x");
+
+        let scan = scan_of(SyncCategory::Credentials, &dir);
+        assert_eq!(scan.files.len(), 8, "{:?}", names(&scan));
+        assert!(
+            !scan
+                .files
+                .iter()
+                .any(|f| f.path.to_string_lossy().contains("broken"))
+        );
+    }
+
+    #[test]
+    fn bridge_state_and_the_device_registry_never_leave_a_profile() {
+        let dir = TempDir::new().unwrap();
+        seed(dir.path(), "profiles/gmail/meta.json", "{}");
+        for name in ["bridge-state.json", "ant-device-registry.json"] {
+            seed(dir.path(), &format!("profiles/gmail/{name}"), "{}");
+            seed(
+                dir.path(),
+                &format!("profiles/gmail/desktop-state/{name}"),
+                "{}",
+            );
+        }
+        seed(dir.path(), "profiles/gmail/desktop-state/Cookies", "x");
+
+        let scan = scan_of(SyncCategory::Credentials, &dir);
+        assert_eq!(names(&scan), vec!["Cookies", "meta.json"]);
+    }
+
+    #[test]
+    fn rollback_state_beside_and_inside_the_profile_store_contributes_nothing() {
+        let dir = TempDir::new().unwrap();
+        seed(dir.path(), "profiles/gmail/meta.json", "{}");
+        // Siblings of the store: outside the only root this collector is handed.
+        seed(dir.path(), "backups/gmail/config-tokenCache", "x");
+        seed(dir.path(), "prelogin-backup/config-tokenCache", "x");
+        // The same names inside it, where the shared D2 predicate catches them.
+        seed(dir.path(), "profiles/backups/meta.json", "{}");
+        seed(dir.path(), "profiles/hidden/meta.json", "{}");
+
+        let scan = scan_of(SyncCategory::Credentials, &dir);
+        assert_eq!(names(&scan), vec!["meta.json"]);
+    }
+
+    #[test]
+    fn a_missing_profile_store_is_an_empty_scan_not_an_error() {
+        let dir = TempDir::new().unwrap();
+        let scan = scan_of(SyncCategory::Credentials, &dir);
+        assert!(scan.files.is_empty());
+        assert_eq!(scan.bytes, 0);
+        assert_eq!(scan.category, SyncCategory::Credentials);
+    }
+
+    #[test]
+    fn unchecking_credentials_scans_nothing_even_with_a_full_profile_store() {
+        let dir = TempDir::new().unwrap();
+        seed(dir.path(), "profiles/gmail/meta.json", "{}");
+        seed(dir.path(), "profiles/gmail/config-tokenCache", "x");
+        let cfg = SyncConfig {
+            categories: vec![SyncCategory::Config],
+            ..SyncConfig::default()
+        };
+        let scan = collect(SyncCategory::Credentials, &roots_at(&dir), &cfg, Utc::now());
+        assert!(scan.files.is_empty());
+        assert_eq!(scan.bytes, 0);
+    }
+
+    // ---- routines: ~/.claude/scheduled-tasks/** plus each account registry --
+
+    #[test]
+    fn routines_take_the_claude_home_tree_and_every_account_registry() {
+        let dir = TempDir::new().unwrap();
+        seed(
+            dir.path(),
+            "claude-home/scheduled-tasks/daily-skill-update/task.json",
+            "{}",
+        );
+        seed(
+            dir.path(),
+            "claude-home/scheduled-tasks/standup/report.md",
+            "x",
+        );
+        seed(
+            dir.path(),
+            "desktop/claude-code-sessions/acct-1/org-1/scheduled-tasks.json",
+            "{}",
+        );
+        seed(
+            dir.path(),
+            "desktop/claude-code-sessions/acct-2/org-2/scheduled-tasks.json",
+            "{}",
+        );
+        // Chat indexes are the other category's.
+        seed(
+            dir.path(),
+            "desktop/claude-code-sessions/acct-1/org-1/local_abc.json",
+            "{}",
+        );
+
+        let scan = scan_of(SyncCategory::Routines, &dir);
+        assert_eq!(
+            names(&scan),
+            vec![
+                "report.md",
+                "scheduled-tasks.json",
+                "scheduled-tasks.json",
+                "task.json",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_missing_routines_tree_is_an_empty_scan_not_an_error() {
+        let dir = TempDir::new().unwrap();
+        let scan = scan_of(SyncCategory::Routines, &dir);
+        assert!(scan.files.is_empty());
+        assert_eq!(scan.bytes, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_profile_or_account_directory_is_not_entered() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        seed(outside.path(), "meta.json", "{}");
+        seed(outside.path(), "config-tokenCache", "x");
+        seed(outside.path(), "org-1/scheduled-tasks.json", "{}");
+
+        fs::create_dir_all(dir.path().join("profiles")).unwrap();
+        symlink(outside.path(), dir.path().join("profiles/linked")).unwrap();
+        assert!(scan_of(SyncCategory::Credentials, &dir).files.is_empty());
+
+        let sessions = dir.path().join("desktop/claude-code-sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        symlink(outside.path(), sessions.join("acct-1")).unwrap();
+        assert!(scan_of(SyncCategory::Routines, &dir).files.is_empty());
     }
 
     #[test]
