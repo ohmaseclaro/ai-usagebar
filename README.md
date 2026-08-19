@@ -39,6 +39,7 @@ codebase.
 - [Claude accounts](docs/claude-accounts.md)
 - [Format placeholders](docs/format-placeholders.md)
 - [Provider endpoints and live tests](docs/vendor-endpoints.md)
+- [Encrypted sync bundle format](docs/sync-format.md)
 - [KDE Plasma 6 plasmoid](kde-plasmoid/README.md)
 
 ## Install
