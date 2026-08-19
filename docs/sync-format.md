@@ -387,11 +387,18 @@ bundles sharing a master key open each other's roots again. An implementation
 must refuse to seal or open a root under an empty identifier.
 
 This is the one place the deterministic-nonce rule is inverted, and deliberately:
-every other object's nonce is derived from its content address because identical
-plaintext *must* seal identically or dedup dies. The root's plaintext changes on
-every sync, and a content-derived nonce would publish whether two consecutive
-snapshots are identical. The root is the mutable entry point and so has no
-content address of its own — hence the fixed AAD literal.
+every other object's nonce is derived from **the exact bytes it seals** (§3) —
+never from its id — because identical plaintext *must* seal identically or dedup
+dies. Deriving a nonce from an id while sealing something else is precisely the
+AEAD nonce-reuse flaw this format was audited for and had removed; do not
+reintroduce it for a new object kind.
+
+The root's plaintext changes on every sync, so a message-derived nonce would
+publish whether two consecutive snapshots are identical. The root is the mutable
+entry point, so it takes a fresh random 24-byte nonce instead. Its AAD is
+`ROOT_AAD ‖ repo_id` — the literal alone was the pre-audit form and is not
+sufficient: without the identifier, two bundles sharing a master key open each
+other's roots.
 
 ```json
 {

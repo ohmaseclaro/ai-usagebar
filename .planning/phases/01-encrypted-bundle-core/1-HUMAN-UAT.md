@@ -1,6 +1,6 @@
 # Phase 1 — Deferred live verification
 
-Everything in Phase 1 that a machine could verify **has been verified**: 1095 tests pass,
+Everything in Phase 1 that a machine could verify **has been verified**: 1104 tests pass,
 clippy and fmt are clean, and the verifier independently re-ran the gates and enumerated
 consumers rather than trusting the claims. The two items below need something this phase
 deliberately does not have — a real GitHub repo with a token, and slow non-Apple hardware —
