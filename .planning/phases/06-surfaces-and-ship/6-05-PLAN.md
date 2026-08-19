@@ -109,8 +109,11 @@ for you, because withholding that permission is what makes a push to a public re
 impossible rather than merely discouraged.
 
 **Day to day.** `sync status`, `sync push`, `sync pull`, `--dry-run` on both, and `--json` for
-scripting. Note that these exit non-zero on failure and that the Waybar widget is a different
-binary with the opposite contract — it always exits 0, because Waybar hides modules that do not.
+scripting. Note that these exit non-zero on failure, and that the Waybar render path — the same
+`ai-usagebar` binary invoked with no subcommand — has the opposite contract: it always exits 0,
+because Waybar hides modules that do not. One binary, two deliberately opposite exit contracts.
+Do not write "a different binary"; `6-CONTEXT.md`'s D3 uses that phrasing and it is wrong, as
+6-03's SUMMARY records. The contract split it describes is right.
 
 **Surfaces.** The macOS menu bar's Sync submenu and the TUI's Sync section, each with what it
 can and cannot do. State D-02 explicitly: a surface cannot prompt, so an operation needing a
@@ -193,7 +196,7 @@ one most easily bumped by reflex when it should not be.
 
 <task type="checkpoint:human-verify" gate="blocking">
   <name>Task 3: The gate, the hand checks, and the tag</name>
-  <what-built>Phase 6 in full: `sync status --json` and the menu-bar state row (6-01), the menu-bar push/pull triggers and the CLI's non-interactive refusal (6-02), the widget exit-0 gate (6-03), the TUI Sync section (6-04), and this plan's docs plus release preparation. Everything is committed; nothing is tagged.</what-built>
+  <what-built>Phase 6 in full: `sync status --json` and the menu-bar state row (6-01), the menu-bar push/pull triggers and the CLI's non-interactive refusal (6-02), the widget exit-0 gate (6-03), the TUI Sync section (6-04), and this plan's docs plus release preparation. **Task 2's version, CHANGELOG and packaging edits are already committed as the release commit** — this checkpoint runs the gate and tags that commit. Nothing is tagged yet.</what-built>
   <how-to-verify>
 Run the full gate. On a Mac, `omarchy plugin validate .` will not be available; run it on the
 Linux box, or state that it was skipped and why.
@@ -219,10 +222,13 @@ Then exercise the surfaces by hand, because none of the above can:
 6. Open the TUI, press `s`, toggle a sync category, Ctrl-S, and confirm `config.toml` changed,
    its comments survived, and it is still mode 0600.
 
-Then, and only then, tag — by hand, not through an agent:
+Then, and only then, tag — by hand, not through an agent. Task 2 already made the release
+commit, so do **not** commit again here; a second commit would leave the tag pointing at an
+empty change or, worse, at a commit the gate never ran against. `git status` should be clean
+before you tag; if it is not, whatever is uncommitted has not been through the gate.
 
 ```
-git commit -m "v1.2.0 — encrypted GitHub sync"
+git status                                    # must be clean
 git tag -a v1.2.0 -m "v1.2.0 — encrypted GitHub sync"
 git push origin main && git push origin v1.2.0
 ```
@@ -256,6 +262,7 @@ including the `git fetch && git reset --hard origin/master` in each AUR clone be
 | T-6-42 | Tampering | a hand-edited `.SRCINFO` on a non-Arch host | high | mitigate | The task's precondition stops and hands off rather than hand-editing; a `.SRCINFO` that disagrees with its PKGBUILD is what the release workflow rejects |
 | T-6-43 | Denial of service | a test that reads a real `$HOME` failing the AUR `check()` | high | mitigate | Every Phase 6 plan forbids it in its own verification; `make test` here is the last gate before the tag, run once over all of it |
 | T-6-44 | Tampering | an unmovable wrong tag | high | mitigate | Tagging is a blocking human checkpoint, never an agent action, and the checkpoint restates that tags are immutable and that the fix is a new patch version |
+| T-6-47 | Tampering | tagging a commit the gate never ran against | medium | mitigate | Task 2 makes the release commit; the checkpoint tags it and does not commit. `git status` must be clean before tagging, so anything uncommitted is visibly outside what was gated |
 | T-6-45 | Information disclosure | a real API key or token in a release artifact | critical | mitigate | `git diff` review at the checkpoint plus the repo's standing rule that no real key is ever committed; the release commit touches only docs, versions and packaging |
 | T-6-46 | Tampering | an unrelated dependency moving inside a release commit | medium | mitigate | `cargo update -p ai-usagebar` only, never a bare `cargo update`; `cargo machete` runs in the gate |
 | T-6-SC | Tampering | dependency surface for the whole phase | medium | mitigate | Phase 6 adds **zero** new crates and zero new Swift dependencies, so no package-legitimacy audit applies. `cargo machete` and the AUR source build's "no system `-dev` package" constraint are both re-checked at the gate, and `Cargo.toml` appears in this plan's `files_modified` for the version line only |

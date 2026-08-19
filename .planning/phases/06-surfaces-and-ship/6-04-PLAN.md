@@ -85,7 +85,7 @@ design than this overlay has today.
 
 <task type="tracer" tdd="true">
   <name>Task 1: The Sync rows — state, focus walk, and the toggle</name>
-  <precondition>`SyncConfig`/`SyncCategory` in `src/config.rs` may have grown fields in Phases 2–5 (a repo, transcript bounds). Read it first and round-trip the real `categories` vector rather than a shape invented here.</precondition>
+  <precondition>The API this task names — `SyncCategory::ALL`, `SyncCategory::label`, `SyncConfig::categories`, `SyncConfig::includes` — exists in `src/config.rs` today, but `SyncConfig` may have grown fields in Phases 2–5 (a repo, transcript bounds). Read it first, confirm those four, and round-trip the real `categories` vector rather than a shape invented here.</precondition>
   <files>src/tui/settings.rs</files>
   <behavior>
     - `SettingsState::from_config` over a default `Config` yields one sync row per `SyncCategory::ALL` entry, in that order, with transcripts off and the other four on.

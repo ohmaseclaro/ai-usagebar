@@ -26,6 +26,7 @@ must_haves:
     - "`--json` on `SyncAction::Status` in src/widget/cli.rs"
     - "`report::status_json(&StatusReport) -> serde_json::Value` in src/sync/report.rs — pure, no filesystem"
     - "`PendingSummary` on `StatusReport`, counted from index lookups with no file body read"
+    - "`pub warnings: Vec<String>` on `StatusReport` — the field does not exist today; `StatusReport` currently carries `lines`, `last_sync`, and `index_path` only"
     - "`SyncStatus` + `parseSyncStatus(_ data: Data) -> SyncStatus?` in macos/ai-usagebar-menubar.swift"
     - "`syncSummaryLine(_:)` in macos/ai-usagebar-menubar.swift — the one dim row, pure"
     - "`testSyncStatus()` registered in macos/ai-usagebar-tests.swift's TestRunner"
@@ -119,7 +120,16 @@ and do not touch any other variant.
 
 In `src/sync/report.rs`:
 
-Add `PendingSummary { pub files: usize, pub bytes: u64 }` and
+Add three fields to `StatusReport`, which today carries `lines`, `last_sync`, and
+`index_path` and nothing else — check that before assuming any of them is already there.
+
+`pub warnings: Vec<String>`, default empty. `build_status` cannot fill it (it has no failure
+of its own to report), so the caller pushes into it: today's only entry is the
+index-unavailable message that `sync::cli::status` currently sends to stderr and drops. A
+JSON consumer that never sees it would render "last sync: never" for a machine that syncs
+hourly.
+
+`PendingSummary { pub files: usize, pub bytes: u64 }` and
 `pub pending: Option<PendingSummary>` on `StatusReport`. `None` means the index was not
 available, which is a third state and must not be flattened into "nothing pending" — a
 backup nobody can tell is stale is exactly what D-04 exists to prevent.
@@ -142,7 +152,8 @@ across derives. Keys, all present on every run so the consumer never has to dist
 `last_sync` (RFC 3339 string or null), `pending` (bool or null), `pending_files` (number or
 null), `pending_bytes` (number or null), `categories` (array of
 `{category, enabled, files, bytes, capped}` in `SyncCategory::ALL` order), `total_files`,
-`total_bytes`, `index` (path string or null), `warnings` (array of strings, empty when clean).
+`total_bytes`, `index` (path string or null), `warnings` (array of strings, empty when clean —
+serialized straight from the new field, never re-derived).
 
 Reuse `CategoryLine`'s fields verbatim; do not invent parallel names. Leave the object open
 for 6-02 and for Phases 3–5 fields such as `repo` — a consumer that ignores unknown keys is
@@ -155,8 +166,8 @@ In `src/sync/cli.rs`: thread the flag through `run` into `status(json: bool)`. O
 print `serde_json::to_string(&status_json(&report))` plus a newline when the flag is set, and
 the existing text otherwise; return 0. On a config or roots failure, keep the existing
 `eprintln!` and the non-zero return — a script piping this deserves a real exit code, and
-that is the whole point of D-03's split. Route the index-unavailable message into the
-report's `warnings` array as well as stderr, so a JSON consumer sees it too.
+that is the whole point of D-03's split. Push the index-unavailable message into the report's new
+`warnings` field as well as stderr, so a JSON consumer sees it too.
 
 Refactor `status()` so the config/roots/index resolution and the printing are separable, and
 add a `status_with(roots, cfg, index, now, json) -> (i32, String)` seam that the tests drive.
