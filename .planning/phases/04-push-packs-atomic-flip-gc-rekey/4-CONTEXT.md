@@ -83,3 +83,25 @@ Worth hunting specifically: a pointer flip that could publish a snapshot referen
 failed verification; a prune that could race a concurrent push from another machine and delete
 a pack the *new* snapshot references; and any path where a rekey reports success while the old
 keyfile asset survives.
+
+---
+
+## Risk propagated from Phase 1 verification
+
+**The pack header is still single-chunk, and its slack is a function of `PACK_TARGET`.**
+
+Gap-closure 1-09 removed the single-chunk size limit from manifests and index objects, but it
+did not reach the **pack header** (`pack.rs`), which still seals through `chunk::seal_chunk` and
+therefore keeps the `CHUNK_SIZE` ceiling.
+
+That is sound *today*: a 32 MiB pack of 256 KiB chunks holds ~128 entries against a limit in the
+thousands, and an oversized header errors cleanly rather than truncating.
+
+**But if CAL-1 comes back positive and this phase raises `PACK_TARGET`, the entry count rises
+with it and that ceiling must be re-checked.** It is the one place 1-09's fix deliberately did
+not reach. Raising the pack target without re-examining the header limit would reintroduce
+exactly the failure 1-09 was written to remove — this time on the object that names every chunk
+in the pack.
+
+The upgrade path, if needed, is a format-2 multi-chunk header via the same
+`chunk::seal_all`/`reassemble` pair the manifest now uses.
