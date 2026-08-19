@@ -1,8 +1,22 @@
 # Phase 1 — Security Audit
 
-**Verdict:** `OPEN_THREATS` → remediation in progress (see status at the bottom)
+**Verdict:** `SECURED` — both blockers closed and independently re-verified; one low-severity
+item deliberately deferred to Phase 2 with its trigger recorded.
 **ASVS level:** 2, with L3 depth on the AEAD/nonce path. `block_on: high`.
-**Closed:** 40/45 · **Blocking open:** 2 · **Non-blocking open:** 3
+**Final state:** blocking open **0** · non-blocking open **0** · deferred **1** (NEW-3)
+
+Re-verification was performed by an auditor that did **not** write the fixes and was instructed
+to reproduce each finding from the current code rather than review the diff. It enumerated all
+six AEAD call sites in the crate, and confirmed the id pins were untouched by extracting every
+hex literal from `tests/sync_vectors.rs` at the pre-remediation commit and diffing against
+`HEAD` — evidence independent of whether the suite passes. That mattered: the original F-1 flaw
+passed all thirteen adversarial tests.
+
+It also found that the first remediation had **re-introduced the very defect class it fixed
+elsewhere in the same commit** — documentation asserting behaviour that does not exist (F-4b) —
+and had left the F-4 floor seam `pub` while narrowing `Keys::seal` to `pub(crate)` for exactly
+that reason. Both are now closed. Round two corrected six such statements, two more than the
+audit named, including the user-facing `WEAKENED_KDF` message and this file.
 
 Audited adversarially from the format and threat model directly. The existing adversarial test
 suite was explicitly **not** treated as proof — it was written by the same effort that wrote the

@@ -104,3 +104,25 @@ machine.
   after a week, rather than blocking.
 - **CAL-4** — the real compressed size of the default bundle. Measure the actual zstd ratio on
   this machine's true payload rather than quoting the 115 MB raw figure.
+
+---
+
+## Deferred from Phase 1 security audit (NEW-3) — object-type separator in the chunk AAD
+
+Every object sealed through `chunk::seal_chunk` — data chunk, manifest chunk, index chunk, pack
+header — uses one key with `aad = its own chunk_id` and **no object-type domain separator**.
+Serde ignores unknown fields, so an `IndexObject` structurally deserializes as a `PackHeader`.
+
+Confirmed to dead-end today: bounds checks and per-blob tags stop it, so it is a confused read
+that errors, not a compromise. Deliberately **not** fixed in Phase 1 — a type byte changes ~10
+signatures and ~60 call sites across four modules and two test binaries, moves every ciphertext
+pin, and would rewrite §3–§5 of a format stabilised days earlier. A rushed AAD change on a
+just-stabilised format is worse than a documented known issue.
+
+**The trigger that forces it:** introducing a *new kind of object* sealed under `chunk_key`. If
+this phase adds one, the separator lands first. Recorded at `Keys::seal`'s safety contract and
+in `docs/sync-format.md` §3.
+
+Also carried forward from `1-09`: `manifest_chunks` is unbounded, which is safe only because it
+sits inside authenticated plaintext. **If this phase grows any path that reads an id list before
+its container authenticates, that path needs its own bound.**
