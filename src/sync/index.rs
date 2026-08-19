@@ -172,15 +172,38 @@ impl Index {
     pub fn lookup(&self, entry: &FileEntry) -> Option<FileRecord> {
         let path = entry.path.to_str()?;
         let (size, mtime_ns, inode) = key_of(entry)?;
+        self.read_row(
+            "SELECT sealed_chunks, chunk_ids FROM file \
+             WHERE path = ?1 AND size = ?2 AND mtime_ns = ?3 AND inode = ?4 \
+               AND length(chunk_ids) <= ?5",
+            params![path, size, mtime_ns, inode, MAX_CHUNK_IDS_BYTES],
+        )
+    }
+
+    /// The stored row for `path` whatever its D5 tuple now says — what we
+    /// chunked *last* time, which is the append fast path's starting guess.
+    ///
+    /// [`Index::lookup`] answers "is this file unchanged?" and its `Some` may
+    /// be trusted. This answers "what did this file used to be?" and its `Some`
+    /// is a **hypothesis**: the caller must re-hash the last sealed chunk
+    /// before reusing any id, because a rewrite that happens to grow a file is
+    /// indistinguishable from an append by `(size, mtime_ns, inode)` alone.
+    pub fn cached(&self, path: &Path) -> Option<FileRecord> {
+        let path = path.to_str()?;
+        self.read_row(
+            "SELECT sealed_chunks, chunk_ids FROM file \
+             WHERE path = ?1 AND length(chunk_ids) <= ?2",
+            params![path, MAX_CHUNK_IDS_BYTES],
+        )
+    }
+
+    /// Decode one `file` row. Every failure — no row, SQL error, a field that
+    /// does not fit, a `chunk_ids` blob that is not a whole number of ids —
+    /// reads as `None`, never as a partial answer.
+    fn read_row(&self, sql: &str, params: impl rusqlite::Params) -> Option<FileRecord> {
         let (sealed, blob): (i64, Vec<u8>) = self
             .conn
-            .query_row(
-                "SELECT sealed_chunks, chunk_ids FROM file \
-                 WHERE path = ?1 AND size = ?2 AND mtime_ns = ?3 AND inode = ?4 \
-                   AND length(chunk_ids) <= ?5",
-                params![path, size, mtime_ns, inode, MAX_CHUNK_IDS_BYTES],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
+            .query_row(sql, params, |row| Ok((row.get(0)?, row.get(1)?)))
             .ok()?;
         if !blob.len().is_multiple_of(32) {
             // A truncated row would otherwise yield a short chunk list, i.e. a
