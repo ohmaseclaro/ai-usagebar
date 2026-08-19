@@ -84,3 +84,23 @@ Restore is the phase where a compromised or tampered bundle turns into local wri
 hunting: path traversal in the manifest, symlink targets that escape the category root, a
 mode-0644 credential slipping through, and any path where a failed integrity check still leaves
 partial output on disk.
+
+---
+
+## Risk propagated from plan 1-05 (recorded during Phase 1 execution)
+
+**`anchor::accept` decides; it does not persist. Advancing the high-water mark is this phase's
+job, and the order is a security property.**
+
+The rollback anchor's `accept()` is a pure function of (local anchor, remote counter). Whoever
+wires it must advance the stored counter **only after the snapshot has verified**. Advancing
+first means a failed fetch of a forged high counter permanently locks the user out of their own
+real bundle — a denial-of-service an attacker with repo write access could trigger at will,
+turning a rollback defence into a self-inflicted outage.
+
+Also inherited: a `repo_id` mismatch errors even under `allow_rollback`. That escape hatch is
+for an older snapshot of the *same* bundle, never for a counter borrowed from a different one
+by renaming.
+
+First-contact TOFU is an accepted residual risk, not a mitigated one — documented in
+`accept`'s doc comment and owed a mention in the milestone's residual-risk section.
