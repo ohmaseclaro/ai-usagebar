@@ -35,16 +35,20 @@
 
 use std::sync::OnceLock;
 
+use base64::Engine;
+use chacha20poly1305::XChaCha20Poly1305;
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 use zeroize::Zeroizing;
 
 use ai_usagebar::error::{AppError, Result};
-use ai_usagebar::sync::CHUNK_SIZE;
 use ai_usagebar::sync::anchor::{self, Anchor};
 use ai_usagebar::sync::chunk::{reassemble, seal_all};
-use ai_usagebar::sync::crypto::{ChunkId, KdfParams, Keyfile, Keys};
+use ai_usagebar::sync::crypto::{ChunkId, KdfDoc, KdfParams, Keyfile, Keys, derive_kek};
 use ai_usagebar::sync::model::{FileEntry, Manifest, Root};
 use ai_usagebar::sync::pack::{PackHeader, PackWriter, blob_bytes, read_header};
+use ai_usagebar::sync::{CHUNK_SIZE, KEYFILE_VERSION};
 
 // ---------------------------------------------------------------------------
 // The harness
@@ -100,8 +104,76 @@ fn fixture(len: usize) -> Vec<u8> {
     out
 }
 
+/// A keyfile wrapping a fixed master key, assembled from the public fields
+/// instead of through `Keyfile::create_with_floor`.
+///
+/// That seam is `pub(crate)`: a memory floor an outside caller passes its own
+/// value for is not a floor, and it was measurably not one — `create` at 8 KiB
+/// was refused while `create_with_floor` at 8 KiB wrote a keyfile that opened.
+/// `Keyfile::create` is the only exported constructor, and it will not wrap at
+/// the cheap seam, so a hermetic suite that must stay microseconds builds its
+/// own — the same thing `tests/sync_vectors.rs` does, which needs a fixed master
+/// key that `create`'s CSPRNG draw could never give it.
+///
+/// `seed` picks both the master key and the salt, so two keyfiles from this
+/// helper are two different hierarchies **and** two different KEKs. The fixed
+/// wrap nonce is only safe because of that second half: one nonce under one KEK
+/// wrapping two master keys is precisely the misuse this file exists to catch.
+fn wrap_by_hand(seed: u8, k: KdfParams) -> Keyfile {
+    /// `docs/sync-format.md` §1's `{"format":…,"kdf":{…}}`, in declaration
+    /// order, which *is* the canonical AAD byte order.
+    #[derive(Serialize)]
+    struct KeyfileAad<'a> {
+        format: u32,
+        kdf: &'a KdfDoc,
+    }
+
+    const B64: base64::engine::general_purpose::GeneralPurpose =
+        base64::engine::general_purpose::STANDARD;
+    const WRAP_NONCE: [u8; 24] = [0x5e; 24];
+
+    let (master, salt) = ([seed; 32], [seed ^ 0xa5; 16]);
+    let kdf = KdfDoc {
+        algo: "argon2id".into(),
+        version: 19,
+        m_kib: k.m_kib,
+        t: k.t,
+        p: k.p,
+        salt: B64.encode(salt),
+    };
+    let aad = serde_json::to_vec(&KeyfileAad {
+        format: KEYFILE_VERSION,
+        kdf: &kdf,
+    })
+    .expect("the AAD serializes");
+
+    let kek = derive_kek(PASSWORD.as_bytes(), &salt, k).expect("the cheap KDF seam");
+    let wrapped = XChaCha20Poly1305::new((&*kek).into())
+        .encrypt(
+            &WRAP_NONCE.into(),
+            Payload {
+                msg: &master,
+                aad: &aad,
+            },
+        )
+        .expect("wrapping the fixed master key");
+
+    Keyfile {
+        format: KEYFILE_VERSION,
+        kdf,
+        nonce: B64.encode(WRAP_NONCE),
+        wrapped_master_key: B64.encode(&wrapped),
+    }
+}
+
+/// The suite's own keyfile and the subkeys it unwraps to — through the
+/// production `Keyfile::open`, so the hierarchy under test is the real one.
 fn suite_keys() -> (Keyfile, Keys) {
-    Keyfile::create_with_floor(PASSWORD.as_bytes(), CHEAP, CHEAP.m_kib).expect("keyfile creation")
+    let keyfile = wrap_by_hand(0x11, CHEAP);
+    let keys = keyfile
+        .open(PASSWORD.as_bytes())
+        .expect("a hand-wrapped keyfile must open");
+    (keyfile, keys)
 }
 
 /// Fixed, injected, never `Utc::now()`.
@@ -408,9 +480,10 @@ fn attack_2_downgraded_kdf_parameters() -> String {
         t: 1,
         p: 1,
     };
-    let (keyfile, keys) =
-        Keyfile::create_with_floor(PASSWORD.as_bytes(), SEALED_AT, SEALED_AT.m_kib)
-            .expect("keyfile creation");
+    let keyfile = wrap_by_hand(0x22, SEALED_AT);
+    let keys = keyfile
+        .open(PASSWORD.as_bytes())
+        .expect("a hand-wrapped keyfile must open");
     let data = fixture(FIXTURE_LEN);
     let (pack, _, root) = bundle(&keys, &data);
 
@@ -643,10 +716,10 @@ fn attack_8_transposed_manifest_ids() -> String {
     // requires the key", stated as an assertion rather than as prose.
     let mut transposed = ordered.clone();
     transposed.swap(0, 1);
-    let stranger =
-        Keyfile::create_with_floor(b"a key the attacker actually holds", CHEAP, CHEAP.m_kib)
-            .expect("keyfile creation")
-            .1;
+    // A second, unrelated hierarchy: the key the attacker actually holds.
+    let stranger = wrap_by_hand(0x33, CHEAP)
+        .open(PASSWORD.as_bytes())
+        .expect("a hand-wrapped keyfile must open");
     let forged = Root::new(
         SNAPSHOT_COUNTER,
         fixed_time(),

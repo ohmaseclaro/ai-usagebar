@@ -328,6 +328,19 @@ fn aad_bytes(format: u32, kdf: &KdfDoc) -> Result<Vec<u8>> {
 /// The on-disk keyfile: KDF parameters in cleartext plus the wrapped master
 /// key. It holds no plaintext key material — the wrapped key is ciphertext and
 /// the salt is public — so deriving `Debug` here is safe.
+///
+/// **The fields stay `pub`, and that is a considered trade rather than an
+/// oversight.** They let an outside caller assemble a `Keyfile` struct without
+/// going through `wrap`, so the write-path floor is not enforced by the type.
+/// It is not enforced by the type in any case — a caller willing to build one by
+/// hand is also willing to run Argon2id and XChaCha20-Poly1305 by hand, which is
+/// what filling `wrapped_master_key` actually takes. What the fields buy is the
+/// one test that proves the *documented* format and the implemented one are the
+/// same thing: `tests/sync_vectors.rs` wraps a fixed master key from
+/// `docs/sync-format.md` §1 and asserts [`Keyfile::open`] accepts it, which is
+/// impossible against a private-field struct and irreplaceable as evidence. The
+/// hole that mattered — an exported entry point that *takes* the floor as an
+/// argument, so no crypto knowledge is needed to skip it — is closed above.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Keyfile {
     pub format: u32,
@@ -342,8 +355,9 @@ impl Keyfile {
     /// Draw a fresh master key and wrap it under `pw`. Returns both the keyfile
     /// to persist and the live subkeys, so the caller never pays the KDF twice.
     ///
-    /// Refuses `k.m_kib` below [`MIN_KDF_MEMORY_KIB`]. **Every production caller
-    /// uses this**, not [`Keyfile::create_with_floor`].
+    /// Refuses `k.m_kib` below [`MIN_KDF_MEMORY_KIB`]. This is the **only** way
+    /// to create a keyfile from outside the crate; `create_with_floor` beside it
+    /// is `pub(crate)`.
     pub fn create(pw: &[u8], k: KdfParams) -> Result<(Keyfile, Keys)> {
         Self::create_with_floor(pw, k, MIN_KDF_MEMORY_KIB)
     }
@@ -353,10 +367,21 @@ impl Keyfile {
     ///
     /// Tests wrap at `m_kib = 8` and run in microseconds, which is what keeps
     /// the AUR `check()` inside its budget on an installer's machine; they pass
-    /// their own parameters as the floor. Production has no reason to call this:
-    /// a caller that wants a lower floor wants [`MIN_KDF_MEMORY_KIB`] lowered,
-    /// where the argument for it can be read.
-    pub fn create_with_floor(pw: &[u8], k: KdfParams, min_m_kib: u32) -> Result<(Keyfile, Keys)> {
+    /// their own parameters as the floor.
+    ///
+    /// **`pub(crate)`, for the same reason `Keys::seal` is.** Exported, this was
+    /// not a seam but a hole: `create` at 8 KiB is refused while this wrote the
+    /// keyfile and it opened, so [`MIN_KDF_MEMORY_KIB`] bound `create` and
+    /// `rewrap` rather than the format. Production has no reason to call it
+    /// either — a caller that wants a lower floor wants [`MIN_KDF_MEMORY_KIB`]
+    /// lowered, where the argument for it can be read. An integration test that
+    /// needs a cheap keyfile builds one by hand from the public fields, which
+    /// `tests/sync_vectors.rs` has to do anyway to pin a fixed master key.
+    pub(crate) fn create_with_floor(
+        pw: &[u8],
+        k: KdfParams,
+        min_m_kib: u32,
+    ) -> Result<(Keyfile, Keys)> {
         let mut mk = Zeroizing::new([0u8; 32]);
         fill(&mut mk[..])?;
         let keyfile = Self::wrap(&mk, pw, k, min_m_kib)?;
@@ -388,9 +413,10 @@ impl Keyfile {
         self.rewrap_with_floor(old_pw, new_pw, k, MIN_KDF_MEMORY_KIB)
     }
 
-    /// [`Keyfile::rewrap`] with the memory floor as an argument. The test seam;
-    /// see [`Keyfile::create_with_floor`].
-    pub fn rewrap_with_floor(
+    /// [`Keyfile::rewrap`] with the memory floor as an argument. The test seam,
+    /// `pub(crate)` for the reason `create_with_floor` is: a floor a caller can
+    /// pass its own value for is not a floor at all.
+    pub(crate) fn rewrap_with_floor(
         &self,
         old_pw: &[u8],
         new_pw: &[u8],
