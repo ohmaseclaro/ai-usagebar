@@ -628,9 +628,12 @@ mod tests {
             .collect()
     }
 
-    /// Guards the fixture itself: the size tests below are only meaningful while
-    /// one entry costs roughly what a real one does (~290 bytes, from a measured
-    /// 1,558-entry / 448 KiB default bundle).
+    /// Guards the fixture itself. The size tests below are only meaningful while
+    /// one entry costs about what a real one does: the measured default bundle is
+    /// 448 KiB over 1,558 entries, ~294 bytes each, and this fixture is 229. A
+    /// fixture that drifts far below that stops exercising the split and starts
+    /// passing vacuously, which is exactly how the first draft of these tests
+    /// failed.
     #[test]
     fn the_many_files_fixture_matches_the_measured_bundles_bytes_per_entry() {
         let bytes = serde_json::to_vec(&Manifest::new(many_files(1_600)))
@@ -639,10 +642,14 @@ mod tests {
         let per_entry = bytes / 1_600;
         assert!(
             (150..400).contains(&per_entry),
-            "one entry serializes to {per_entry} bytes, far from a real bundle's ~290"
+            "one entry serializes to {per_entry} bytes, far from a real bundle's ~294"
         );
     }
 
+    /// Where the boundary actually falls: 1,000 entries is ~224 KiB, inside one
+    /// 256 KiB chunk, so a small manifest is still not split. Deliberately close
+    /// to the edge — if a fixture change pushes it over, this fails loudly rather
+    /// than letting the split tests below quietly become the only coverage.
     #[test]
     fn a_thousand_file_manifest_still_fits_in_one_chunk_and_round_trips() {
         let keys = keys();
@@ -674,7 +681,7 @@ mod tests {
     }
 
     /// The same bundle with transcripts enabled — the case 1-04 assumed was the
-    /// only one that mattered.
+    /// only one that mattered. ~1.25 MiB of JSON, five chunks.
     #[test]
     fn a_fifty_seven_hundred_file_manifest_round_trips() {
         let keys = keys();
