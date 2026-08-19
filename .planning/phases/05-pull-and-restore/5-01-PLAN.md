@@ -175,7 +175,7 @@ this plan makes to Phase 4's file. Leave `mode` and `true_len` as they are.
     <automated>cargo test --lib -- sync::restore::layout sync::push::packer</automated>
   </verify>
   <done>`cargo test --lib -- sync::restore::layout sync::push::packer` is green. `src/sync/restore/` holds seven files. The prefix table appears exactly once. `from_manifest_path` refuses all eight rejection cases with distinct messages, and the bijection test covers all five categories. `packer.rs` writes prefixed relative paths and a pushed manifest contains no absolute path, asserted in `packer.rs`'s own tests.</done>
-  <reversibility rating="one-way">The manifest path encoding is on the wire. Once a user has pushed, every future build must read what this shipped or their bundle is unrestorable. It rides inside `MANIFEST_VERSION`, so it *can* evolve, but the v1 spelling ships once.</reversibility>
+  <reversibility rating="costly">The manifest path encoding is on the wire, and after this ships every future build must read what it shipped. It is *not* a one-way door only because the recovery is a re-push: a bundle pushed between Phase 4 and this change carries absolute paths, and the honest fix for that user is one `sync push`, which is the cheap direction of this milestone's asymmetry. The v1 spelling still ships once, inside `MANIFEST_VERSION`, and is not to be improvised.</reversibility>
 </task>
 
 <task type="auto">
@@ -212,7 +212,12 @@ options; keeping them distinct is what lets the report name exactly what was los
 still appears in the report, which is how a tampered bundle becomes visible instead of invisible.
 
 `RestorePlan { pub items: Vec<ItemPlan>, pub counter: u64, pub created_at: DateTime<Utc>, pub repo_id: String, pub packs_needed: usize, pub bytes_to_fetch: u64 }`
-and `RestoreOutcome { pub plan: RestorePlan, pub applied: bool, pub backup: Option<PathBuf>, pub written: usize, pub overwritten: Vec<String>, pub skipped: usize }`.
+and `RestoreOutcome { pub plan: RestorePlan, pub applied: bool, pub backup: Option<BackupRecord>, pub written: usize, pub overwritten: Vec<String>, pub skipped: usize, pub failed_at: Option<String> }`.
+
+Two more, declared here because `run` returns through them and two wave-2 plans fill them:
+`Applied { pub written: usize, pub overwritten: Vec<String>, pub skipped: usize, pub failed_at: Option<String> }`
+(5-04) and `BackupRecord { pub archive: PathBuf, pub root: PathBuf, pub members: usize, pub bytes: u64 }`
+with `pub fn rollback_command(&self) -> String` (5-05).
 
 `pub async fn run(ctx: RestoreCtx<'_>) -> Result<RestoreOutcome>` is the orchestrator, and its
 order is a security property, spelled out as numbered steps in the doc comment:
@@ -233,14 +238,21 @@ order is a security property, spelled out as numbered steps in the doc comment:
    the risk plan 1-05 recorded against this phase. Write the anchor from the **root's** sealed
    `counter`, never the pointer's.
 
+`Resolved { pub root: Root, pub manifest: Manifest, pub index: IndexObject, pub packs: PackSource }`
+and `PackSource` — the pack cache, with `pub fn chunk(&mut self, id: &ChunkId) -> Result<Zeroizing<Vec<u8>>>`
+as its only accessor — are declared **here in `mod.rs`**, not in `fetch.rs`, even though 5-02 fills
+them. Three wave-2 plans name these types across module lines; a type declared in `fetch.rs` and
+consumed by `merge.rs` would make two parallel worktrees uncompilable, which is exactly what
+4-01 learned. Same rule as `Applied` and `BackupRecord`.
+
 Create the five sibling files with their frozen signatures and enough body to carry the tracer's
 one file, leaving the hard cases to their owning plan and saying so in a module-level comment
 naming the plan:
 
-- `fetch.rs` — `pub async fn resolve(ctx: &RestoreCtx<'_>, local_anchor: Option<&Anchor>) -> Result<Resolved>` where `Resolved { root: Root, manifest: Manifest, index: IndexObject, packs: PackSource }`. The tracer fills pointer load (through `push::pointer::load`, which already probes `format` and checks `repo_id`), keyfile download and open, `Root::open`, and a single-pack `download_asset`. Plan 5-02 owns the bounds and the multi-pack cache.
+- `fetch.rs` — `pub async fn resolve(ctx: &RestoreCtx<'_>, local_anchor: Option<&Anchor>) -> Result<Resolved>`. The tracer fills pointer load (through `push::pointer::load`, which already probes `format` and checks `repo_id`), keyfile download and open, `Root::open`, and a single-pack `download_asset`. Plan 5-02 owns the bounds and the multi-pack cache.
 - `merge.rs` — `pub fn plan(ctx: &RestoreCtx<'_>, resolved: &Resolved) -> Result<RestorePlan>`. The tracer fills `Create` and `RejectedPath` only. Plan 5-03 owns the rest.
 - `write.rs` — `pub fn apply(ctx: &RestoreCtx<'_>, plan: &RestorePlan, packs: &PackSource) -> Result<Applied>`. The tracer fills the one-file happy path: `NamedTempFile::new_in(dest_dir)`, write, `sync_all`, explicit mode 0600, `persist`. Plan 5-04 owns directories, cleanup, and times.
-- `backup.rs` — `pub fn take(ctx: &RestoreCtx<'_>, targets: &[PathBuf]) -> Result<BackupRecord>` returning the archive path and the rollback command string. The tracer fills the signature and a no-op-when-nothing-exists arm. Plan 5-05 owns the archive.
+- `backup.rs` — `pub fn take(ctx: &RestoreCtx<'_>, targets: &[PathBuf]) -> Result<Option<BackupRecord>>`, `None` meaning there was nothing on disk to preserve. The tracer fills the signature and that arm. Plan 5-05 owns the archive.
 - `report.rs` — `pub fn render_plan(plan: &RestorePlan) -> String` and `pub fn render_outcome(outcome: &RestoreOutcome) -> String`, following `sync/report.rs`'s existing `render_*` shape. The tracer fills enough to print the tracer's one line. Plan 5-06 owns the table and the gate.
 
 Add §11 to `docs/sync-format.md`: the chain a reader walks (pointer → keyfile asset → the newest

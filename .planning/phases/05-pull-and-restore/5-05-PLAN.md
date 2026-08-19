@@ -120,8 +120,8 @@ it is present, and is skipped otherwise, so the AUR `check()` never depends on i
     - The record carries the member count and the archive's size on disk, so the report can say what was preserved without re-reading the archive.
   </behavior>
   <action>
-Add `BackupRecord { pub archive: PathBuf, pub root: PathBuf, pub members: usize, pub bytes: u64 }`
-and `pub fn rollback_command(&self) -> String` rendering the exact line a user pastes.
+`BackupRecord` and its `rollback_command` are declared in `restore/mod.rs` by 5-01 — implement the
+body here, do not redeclare the type. `rollback_command` renders the exact line a user pastes.
 
 Quote both paths. A home directory with a space in it is ordinary on macOS and a rollback command
 that breaks on one is a rollback command that does not exist when it is needed. Single-quote and

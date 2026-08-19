@@ -467,7 +467,30 @@ push→wipe→pull round-trip test against mockito.
 7. Killing the process mid-restore leaves no plaintext outside the destination directory and no
    half-written credential file.
 
-**Plans**: TBD
+**Plans:** 8 plans across 4 waves (1 / 5 / 1 / 1). Wave 1's tracer creates all seven
+`src/sync/restore/` files, **fills** `layout.rs` because four wave-2 plans call it, and freezes
+every cross-module type in `restore/mod.rs` — so the five wave-2 plans each own exactly one
+whole file, share none, and compile in isolation.
+
+Plans:
+- [ ] 5-01-PLAN.md — wave 1 — pointer → keyfile → root → manifest → pack → one file written at 0600, dry-run by default (tracer, D1/D4/D5, SAFE-05)
+- [ ] 5-02-PLAN.md — wave 2 — the verified chain with a ceiling on every remote-chosen list, and whole-pack fetch
+- [ ] 5-03-PLAN.md — wave 2 — the eight dispositions: digest before timestamp, and the credential arm `--force` cannot open (SAFE-03, SYNC-06, D2/D7)
+- [ ] 5-04-PLAN.md — wave 2 — the write path: tempfile in the destination's own directory, 0600 before content, nothing left behind (SAFE-05)
+- [ ] 5-05-PLAN.md — wave 2 — the pre-restore archive and a rollback command proven by running it (SAFE-04, D3)
+- [ ] 5-06-PLAN.md — wave 2 — one gate, a second for credentials, and a summary that names what was lost (D1/D6)
+- [ ] 5-07-PLAN.md — wave 3 — `sync pull` wired in safety order, plus `--rebuild-index` / `--force-rehash` (UX-01)
+- [ ] 5-08-PLAN.md — wave 4 — the push→pull round trip, the six refusals, and the two-machine docs
+
+**One reconciliation, recorded in `5-01-PLAN.md`'s source audit.** Phase 4's `4-02` builds the
+manifest from `FilePlan.path`, which is an **absolute local path** — unresolvable on a second
+machine, and exactly what D5 orders restore to reject. Plan 5-01 owns the fix: a root-prefixed
+relative encoding in `src/sync/restore/layout.rs`, emitted by a one-expression change to
+`src/sync/push/packer.rs` and consumed by restore. It is the phase's one edit to a Phase 4 file.
+
+**CAL-1 is still unmeasured** after Phases 1, 3, and 4. Plan 5-02 ships whole-pack fetch on the
+pessimistic assumption — correct either way — and 5-08 leaves an `#[ignore]`d probe so the
+measurement has somewhere to land. It does not block the phase.
 
 ---
 
@@ -605,7 +628,7 @@ Assignment notes where a requirement could have gone elsewhere:
 | 2. Bundle Scope, Local Index, Dry-Run Planning | 0/7 | Not started | - |
 | 3. GitHub Auth and the Private-Repo Gate | 0/7 | Planned | - |
 | 4. Push — Packs, Atomic Flip, GC, Rekey | 0/7 | Planned | - |
-| 5. Pull and Restore | 0/TBD | Not started | - |
+| 5. Pull and Restore | 0/8 | Planned | - |
 | 6. Surfaces and Ship | 0/5 | Planned | - |
 
 **Security audits required:** Phases 1, 2, 3, 4, 5.

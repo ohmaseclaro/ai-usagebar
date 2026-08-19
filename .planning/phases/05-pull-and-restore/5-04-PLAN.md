@@ -144,8 +144,8 @@ does this, so the requirement is negative: do not `into_temp_path().keep()` and 
 staging name to rename later. Assert it rather than assume it, by injecting a failure at each of
 the write's steps and walking the destination directory afterwards.
 
-`Applied { pub written: usize, pub overwritten: Vec<String>, pub skipped: usize, pub failed_at: Option<String> }`.
-`failed_at` carries the manifest path of the item that stopped the run, so the error the user sees
+`Applied` is already declared in `restore/mod.rs` by 5-01 — fill its use, do not redeclare it here.
+Its `failed_at` carries the manifest path of the item that stopped the run, so the error the user sees
 names where the restore reached — and the backup archive plan 5-05 already wrote is what makes
 that recoverable.
 
