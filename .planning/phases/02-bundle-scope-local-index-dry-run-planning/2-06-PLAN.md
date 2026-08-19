@@ -51,7 +51,7 @@ be re-run when either answer goes stale.
 </execution_context>
 
 <context>
-@.planning/phases/2-bundle-scope-local-index-dry-run-planning/2-CONTEXT.md
+@.planning/phases/02-bundle-scope-local-index-dry-run-planning/2-CONTEXT.md
 @.planning/ROADMAP.md
 @.planning/research/chunking-storage.md
 @CLAUDE.md
@@ -178,7 +178,7 @@ recorded — and in neither case did the measurement block the phase.
 </success_criteria>
 
 <output>
-Create `.planning/phases/2-bundle-scope-local-index-dry-run-planning/2-06-SUMMARY.md` when done.
+Create `.planning/phases/02-bundle-scope-local-index-dry-run-planning/2-06-SUMMARY.md` when done.
 State whether CAL-2 changed the recommendation for the credentials category's default, since
 that decision gates Phase 4's push.
 </output>

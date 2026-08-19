@@ -43,8 +43,8 @@ Output: `src/sync/index.rs` complete, ready for plan 2-05's planner to consume.
 </execution_context>
 
 <context>
-@.planning/phases/2-bundle-scope-local-index-dry-run-planning/2-CONTEXT.md
-@.planning/phases/2-bundle-scope-local-index-dry-run-planning/2-01-SUMMARY.md
+@.planning/phases/02-bundle-scope-local-index-dry-run-planning/2-CONTEXT.md
+@.planning/phases/02-bundle-scope-local-index-dry-run-planning/2-01-SUMMARY.md
 @.planning/research/chunking-storage.md
 @CLAUDE.md
 @src/cursor/db.rs
@@ -182,6 +182,6 @@ a missing or corrupt index degrades to a full re-scan with the failure surfaced 
 </success_criteria>
 
 <output>
-Create `.planning/phases/2-bundle-scope-local-index-dry-run-planning/2-03-SUMMARY.md` when done.
+Create `.planning/phases/02-bundle-scope-local-index-dry-run-planning/2-03-SUMMARY.md` when done.
 Record the exact `Index` public API, since plan 2-05 builds directly against it.
 </output>

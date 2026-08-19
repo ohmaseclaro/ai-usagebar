@@ -206,7 +206,8 @@ remote; restore; the merge/conflict model (Phase 5).
 
 **Deliverables**: the collectors, the `[sync]` config schema, the SQLite index with its migration,
 the change-detection + append fast path, the plan builder, `sync status`, `sync push --dry-run`,
-and both calibration numbers written into `docs/sync-format.md`.
+and both calibration numbers written into `docs/sync-calibration.md`, linked from
+`docs/sync-format.md`.
 
 **Success Criteria** (what must be TRUE):
 1. `sync status` on a seeded temp tree lists every category with file count and byte size, shows
@@ -222,7 +223,16 @@ and both calibration numbers written into `docs/sync-format.md`.
 6. Every test injects its roots; `cargo test` passes with `$HOME` unset, and the index file is
    created mode 0600.
 
-**Plans**: TBD
+**Plans**: 7 plans, 4 waves (max 3 concurrent). Plans 2-06 and 2-07 need Phase 1 merged; the
+rest build against Phase 1's contract only.
+
+- [ ] 2-01-PLAN.md — wave 1 — `[sync]` config, roots seam, bounded symlink-safe walker with the D2 exclusions, `sync status` end-to-end for the config category
+- [ ] 2-02-PLAN.md — wave 2 — credentials, routines and chat_index collectors (D1)
+- [ ] 2-03-PLAN.md — wave 2 — the rusqlite local index (D5), including corrupt-degrades-to-rescan
+- [ ] 2-04-PLAN.md — wave 2 — opt-in transcripts and their 30-day / 2 GiB bounds (D3)
+- [ ] 2-05-PLAN.md — wave 3 — change detection, the append fast path, and the plan builder
+- [ ] 2-06-PLAN.md — wave 3 — CAL-2 and CAL-4 measurements *(needs Phase 1)*
+- [ ] 2-07-PLAN.md — wave 4 — `sync push --dry-run` in D4's shape, wired to Phase 1's chunker *(needs Phase 1)*
 
 ---
 
@@ -535,7 +545,7 @@ Assignment notes where a requirement could have gone elsewhere:
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Encrypted Bundle Core | 0/8 | Not started | - |
-| 2. Bundle Scope, Local Index, Dry-Run Planning | 0/TBD | Not started | - |
+| 2. Bundle Scope, Local Index, Dry-Run Planning | 0/7 | Not started | - |
 | 3. GitHub Auth and the Private-Repo Gate | 0/TBD | Not started | - |
 | 4. Push — Packs, Atomic Flip, GC, Rekey | 0/TBD | Not started | - |
 | 5. Pull and Restore | 0/TBD | Not started | - |

@@ -47,10 +47,10 @@ a closure parameter. Plan 2-07 supplies the real one.
 </execution_context>
 
 <context>
-@.planning/phases/2-bundle-scope-local-index-dry-run-planning/2-CONTEXT.md
-@.planning/phases/1-encrypted-bundle-core/1-CONTEXT.md
-@.planning/phases/2-bundle-scope-local-index-dry-run-planning/2-01-SUMMARY.md
-@.planning/phases/2-bundle-scope-local-index-dry-run-planning/2-03-SUMMARY.md
+@.planning/phases/02-bundle-scope-local-index-dry-run-planning/2-CONTEXT.md
+@.planning/phases/01-encrypted-bundle-core/1-CONTEXT.md
+@.planning/phases/02-bundle-scope-local-index-dry-run-planning/2-01-SUMMARY.md
+@.planning/phases/02-bundle-scope-local-index-dry-run-planning/2-03-SUMMARY.md
 @.planning/research/chunking-storage.md
 @CLAUDE.md
 </context>
@@ -60,7 +60,7 @@ a closure parameter. Plan 2-07 supplies the real one.
 <task type="auto" tdd="true">
   <name>Task 1: change detection with the zero-read no-op path</name>
   <files>src/sync/plan.rs</files>
-  <read_first>.planning/research/chunking-storage.md lines 206-230 (the borg rule and the append fast path pseudocode); .planning/phases/2-bundle-scope-local-index-dry-run-planning/2-03-SUMMARY.md (the exact `Index` API this builds on).</read_first>
+  <read_first>.planning/research/chunking-storage.md lines 206-230 (the borg rule and the append fast path pseudocode); .planning/phases/02-bundle-scope-local-index-dry-run-planning/2-03-SUMMARY.md (the exact `Index` API this builds on).</read_first>
   <behavior>
     - First plan over a seeded tree: every file is new, `files_opened` equals the file count, and the plan's chunk set is non-empty.
     - Second plan over the same untouched tree: the plan is empty, `files_opened` is exactly 0, and no chunk is listed as new.
@@ -213,7 +213,7 @@ re-chunk. `append_check_miss_bytes` reports the cost of every fallback.
 </success_criteria>
 
 <output>
-Create `.planning/phases/2-bundle-scope-local-index-dry-run-planning/2-05-SUMMARY.md` when done.
+Create `.planning/phases/02-bundle-scope-local-index-dry-run-planning/2-05-SUMMARY.md` when done.
 Record `SyncPlan`'s exact fields and `build`'s signature — plan 2-07 renders the first and
 calls the second, and Phase 4 uploads the result.
 </output>

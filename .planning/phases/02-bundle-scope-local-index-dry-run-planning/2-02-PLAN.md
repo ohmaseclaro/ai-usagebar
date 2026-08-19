@@ -40,8 +40,8 @@ Output: `scope::collect` returns real scans for four of the five categories.
 </execution_context>
 
 <context>
-@.planning/phases/2-bundle-scope-local-index-dry-run-planning/2-CONTEXT.md
-@.planning/phases/2-bundle-scope-local-index-dry-run-planning/2-01-SUMMARY.md
+@.planning/phases/02-bundle-scope-local-index-dry-run-planning/2-CONTEXT.md
+@.planning/phases/02-bundle-scope-local-index-dry-run-planning/2-01-SUMMARY.md
 @CLAUDE.md
 @src/claude_desktop/mod.rs
 </context>
@@ -154,5 +154,5 @@ actually live.
 </success_criteria>
 
 <output>
-Create `.planning/phases/2-bundle-scope-local-index-dry-run-planning/2-02-SUMMARY.md` when done.
+Create `.planning/phases/02-bundle-scope-local-index-dry-run-planning/2-02-SUMMARY.md` when done.
 </output>

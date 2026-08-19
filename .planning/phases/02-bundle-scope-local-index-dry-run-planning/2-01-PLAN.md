@@ -60,7 +60,7 @@ later plan owns exactly one of those files.
 </execution_context>
 
 <context>
-@.planning/phases/2-bundle-scope-local-index-dry-run-planning/2-CONTEXT.md
+@.planning/phases/02-bundle-scope-local-index-dry-run-planning/2-CONTEXT.md
 @CLAUDE.md
 @src/context/mod.rs
 @src/claude_desktop/mod.rs
@@ -285,7 +285,7 @@ them thin, each owned by exactly one later plan in this phase.
 </success_criteria>
 
 <output>
-Create `.planning/phases/2-bundle-scope-local-index-dry-run-planning/2-01-SUMMARY.md` when done.
+Create `.planning/phases/02-bundle-scope-local-index-dry-run-planning/2-01-SUMMARY.md` when done.
 Record in it the exact public signatures of `SyncRoots`, `FileEntry`, `CategoryScan`,
 `Index::at` and `collect`, since three parallel plans build against them.
 </output>

@@ -41,8 +41,8 @@ Output: `src/sync/transcripts.rs` complete; the fifth category is real.
 </execution_context>
 
 <context>
-@.planning/phases/2-bundle-scope-local-index-dry-run-planning/2-CONTEXT.md
-@.planning/phases/2-bundle-scope-local-index-dry-run-planning/2-01-SUMMARY.md
+@.planning/phases/02-bundle-scope-local-index-dry-run-planning/2-CONTEXT.md
+@.planning/phases/02-bundle-scope-local-index-dry-run-planning/2-01-SUMMARY.md
 @CLAUDE.md
 @src/context/mod.rs
 </context>
@@ -138,7 +138,7 @@ applied newest-first, per whole file, with the excluded remainder reported.
 </success_criteria>
 
 <output>
-Create `.planning/phases/2-bundle-scope-local-index-dry-run-planning/2-04-SUMMARY.md` when done.
+Create `.planning/phases/02-bundle-scope-local-index-dry-run-planning/2-04-SUMMARY.md` when done.
 Record the measured shape of the bounds on real data if you have it — how many of the 4110
 files land inside 30 days — since plan 2-06's CAL-4 quotes a bundle size to the user.
 </output>
