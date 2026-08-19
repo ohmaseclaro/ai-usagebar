@@ -1,86 +1,165 @@
 //! `ai-usagebar sync …` entry point. Owned by plan 2-01, extended with
-//! `push --dry-run` by plan 2-07.
+//! `push --dry-run` by plan 2-07 and `setup` by plan 3-01.
 //!
 //! Output carries paths and byte counts only — never a file's contents. This
 //! command's whole job is telling the user what *would* leave the machine, so
 //! printing any of it here would defeat the point.
 //!
-//! **Nothing in this module opens a socket.** `--dry-run` measures a push
-//! without performing one, and `sync push` without it refuses rather than
-//! half-executing: there is no transport in this build to half-execute with.
+//! **Only `setup` opens a socket, and only to `GET`.** `--dry-run` measures a
+//! push without performing one, `sync push` without it refuses rather than
+//! half-executing, and `setup` verifies the remote is private without uploading
+//! a byte — the client it uses has no method that can carry a request body.
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 use crate::config::Config;
 use crate::sync::crypto::{Keyfile, Keys};
+use crate::sync::github::{self, Endpoints, token::TokenChain};
 use crate::sync::index::{self, Index};
 use crate::sync::report::DryRunReport;
 use crate::sync::{SyncRoots, passphrase, plan, report};
 use crate::widget::cli::SyncAction;
 
 /// Same shape as `account::run` / `tui::settings::run_cli`: an exit code, no
-/// async, no Waybar exit-0 contract — a script piping this deserves a real code.
+/// Waybar exit-0 contract — a script piping this deserves a real code. The
+/// widget's exit-0 invariant is a property of `widget::run::fallback`; `sync`
+/// reports failure honestly (D-06).
+///
+/// **The thin wrapper that resolves the real world.** No test calls it: it
+/// reads `$HOME` through `Config::load` and `TokenChain::production`, and the
+/// AUR `check()` runs `cargo test` on installers' machines. Everything below
+/// hangs off [`run_with`].
 pub fn run(action: &SyncAction) -> i32 {
+    let config = match Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("sync: could not read the config file: {e}");
+            return 1;
+        }
+    };
+    let roots = match SyncRoots::resolve(&config) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("sync: {e}");
+            return 1;
+        }
+    };
+    run_with(
+        action,
+        &config,
+        &roots,
+        &Endpoints::default(),
+        &TokenChain::production(),
+        Utc::now(),
+    )
+}
+
+/// Every dependency injected: the config, the roots, both GitHub hosts, the
+/// token chain, and the clock. This is what tests drive.
+pub fn run_with(
+    action: &SyncAction,
+    cfg: &Config,
+    roots: &SyncRoots,
+    endpoints: &Endpoints,
+    chain: &TokenChain,
+    now: DateTime<Utc>,
+) -> i32 {
     match action {
-        SyncAction::Status => status(),
-        SyncAction::Push { dry_run: true } => dry_run(),
+        SyncAction::Status => status(cfg, roots, now),
+        SyncAction::Setup => setup(cfg, roots, endpoints, chain, now),
+        SyncAction::Push { dry_run: true } => dry_run(cfg, roots, now),
         SyncAction::Push { dry_run: false } => no_transport(),
     }
 }
 
-/// Config, roots, and the index — everything both subcommands need.
-///
 /// The index is a hint (D5): if it will not open, the scan is still the truth
 /// and only the last-sync line and the would-upload column are lost.
-fn open() -> std::result::Result<(Config, SyncRoots, Option<Index>), String> {
-    let config = Config::load().map_err(|e| format!("could not read the config file: {e}"))?;
-    let roots = SyncRoots::resolve(&config).map_err(|e| e.to_string())?;
-    let index = match index::default_path().and_then(|p| Index::at(&p)) {
+fn open_index() -> Option<Index> {
+    match index::default_path().and_then(|p| Index::at(&p)) {
         Ok(i) => Some(i),
         Err(e) => {
             eprintln!("sync: local index unavailable, last-sync unknown ({e})");
             None
         }
-    };
-    Ok((config, roots, index))
+    }
 }
 
-fn status() -> i32 {
-    let (config, roots, index) = match open() {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("sync: {e}");
-            return 1;
-        }
-    };
-
+fn status(config: &Config, roots: &SyncRoots, now: DateTime<Utc>) -> i32 {
+    let index = open_index();
     // UX-02 is "what would change now", so status builds a plan when it can —
     // and still prints plan 2-01's counts-only form when it cannot.
-    let (plan, _) = try_plan(&roots, &config, index.as_ref());
-    let report = report::build_status(&roots, &config.sync, index.as_ref(), Utc::now(), plan);
+    let (plan, _) = try_plan(roots, config, index.as_ref());
+    let report = report::build_status(roots, &config.sync, index.as_ref(), now, plan);
     print!("{}", report::render_status(&report));
     0
 }
 
-fn dry_run() -> i32 {
-    let (config, roots, index) = match open() {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("sync: {e}");
-            return 1;
-        }
-    };
-
-    let (plan, no_key) = try_plan(&roots, &config, index.as_ref());
+fn dry_run(config: &Config, roots: &SyncRoots, now: DateTime<Utc>) -> i32 {
+    let index = open_index();
+    let (plan, no_key) = try_plan(roots, config, index.as_ref());
     let report = DryRunReport {
-        status: report::build_status(&roots, &config.sync, index.as_ref(), Utc::now(), plan),
+        status: report::build_status(roots, &config.sync, index.as_ref(), now, plan),
         no_key,
     };
     print!("{}", report::render_dry_run(&report));
     0
+}
+
+/// `sync setup` — pair with the configured private repository.
+///
+/// **The runtime is built here.** `src/bin/ai-usagebar.rs` dispatches
+/// `Command::Sync` before it constructs one, which was correct when `sync` only
+/// scanned the filesystem. Keeping the dispatch where it is means `status` and
+/// `push --dry-run` still pay nothing for a runtime they do not use.
+///
+/// The success line reports the token's **source** and never its value; the
+/// failure path prints the message and nothing else — no token, no prefix of
+/// one, no header dump (T-3-01).
+fn setup(
+    cfg: &Config,
+    roots: &SyncRoots,
+    endpoints: &Endpoints,
+    chain: &TokenChain,
+    now: DateTime<Utc>,
+) -> i32 {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("sync: could not start the async runtime ({e})");
+            return 1;
+        }
+    };
+    match rt.block_on(github::setup::run(&cfg.sync, roots, endpoints, chain, now)) {
+        Ok(outcome) => {
+            print!("{}", render_setup(&outcome));
+            0
+        }
+        Err(e) => {
+            eprintln!("sync: {e}");
+            1
+        }
+    }
+}
+
+/// Pure so a test can assert on it without capturing stdout.
+fn render_setup(outcome: &github::setup::SetupOutcome) -> String {
+    let mut out = format!(
+        "repo:       {}\nvisibility: {}\ntoken:      present ({})\n",
+        outcome.repo,
+        outcome.visibility,
+        outcome.token_source.label(),
+    );
+    for warning in &outcome.warnings {
+        out.push_str(&format!("warning:    {warning}\n"));
+    }
+    out.push_str("Nothing was uploaded — this command only verifies the pairing.\n");
+    out
 }
 
 /// The would-upload half, or the reason there is none.
@@ -180,6 +259,10 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    const TOKEN: &str = "github_pat_fixture_not_a_real_token";
+    const PRIVATE_BODY: &str = r#"{"id":1,"private":true,"visibility":"private",
+        "owner":{"login":"o","id":7},"archived":false,"fork":false}"#;
+
     fn roots_at(dir: &TempDir) -> SyncRoots {
         SyncRoots::at(
             dir.path().join("config.toml"),
@@ -221,8 +304,125 @@ mod tests {
         assert!(!err.contains("not-a-keyfile-at-all"), "{err}");
     }
 
+    /// Injected end to end. Nothing here reads a real `$HOME`, which is what
+    /// keeps the AUR `check()` from failing on an installer's machine.
+    fn drive(action: &SyncAction, cfg: &Config, dir: &TempDir, base: &str) -> i32 {
+        run_with(
+            action,
+            cfg,
+            &roots_at(dir),
+            &Endpoints {
+                api_base: base.into(),
+                uploads_base: base.into(),
+            },
+            &TokenChain {
+                env_value: Some(TOKEN.into()),
+                ..TokenChain::default()
+            },
+            DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        )
+    }
+
+    fn cfg_with_repo(repo: Option<&str>) -> Config {
+        Config {
+            sync: crate::config::SyncConfig {
+                repo: repo.map(str::to_owned),
+                ..Default::default()
+            },
+            ..Config::default()
+        }
+    }
+
     #[test]
     fn a_push_without_dry_run_refuses_non_zero_and_points_at_the_dry_run() {
-        assert_ne!(run(&SyncAction::Push { dry_run: false }), 0);
+        let dir = TempDir::new().unwrap();
+        assert_ne!(
+            drive(
+                &SyncAction::Push { dry_run: false },
+                &cfg_with_repo(None),
+                &dir,
+                "http://127.0.0.1:1",
+            ),
+            0
+        );
+    }
+
+    /// A plain `#[test]`: `setup` builds its own runtime, so the test must not
+    /// already have one installed on this thread. That is also why the mock
+    /// server is the blocking constructor.
+    #[test]
+    fn setup_against_a_private_repository_exits_zero() {
+        let dir = TempDir::new().unwrap();
+        let mut server = mockito::Server::new();
+        let m = server
+            .mock("GET", "/repos/o/n")
+            .with_status(200)
+            .with_body(PRIVATE_BODY)
+            .create();
+
+        let code = drive(
+            &SyncAction::Setup,
+            &cfg_with_repo(Some("o/n")),
+            &dir,
+            &server.url(),
+        );
+        assert_eq!(code, 0);
+        m.assert();
+    }
+
+    /// D-01: a missing `[sync] repo` is a non-zero exit that names the fix, and
+    /// no request is made at all — the endpoint here is a dead port.
+    #[test]
+    fn setup_without_a_configured_repo_exits_non_zero() {
+        let dir = TempDir::new().unwrap();
+        assert_ne!(
+            drive(
+                &SyncAction::Setup,
+                &cfg_with_repo(None),
+                &dir,
+                "http://127.0.0.1:1"
+            ),
+            0
+        );
+    }
+
+    /// T-3-01. `render_setup` is pure precisely so this can be asserted rather
+    /// than reasoned about.
+    #[test]
+    fn the_success_line_reports_the_token_source_and_never_the_token() {
+        let dir = TempDir::new().unwrap();
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/repos/o/n")
+            .with_status(200)
+            .with_body(PRIVATE_BODY)
+            .create();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let outcome = rt
+            .block_on(github::setup::run(
+                &cfg_with_repo(Some("o/n")).sync,
+                &roots_at(&dir),
+                &Endpoints {
+                    api_base: server.url(),
+                    uploads_base: server.url(),
+                },
+                &TokenChain {
+                    env_value: Some(TOKEN.into()),
+                    ..TokenChain::default()
+                },
+                DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            ))
+            .unwrap();
+        let rendered = render_setup(&outcome);
+
+        assert!(rendered.contains("o/n"), "{rendered}");
+        assert!(rendered.contains("private"), "{rendered}");
+        assert!(rendered.contains("token:      present (env)"), "{rendered}");
+        assert!(!rendered.contains(TOKEN), "{rendered}");
+        assert!(!rendered.contains(&TOKEN[..8]), "{rendered}");
     }
 }
