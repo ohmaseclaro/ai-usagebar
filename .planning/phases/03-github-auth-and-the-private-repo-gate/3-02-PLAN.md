@@ -7,6 +7,8 @@ depends_on: [3-01]
 files_modified:
   - src/sync/github/token.rs
   - src/sync/github/keychain.rs
+  - src/anthropic/keychain.rs
+  - tests/live.rs
 autonomous: true
 requirements: [REPO-02, REPO-04]
 must_haves:
@@ -14,14 +16,17 @@ must_haves:
     - "All four sources in D-02's order are reachable, and each is exercised through the injected chain rather than the real thing."
     - "A token written on macOS never appears in a process argument list."
     - "A token written on Linux lands in a mode-0600 file created in its destination directory."
-    - "No test reads the real Keychain, the real token file, or spawns `gh`."
+    - "No test in `src/` reads the real Keychain, the real token file, or spawns `gh`; the real-Keychain round trip lives in `tests/live.rs` behind `#[ignore]`."
+    - "The Keychain read/write/delete rules exist in exactly one place in the crate, not two."
     - "The stored token is never written into `config.toml`, and nothing in this module can write there."
   artifacts:
     - src/sync/github/token.rs with the complete four-source chain and the store/clear entry points
-    - src/sync/github/keychain.rs implementing the macOS read/write split for the sync-token item
+    - src/sync/github/keychain.rs — a service-name constant and three wrappers over the existing workers
+    - "three `pub(crate)` visibilities in src/anthropic/keychain.rs"
   key_links:
     - "`TokenChain`'s two closure fields are the only path to the Keychain and to `gh`; production supplies them, tests supply fakes"
     - "`TokenChain::production()` is the single place that decides which platform half is live"
+    - "`anthropic::keychain`'s `*_service` workers are already service-parameterized — reusing them is what keeps the account-selector agreement rule single-sourced"
 ---
 
 <objective>
@@ -55,55 +60,55 @@ Output: a complete `token.rs` and a complete macOS `keychain.rs`.
 
 <tasks>
 
-<task type="auto" tdd="true">
-  <name>Task 1: The macOS Keychain half — read via `security(1)`, write via Security.framework</name>
-  <files>src/sync/github/keychain.rs</files>
-  <behavior>
-    - `read_raw` returns `Ok(None)` when `security` exits with the item-not-found status, and `Err` for every other non-zero exit — a locked Keychain is not the same as "no token".
-    - `write_raw` fails closed with an actionable error when the account selector is unavailable, rather than falling back to a form that would place the token in argv.
-    - A round trip of write-then-read is exercised only behind a macOS-gated, `#[ignore]`d test; the default test set touches no real Keychain item.
-  </behavior>
+<task type="auto">
+  <name>Task 1: The macOS Keychain half — three wrappers over the module that already does this</name>
+  <files>src/anthropic/keychain.rs, src/sync/github/keychain.rs, tests/live.rs</files>
   <action>
-Fill `src/sync/github/keychain.rs`, which plan 3-01 created as a macOS-gated module holding
-only its doc comment. Model it directly on `src/anthropic/keychain.rs` — reuse that module's
-shape and its reasoning, do not invent a second convention, and do not refactor the Anthropic
-module to share code with this one. The two items have different service names and different
-lifetimes; a shared abstraction over two callers is the wrong trade here.
+**Do not write a second Keychain implementation.** `src/anthropic/keychain.rs` already
+implements exactly this, and its three workers —`read_raw_service`, `write_raw_service`,
+`delete_raw_service` — are **already parameterized by service name**. They are private only
+because nothing outside that module has needed them until now. Re-deriving the
+`errSecItemNotFound` mapping, the read/write account-selector agreement, and the
+fail-closed-on-unset-`$USER` rule is not "following the convention", it is a second copy that
+can drift. That module's own doc comment records the bug this invites: the read once omitted
+`-a` while the write passed `-a ""`, so a refresh created a second, empty-account item the read
+could never find again. One copy of that rule, not two.
 
-Service name: the constant `ai-usagebar-sync-token`, exactly as D-02 names it. Account
-selector: the macOS short user name, resolved the same way `anthropic::keychain::account`
-resolves it, and used identically by the read and the write so an update cannot create a
-second item the read will never find again. That divergence is a bug the Anthropic module
-already paid for; its doc comment says so.
+So: in `src/anthropic/keychain.rs`, change `read_raw_service`, `write_raw_service`, and
+`delete_raw_service` from private to `pub(crate)`. Nothing else in that file changes — no
+behaviour, no signature, no test. Add one line to its module doc noting that the sync token
+uses the same workers under a different service name, so the next reader knows why the
+visibility widened.
 
-`pub fn read_raw() -> Result<Option<String>>` shells out to `/usr/bin/security
-find-generic-password` with the service and account selectors and `-w`. The token arrives on
-that child's **stdout**, which is a read and therefore permitted; nothing about the read puts
-a secret into an argument. Return `Ok(None)` only for the item-not-found exit status
-(`errSecItemNotFound`, 44) and `Err` with an actionable message for every other failure,
-naming the locked-Keychain and denied-ACL cases the way the Anthropic module does.
+Then `src/sync/github/keychain.rs`, which plan 3-01 created macOS-gated with only its doc
+comment, becomes a service-name constant and three one-line wrappers:
 
-`pub fn write_raw(token: &str) -> Result<()>` calls
-`security_framework::passwords::set_generic_password` with the same service and account pair.
-This is the load-bearing half of the split: the `security add-generic-password` form would
-place the token in the child's argument vector where any process on the machine can read it.
-Fail closed with an actionable error when the account selector is unavailable — never fall
-back to the argv form.
+- `pub const SERVICE: &str = "ai-usagebar-sync-token";` — exactly as D-02 names it.
+- `pub fn read_raw() -> Result<Option<String>>` → `anthropic::keychain::read_raw_service(SERVICE)`
+- `pub fn write_raw(token: &str) -> Result<()>` → `anthropic::keychain::write_raw_service(SERVICE, token)`
+- `pub fn delete_raw() -> Result<()>` → `anthropic::keychain::delete_raw_service(SERVICE)`
 
-`pub fn delete_raw() -> Result<()>` removes the item, treating item-not-found as success, so
-clearing a revoked token is idempotent.
+Everything the previous draft of this plan spelled out — reads shell out to `security(1)` and
+take the value from the child's **stdout**; writes go through
+`security_framework::passwords::set_generic_password` so the secret never enters the child's
+argument vector; the write fails closed when `$USER` is unset rather than falling back to the
+argv form; item-not-found is `Ok(None)` on read and success on delete; the value is trimmed
+and an empty one reads as absent — is already true of those workers. Verify that by reading
+them, not by re-implementing them.
 
-Trim a trailing newline from what `security` returns and treat an empty value as `Ok(None)`.
-
-Keep the module `#[cfg(target_os = "macos")]`-gated as 3-01 left it, so the Linux build never
-compiles `security-framework` for this path. Unit tests here cover only the pure helpers (the
-exit-status mapping, the trimming); anything that touches a real Keychain item is `#[ignore]`d
-and macOS-gated, because the AUR `check()` runs `cargo test` on installers' machines.
+Three one-line wrappers need no unit test: there is no branch to get wrong. What does need
+exercising is that the real item round-trips, and that belongs in `tests/live.rs` behind
+`#[ignore]` beside the existing probes, macOS-gated. A `src/` unit test that writes a real
+Keychain item would be reached by `cargo test -- --ignored` in any CI leg and by the AUR
+`check()`'s environment, and it would leave an item behind on a developer's login Keychain.
+Name it so its cost is obvious, have it write, read back, and delete under a
+`ai-usagebar-sync-token-livetest` service name — not the production one — and assert the round
+trip.
   </action>
   <verify>
-    <automated>cargo test --lib sync::github::keychain && cargo build --lib</automated>
+    <automated>cargo build --lib && cargo test --lib -- anthropic::keychain sync::github::keychain</automated>
   </verify>
-  <done>On macOS, `cargo test --lib sync::github::keychain` is green and no default-set test reads or writes a real Keychain item. On Linux the module is not compiled and `cargo build --lib` is clean. `grep -n 'add-generic-password' src/sync/github/keychain.rs` finds nothing.</done>
+  <done>`src/sync/github/keychain.rs` is a constant plus three delegating one-liners and contains no `Command`, no `security_framework` call, and no exit-status constant of its own. `src/anthropic/keychain.rs` differs from `HEAD` only by three `pub(crate)` visibilities and one doc line. The live round-trip is `#[ignore]`d, macOS-gated, and uses a test-only service name. `cargo build --lib` is clean on both platforms.</done>
   <reversibility rating="costly">The service name `ai-usagebar-sync-token` is the address of a stored secret on a user's machine. Renaming it after ship orphans every token already written under the old name, with no way to find it. It is fixed by D-02.</reversibility>
 </task>
 
@@ -137,8 +142,17 @@ token travels on the child's **stdout**; nothing is passed to it. Second, strip 
 own provider secrets from the child's environment using the existing
 `crate::vendor::vendor_secret_env_vars_to_remove(&[])` helper, so a subprocess this tool
 spawns never inherits credentials it has no business seeing. Also strip
-`AI_USAGEBAR_SYNC_TOKEN` itself. Bound the child with a timeout so a hung credential helper
-cannot wedge `sync setup`.
+`AI_USAGEBAR_SYNC_TOKEN` itself.
+
+Bound the child, and use this mechanism specifically: `std::process::Command::spawn`, then a
+watchdog `std::thread` that sleeps a few seconds and calls `Child::kill` if the process is
+still running, then `wait_with_output` on the main thread. `Command::output` has no timeout of
+its own and there is no dependency in this tree that adds one — **do not add a crate for
+this**, and do not reach for `tokio::process`, because `resolve` is synchronous and the
+`TokenChain` closures that call it are not async. Roughly fifteen lines of `std`. A `gh` that
+never returns is not hypothetical: it shells out to whatever credential helper the user
+configured, and one of those hanging on a locked keyring would otherwise wedge `sync setup`
+with no output.
 
 **`resolve`** already walks env then file. Extend it to the full D-02 order — env, keychain,
 file, `gh` — returning the first non-empty trimmed value with its `TokenSource`. A closure
@@ -191,7 +205,7 @@ spawns a process.
 
 | Threat ID | Category | Component | Severity | Disposition | Mitigation Plan |
 |---|---|---|---|---|---|
-| T-3-08 | Information disclosure | Keychain write | critical | mitigate | `security_framework::passwords::set_generic_password`, never the `security(1)` form that would place the token in the child's argument vector; fails closed when the account selector is unavailable |
+| T-3-08 | Information disclosure | Keychain write | critical | mitigate | Delegated to `anthropic::keychain::write_raw_service`, which uses `security_framework::passwords::set_generic_password` and never the `security(1)` form that would place the token in the child's argument vector, and fails closed when the account selector is unavailable. Reuse rather than reimplementation is the mitigation: a second copy of this rule is a second place for it to drift |
 | T-3-09 | Information disclosure | spawned `gh` | high | mitigate | Nothing is passed to the child; `vendor_secret_env_vars_to_remove` plus `AI_USAGEBAR_SYNC_TOKEN` are stripped from its environment so it inherits no credential |
 | T-3-10 | Information disclosure | token file | critical | mitigate | Created via `NamedTempFile::new_in` the destination directory, `persist()`d, then explicitly `chmod` 0600; never under `/tmp`, which is world-readable, cross-filesystem, and may be swap-backed tmpfs |
 | T-3-11 | Spoofing | a Keychain error read as "no token" | high | mitigate | An `Err` from a chain source propagates instead of falling through, so a locked Keychain is reported as such rather than sending the user to re-issue a live token |
@@ -200,11 +214,14 @@ spawns a process.
 </threat_model>
 
 <verification>
-- `cargo test --lib sync::github::token` is green on both platforms; `cargo test --lib
-  sync::github::keychain` is green on macOS and the module is absent on Linux.
-- `grep -rn 'add-generic-password' src/sync/github/` returns nothing.
-- No test in either file calls `TokenChain::production`, `std::env::var`, or
-  `std::process::Command`.
+- `cargo test --lib sync::github::token` is green on both platforms; `cargo build --lib` is
+  clean on Linux, where `sync/github/keychain.rs` is not compiled.
+- `git diff --stat HEAD -- src/anthropic/keychain.rs` shows only the three visibility changes
+  and one doc line.
+- `grep -c 'Command\|security_framework' src/sync/github/keychain.rs` is 0.
+- No test in `src/` calls `TokenChain::production`, `std::env::var`, or
+  `std::process::Command`; the real-Keychain round trip is `#[ignore]`d in `tests/live.rs`
+  under a test-only service name.
 </verification>
 
 <success_criteria>

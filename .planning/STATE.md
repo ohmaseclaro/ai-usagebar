@@ -141,3 +141,17 @@ neither gates the code, so the run proceeds — but the roadmap checkbox stays h
   threat model rather than from the suite.
 - Three separate instances of *documentation describing behaviour that does not exist*, the
   last one still asserting the removed nonce rule after two remediation rounds.
+
+## Gate definition — corrected mid-run (found by the Phase 6 planner)
+
+The canonical end-of-phase gate is **`make test` + `cargo clippy --all-targets -D warnings` +
+`cargo fmt --check`**, with these **named blind spots**:
+
+- `make smoke` — hits real vendor APIs, needs credentials. Deferred to live UAT.
+- `make qml-lint` / `qml-test` — only relevant when `kde-plasmoid/` changes.
+- **`./macos/run-tests.sh` — NOT part of `make test`** (it needs `swiftc`; `make test` is cargo
+  plus the three Node contract suites). Any phase touching `macos/*.swift` must run it
+  explicitly. This was missing from the gate as originally defined and would have let every
+  Swift change through untested.
+
+Phase 6 is the phase this bites, and its plans already verify with the harness directly.

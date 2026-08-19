@@ -146,7 +146,7 @@ manual. Do not claim a capability that does not ship yet: describe pairing and s
 pushing.
   </action>
   <verify>
-    <automated>grep -q 'sync-github.md' README.md && grep -q 'sync-github.md' docs/configuration.md && grep -q 'repo' docs/configuration.md</automated>
+    <automated>grep -q 'sync-github.md' README.md && grep -q 'sync-github.md' docs/configuration.md && grep -qF '[sync]' docs/configuration.md && grep -q 'owner/name' docs/configuration.md</automated>
   </verify>
   <done>`docs/configuration.md` documents `[sync] repo` with its shape, its absence of a default, and the reason there is none, and points at `docs/sync-github.md` for the token. `README.md` carries a sync section linking to both documents and claims no capability beyond pairing and status.</done>
 </task>

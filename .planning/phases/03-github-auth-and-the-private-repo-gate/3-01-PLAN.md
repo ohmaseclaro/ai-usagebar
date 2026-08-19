@@ -26,6 +26,9 @@ must_haves:
     - "A repo reporting `private: false` refuses before anything else happens (D-04, SAFE-01)."
     - "The token's value never appears in output at any verbosity; only its source does (D-02)."
     - "Nothing in the phase opens a socket to a host that is not an injected `Endpoints` base (D-05)."
+    - "`Client` exposes no method that can carry a request body, proven by a test rather than by review (D-05)."
+    - "Every CLI test drives `run_with` with injected values; none reads a real `$HOME`, so the AUR `check()` cannot fail on an installer's config."
+    - "A `PushClearance` can be asked whether it is still fresh, so D-04's \"immediately\" is enforceable by Phase 4 rather than only described."
   artifacts:
     - src/sync/github/mod.rs declaring the six submodules, `Endpoints`, `RepoRef`, and the client
     - src/sync/github/http.rs with the frozen `GithubError` enum every later plan matches on
@@ -290,8 +293,8 @@ real home directory.
   <verify>
     <automated>cargo test --lib sync::github</automated>
   </verify>
-  <done>`cargo test --lib sync::github` is green. `src/sync/github/` holds seven files, all seven declared in `github/mod.rs`. `GithubError` carries its seven frozen variants and `TokenChain` its four frozen fields. No test in the module opens a socket to a host other than the mockito base, spawns a process, or reads a real `$HOME` path.</done>
-  <reversibility rating="costly">`GithubError`'s variants and `TokenChain`'s fields are the seams three wave-2 plans build against in parallel; changing either after this plan merges forces all three to be reworked. They come straight from `github-transport.md` §5.2 and D-02 and are not to be improvised.</reversibility>
+  <done>`cargo test --lib sync::github` is green. `src/sync/github/` holds seven files: `mod.rs` plus the six submodules it declares. `GithubError` carries its seven frozen variants, `TokenChain` its four frozen fields, `Client::get_json` its `Vec<u8>` body, and `assert_pushable` its `(PushClearance, Vec<String>)` return with `credentials_in_bundle` in the argument list. The `Client`-has-no-request-body guard test passes. No test in the module opens a socket to a host other than the mockito base, spawns a process, or reads a real `$HOME` path.</done>
+  <reversibility rating="costly">`GithubError`'s variants, `TokenChain`'s fields, `get_json`'s body type, and `assert_pushable`'s full signature are the seams three wave-2 plans build against in parallel worktrees; changing any of them after this plan merges forces all three to be reworked, and 3-04's branch in particular contains this plan's `setup.rs` as a caller it does not own. They come from `github-transport.md` §5.2, D-02, and D-04 and are not to be improvised.</reversibility>
 </task>
 
 <task type="auto" tdd="true">
@@ -386,7 +389,7 @@ returns non-zero on failure, per D-06. Do not route any of this through the widg
 | T-3-05 | Spoofing | `GET /repos` response | high | mitigate | `RepoFacts` is asserted before a `PushClearance` exists; `PushClearance` has a private field, no public constructor, and no `Clone`, so a clearance cannot be forged or cached (D-04) |
 | T-3-06 | Denial of service | oversized response body | medium | mitigate | `vendor::read_body_capped` at `MAX_BODY_BYTES`; every response here is kilobytes of JSON |
 | T-3-07 | Information disclosure | token in argv or a child's environment | critical | mitigate | No subprocess is spawned in this plan, and `Client` receives the token as a value, never through a command line |
-| T-3-SC | Tampering | dependency surface | low | accept | Zero new crates: `reqwest` 0.12 + rustls, `zeroize`, `chrono`, `serde_json`, `tempfile`, and `mockito` are all already resolved in `Cargo.toml`. No package-manager install task exists in this phase, so no legitimacy gate applies |
+| T-3-SC | Tampering | dependency surface | low | accept | Zero new crates. `reqwest` 0.12 + rustls, `zeroize`, `chrono`, `serde_json`, `tempfile`, `toml_edit`, and `mockito` are all **declared** in `Cargo.toml` today. `bytes` is deliberately *not* used: it reaches the build only as a transitive `reqwest` dependency, so `use bytes::…` does not resolve and declaring it would break both the zero-new-crates constraint and `cargo machete`. `Cargo.toml` is not in this plan's `files_modified` — if the executor believes it needs an edit there, that is a signal the design drifted, not a step to take |
 </threat_model>
 
 <verification>
@@ -394,8 +397,12 @@ returns non-zero on failure, per D-06. Do not route any of this through the widg
 - `grep -rn --include='*.rs' 'Utc::now' src/sync/github/` returns nothing outside a
   `production`-suffixed function or the CLI entry point: every time-dependent function takes
   `now`.
-- No test under `src/sync/github/` constructs `TokenChain::production()`, reads an
-  environment variable, or calls `home_dir`.
+- No test under `src/sync/github/` or in `src/sync/cli.rs` constructs `TokenChain::production()`,
+  `Config::load()`, `SyncRoots::resolve`, or `sync::cli::run`, reads an environment variable,
+  or calls `home_dir`.
+- `Cargo.toml` is unchanged by this plan.
+- Multi-filter test invocations use the `cargo test --lib -- a b` form; `cargo test --lib a b`
+  takes only one positional and errors rather than failing usefully.
 </verification>
 
 <success_criteria>
@@ -408,7 +415,13 @@ token, and a public repo each fail distinctly and exit non-zero.
 <output>
 Create `.planning/phases/03-github-auth-and-the-private-repo-gate/3-01-SUMMARY.md` when done.
 Record in it the exact public signatures of `Endpoints`, `RepoRef`, `Client`, `GithubError`,
-`classify`, `TokenChain`, `TokenSource`, `RepoFacts`, `PushClearance`, and
-`github::setup::run` — three wave-2 plans build against them in parallel worktrees and must
-not have to re-derive them from the diff.
+`classify`, `from_transport`, `actionable`, `TokenChain`, `TokenSource`, `RepoFacts`,
+`PushClearance` (including `assert_fresh` and `MAX_CLEARANCE_AGE`), `assert_pushable`,
+`sync::cli::run_with`, and `github::setup::run` — three wave-2 plans build against them in
+parallel worktrees and must not have to re-derive them from the diff.
+
+State the **Phase 4 contract** explicitly, because it is the only thing keeping D-04
+structural: Phase 4's upload entry point takes a `PushClearance` **by value** and calls
+`assert_fresh` before the first byte, and re-runs `fetch_facts` + `assert_pushable` inside the
+push call rather than carrying a clearance obtained at `sync setup`.
 </output>

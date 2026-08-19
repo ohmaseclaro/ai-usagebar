@@ -13,9 +13,9 @@ must_haves:
   truths:
     - "A repository reporting `private: false`, `visibility: \"internal\"`, `archived: true`, `fork: true`, a changed `owner.id`, or 404 is refused in each case with its own message and no clearance (D-04)."
     - "A repository that was private at pairing and is public on re-check produces the incident message, naming the credentials to rotate and stating that published bytes cannot be un-published (SAFE-02)."
-    - "A token that carries administrative permission on the repository warns and continues; it never refuses (D-03)."
+    - "With the credentials category off, a public repository warns and is allowed — and `assert_pushable` and `check_drift` agree about that rather than one overruling the other (D-04)."
     - "The pairing record exists at mode 0600 in the config directory and is written atomically."
-    - "The crate contains no reference to the repository-creation endpoint, in code or in a comment (REPO-03)."
+    - "No repository-creating endpoint is reachable from the crate, and the check that says so runs on every future `make test`, not once at this plan's execution instant (REPO-03)."
   artifacts:
     - src/sync/github/gate.rs with the complete assertion set and the SAFE-02 incident path
     - src/sync/github/pairing.rs with the mode-0600 record and the drift check
@@ -35,8 +35,11 @@ name, which `owner.login` cannot see. `archived` catches a repository that will 
 write later, at a worse moment. `fork` catches a repository whose upstream relationship makes
 its contents reachable in ways the owner did not intend.
 
-Implements **D-03** (warn on excess permission, never refuse), **D-04** (checked immediately
-before every push, never cached), and the structural half of **REPO-03**.
+Implements **D-04** (checked immediately before every push, never cached, and public-with-
+credentials aborts while public-without-credentials warns) and the structural half of
+**REPO-03**. **D-03**'s runtime warning is deliberately *not* shipped here — see Task 1; its
+enforcement in this phase is the token recipe plan 3-05 writes, and plan 3-06 probes the field
+the warning would need.
 
 Purpose: this is the phase's reason to exist.
 Output: a complete `gate.rs` and `pairing.rs`.
@@ -67,54 +70,73 @@ Output: a complete `gate.rs` and `pairing.rs`.
     - `archived: true` refuses with a message naming archiving as the reason.
     - `fork: true` refuses with a message naming the fork relationship as the reason.
     - `owner.login` differing from the configured owner refuses.
-    - A fully-valid response yields a `PushClearance` whose `checked_at` equals the injected `now`.
+    - A fully-valid response yields a `PushClearance` whose `checked_at` equals the injected `now`, paired with an empty warning list.
     - Each of the six refusals produces a message distinct from the other five.
-    - A valid response whose `permissions.admin` is true yields a clearance **and** a warning; it never refuses.
-    - A response missing the `permissions` object yields a clearance and no warning.
+    - `private: false` with `credentials_in_bundle: false` yields a clearance **and** a warning naming the repository as public; it does not refuse.
+    - `private: false` with `credentials_in_bundle: true` refuses, and its message differs from the credentials-off warning.
+    - `visibility: "internal"` refuses in **both** bundle configurations — internal is not a public-repository carve-out, it is a repository whose visibility we do not accept at all.
   </behavior>
   <action>
 Fill `assert_pushable` in `src/sync/github/gate.rs`, which plan 3-01 left asserting `private`
-alone. Do not change its signature or `PushClearance`'s shape; plan 3-07 calls it and Phase 4
-will take a `PushClearance` by value.
+alone. **Do not touch its signature.** Plan 3-01 froze it as
+`assert_pushable(facts, repo, credentials_in_bundle, now) -> Result<(PushClearance, Vec<String>)>`
+precisely so this plan can add both assertions and warnings without one: your worktree contains
+3-01's `setup.rs`, which calls it and which you do not own, so a signature change means your
+branch does not compile. Warnings go in the tuple's `Vec<String>`, which 3-01 left empty and
+`setup.rs` already destructures and renders.
 
-Assert all of: `private` is true; `visibility` equals the literal for private, rejecting the
-internal value explicitly rather than by falling through a match, so the reason can be named;
-`owner_login` equals `repo.owner` case-insensitively, since GitHub treats owner names that
-way; `archived` is false; `fork` is false. Each failure carries its own message stating the
-condition that failed and what to change. Six conditions, six messages, no shared "gate
-failed" string — the phase's first success criterion is that each refuses distinctly.
+Assert: `visibility` equals the literal for private, rejecting the internal value explicitly
+rather than by falling through a match, so the reason can be named; `owner_login` equals
+`repo.owner` case-insensitively, since GitHub treats owner names that way; `archived` is false;
+`fork` is false. Each failure carries its own message stating the condition that failed and
+what to change — no shared "gate failed" string, since the phase's first success criterion is
+that each refuses distinctly.
 
-Return `PushClearance { checked_at: now }` only when all of them hold. `assert_pushable` stays
-the sole constructor.
+**The `private` arm is where this function and `check_drift` have to agree**, and
+`credentials_in_bundle` is what lets them. Read D-04 exactly as written: a public repository
+aborts *when credentials are in the bundle*, and is allowed-with-a-warning when the credentials
+category is off, because chat indexes and config are still personal data but there is nothing
+to rotate. So `private == false` refuses when `credentials_in_bundle`, and otherwise returns a
+clearance plus a warning naming the repository as public. Without this the two functions
+contradict each other and Task 2's credentials-off carve-out is dead code: `setup.rs` calls
+`check_drift` then `assert_pushable`, and an unconditional refusal here would kill it.
 
-Add the D-03 warning. `RepoFacts::admin_permission` comes from the response's
-`permissions.admin`. When it is true, emit a warning saying the token appears to carry
-administrative permission on this repository, that the design's guarantee comes from
-*withholding* that permission, and that the user should re-issue a token with
-`Contents: Read and write` and `Metadata: Read` only. It is a warning and never a refusal,
-exactly as D-03 reasons: the effective permissions of a token cannot be reliably enumerated
-without extra calls, and a false refusal is worse than an unheeded warning. Carry it out of
-the function as a `Vec<String>` of warnings on `PushClearance`, or a separate returned value —
-not by printing from inside, which would make it untestable.
+The internal-visibility arm takes no such carve-out and refuses in both configurations. It is
+not a public repository we are tolerating; it is a visibility we do not accept.
+
+Return `PushClearance { checked_at: now }` with the warning list only when the refusing
+conditions all pass. `assert_pushable` stays its sole constructor.
+
+**The D-03 administrative-permission warning does not ship in this plan**, and this is a
+deliberate reading of D-03 rather than an omission. `RepoFacts::admin_permission` comes from
+`permissions.admin` on `GET /repos/{owner}/{repo}` — but for a classic token that field
+reports the **authenticated user's role on the repository**, not the token's granted
+permissions. D-01 and `docs/sync-github.md` both instruct the user to create the repository
+themselves, which makes them its admin, so a correctly-scoped `Contents: read/write` token
+would still see `admin: true` and the warning would fire on essentially every correct install.
+Whether a fine-grained PAT narrows this field is undocumented. A warning that always fires
+trains its reader to ignore it, which is worse than no warning — the same reasoning D-03 itself
+uses to prefer an unheeded warning over a false refusal, applied one step further.
+
+So: keep parsing `admin_permission` (it is data, and free), emit no warning from it, and leave
+a `ponytail:`-style comment naming the open question and pointing at the probe. Plan 3-06 adds
+an `#[ignore]`d probe beside CAL-1 that dumps the `permissions` object for a real fine-grained
+Contents-only token. If it shows the field narrows, enabling the warning is a one-line
+follow-up against a measured answer. D-03's real force is in the recipe, which plan 3-05
+already delivers: the token is scoped correctly because the document says exactly which two
+permissions to grant.
 
 Widen the 404 handling plan 3-01 wrote so its message is reachable from every entry point in
 this module, and add a test asserting the message contains both possibilities and the create
 command with the configured owner and name substituted.
 
-**REPO-03 is enforced structurally, and this plan must not weaken it.** There is no request in
-this crate to the endpoint that creates a repository under a user namespace. Do not write that
-endpoint's path as a string literal anywhere under `src/` — not in a call, not in a test
-fixture, and not in a comment explaining that it is never called. A gate in this plan's verify
-step greps the tree for it, and a comment naming it is indistinguishable from a call site to
-`grep`. Say what is true instead: the tool refuses and prints the command the user should run.
-
 Every test constructs `RepoFacts` directly or serves one from `mockito`. No test reaches
 `api.github.com`.
   </action>
   <verify>
-    <automated>cargo test --lib sync::github::gate && [ "$(grep -rho 'user/repos' src/ --include='*.rs' | wc -l | tr -d ' ')" = 0 ]</automated>
+    <automated>cargo test --lib sync::github::gate</automated>
   </verify>
-  <done>Six refusals with six distinct messages, one clearance on a fully-valid response, and an administrative-permission warning that does not refuse. The grep gate finds no reference to the repository-creation endpoint anywhere under `src/`. `cargo test --lib sync::github::gate` is green.</done>
+  <done>`assert_pushable`'s signature is byte-identical to 3-01's. Six refusal conditions with six distinct messages; a fully-valid response yields a clearance and an empty warning list; `private: false` refuses with credentials in the bundle and warns-and-clears without them; internal visibility refuses in both. No warning is emitted from `admin_permission`, and the open question is recorded in a comment naming plan 3-06's probe. `cargo test --lib sync::github::gate` is green.</done>
   <reversibility rating="one-way">Withholding repository-creation capability is the milestone's strongest structural guarantee: it is what makes creating a *public* repository impossible rather than merely disallowed. Adding that endpoint later would silently downgrade REPO-03 from a structural property to a runtime check, and the documented token permissions would no longer match what the code can do.</reversibility>
 </task>
 
@@ -184,6 +206,59 @@ Every timestamp comparison takes the injected `now`.
   <reversibility rating="costly">The pairing record's JSON shape is on-disk state on a user's machine. A later field rename makes an existing record unreadable, and a record that cannot be read is a pairing check that silently degrades to first-contact trust — the exact resquat window it exists to close.</reversibility>
 </task>
 
+<task type="auto" tdd="true">
+  <name>Task 3: REPO-03 as a standing test, not a one-time grep</name>
+  <files>src/sync/github/gate.rs</files>
+  <behavior>
+    - The guard walks every `.rs` file under `src/`, excluding only the file it lives in, and passes on the tree as it stands.
+    - Injecting any one of the four forbidden path fragments into a scratch string the guard is pointed at makes it fail, with a message naming the file and the fragment.
+    - The guard reads its root from `CARGO_MANIFEST_DIR`, not from a working directory or a home directory.
+  </behavior>
+  <action>
+The previous draft enforced REPO-03 with a shell `grep` in this plan's verify step. That has
+two holes, and the second is the serious one.
+
+**It ran once.** At this plan's execution instant, and never again. Nothing would stop Phase 4,
+5, or 6 from reintroducing a creation path — and REPO-03 is a property of the shipped crate,
+not of one afternoon. Promote it to a `#[test]` in this file so `make test` carries it forward
+every phase, forever, at the cost of one directory walk.
+
+**It matched one path out of four.** Creating a repository under a user namespace is only the
+first way. There are three more: creating under an *organization* namespace — which D-01
+explicitly permits as an owner, so this is a live route, not a hypothetical; generating a
+repository from a template; and forking one. **Forking is the dangerous one:** a fork of a
+public upstream is public, which is precisely the outcome REPO-03 exists to make impossible.
+A guard that catches only the first path is a guard that would not have caught the worst case.
+
+Write the test as a plain walk, no new crate and no regex. Root it at
+`Path::new(env!("CARGO_MANIFEST_DIR")).join("src")` — a compile-time constant, so this reads no
+`$HOME` and does not depend on the working directory, and the AUR `check()` has the source tree
+in place. Recurse with `std::fs::read_dir`, take every `.rs` file, and reject any whose contents
+contain any of the four forbidden fragments, using `str::contains` four times. Fail with the
+offending file path and which fragment matched.
+
+**Exclude this file from the walk.** The test's own source necessarily contains all four
+fragments as the things it searches for, so a guard that scanned itself would fail on the day
+it was written. Skip by comparing against `file!()`, and say in a comment that the exclusion is
+deliberate and is the reason the fragments may appear here and nowhere else in `src/`.
+
+That exclusion is also the rule for everyone else: do not write any of those four path
+fragments anywhere under `src/` — not in a call, not in a test fixture, and not in a comment
+explaining that the endpoint is never called. To this guard a comment is indistinguishable from
+a call site. Say what is true instead: the tool refuses and prints the command the user should
+run.
+
+The structural half of REPO-03 is plan 3-01's guard that `Client` exposes no method able to
+carry a request body — none of these four endpoints is reachable without one. This test is the
+belt to that's braces, and cheap enough that having both is right.
+  </action>
+  <verify>
+    <automated>cargo test --lib sync::github::gate</automated>
+  </verify>
+  <done>A `#[test]` in `gate.rs` walks `src/` from `CARGO_MANIFEST_DIR`, excludes only itself, checks all four repository-creating path fragments, and passes. Temporarily adding any one of them to another file under `src/` makes it fail with that file named — verify this by hand once and record it in the summary. The test appears in `cargo test --lib` and therefore in `make test`, so every later phase inherits it.</done>
+  <reversibility rating="one-way">This test is what makes REPO-03 durable rather than momentary. Deleting or weakening it later would silently downgrade "the tool cannot create a repository" from a property of the crate to a claim in a document, and the documented token permissions would no longer match what the code is able to do.</reversibility>
+</task>
+
 </tasks>
 
 <threat_model>
@@ -204,27 +279,38 @@ Every timestamp comparison takes the injected `now`.
 | T-3-21 | Information disclosure | a repository flipped public between syncs | critical | mitigate | The gate is a call with no cached result and `PushClearance` is neither `Clone` nor publicly constructible, so D-04's "immediately before every push" cannot be satisfied by a stale check |
 | T-3-22 | Information disclosure | credentials already pushed while public | critical | transfer | Cannot be mitigated in software — published bytes are published. The incident message names the categories to rotate and states plainly that this is not undoable (SAFE-02) |
 | T-3-23 | Tampering | the pairing record on disk | high | mitigate | Written atomically at mode 0600 in the config directory, not the wipeable cache; a corrupt record errors rather than defaulting into a passing check |
-| T-3-24 | Elevation of privilege | a token carrying administrative permission | medium | mitigate | Warned about by name, with the two permissions to re-issue with. Not a refusal, per D-03: effective token permissions cannot be reliably enumerated and a false refusal is worse than an unheeded warning |
-| T-3-25 | Elevation of privilege | repository creation | critical | mitigate | No request to that endpoint exists anywhere in the crate, enforced by a grep gate in this plan's verify step; the documented token withholds the permission that would allow it (REPO-03) |
+| T-3-24 | Elevation of privilege | a token carrying administrative permission | medium | accept (this phase) | The runtime signal is unreliable: `permissions.admin` reports the *user's* role on the repository for a classic token, and D-01 has the user create the repository, so a correct token would trigger it on nearly every install and train its reader to ignore it. Mitigated instead by the recipe in `docs/sync-github.md` (plan 3-05), which is what actually determines the token's scope. Plan 3-06 probes the real field shape; the warning ships when it rests on a measurement |
+| T-3-25 | Elevation of privilege | repository creation | critical | mitigate | All four creating paths — user namespace, organization namespace, template generation, and **forking**, which produces a public repository — are blocked by a standing `#[test]` that walks `src/` on every `make test`, not by a one-time grep. Backed structurally by plan 3-01's guard that `Client` exposes no request-body method, without which none of the four is reachable (REPO-03) |
 </threat_model>
 
 <verification>
-- `cargo test --lib sync::github::gate sync::github::pairing` is green.
-- `grep -rho 'user/repos' src/ --include='*.rs'` produces no output.
-- `PushClearance` still derives neither `Clone` nor `Copy` and still has no public
-  constructor outside `assert_pushable`.
+- `cargo test --lib -- sync::github::gate sync::github::pairing` is green. (The multi-filter
+  form needs the `--` separator; `cargo test --lib a b` takes one positional and errors.)
+- The REPO-03 guard test is part of `cargo test --lib`, so `make test` runs it in every later
+  phase.
+- `assert_pushable`'s signature is unchanged from plan 3-01's summary, and `PushClearance`
+  still derives neither `Clone` nor `Copy` and still has no public constructor outside it.
+- `assert_pushable` and `check_drift` agree on the credentials-off carve-out: a test drives
+  `check_drift` then `assert_pushable` in `setup.rs`'s order over a public repository with the
+  credentials category off and asserts the run is allowed.
 - No test in either file resolves a real config directory or reaches the network.
 </verification>
 
 <success_criteria>
 Every one of the six refusal conditions from `github-transport.md` §3.2 is asserted and refused
-by its own message; a valid private repository yields a clearance; a repository that turned
-public since pairing raises the incident rather than a generic error; and the crate is
-provably incapable of creating a repository.
+by its own message; a valid private repository yields a clearance; the credentials-off carve-out
+survives both functions rather than being overruled by the second; a repository that turned
+public since pairing raises the incident rather than a generic error; and the crate is provably
+incapable of creating a repository by any of the four routes, on every future test run.
 </success_criteria>
 
 <output>
 Create `.planning/phases/03-github-auth-and-the-private-repo-gate/3-04-SUMMARY.md` when done.
 Record the final `DriftOutcome` shape, the pairing record's JSON field names, and the exact
 incident message — plan 3-07 renders it and Phase 4 re-runs this gate before its flip.
+
+Record two things for later phases: that `src/` may not contain any of the four
+repository-creating path fragments and why the guard test excludes its own file, and that the
+D-03 administrative-permission warning is outstanding pending plan 3-06's probe, so Phase 4's
+planner does not assume it shipped.
 </output>

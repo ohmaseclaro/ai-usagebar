@@ -24,6 +24,8 @@ must_haves:
   key_links:
     - "The flow reaches the password step only after the gate has cleared — a user must not be asked to set a passphrase for a repository we are about to refuse"
     - "The size shown is Phase 2's plan-builder total, not a second estimate computed here"
+    - "`cfg.includes(SyncCategory::Credentials)` is the single source of `credentials_in_bundle` for both gate calls; deriving it twice reintroduces the contradiction 3-04 removed"
+    - "`roots: &SyncRoots` is the only filesystem path source in `setup.rs`, and `run_with` is the only entry tests drive — together they are what keep the AUR `check()` off a real `$HOME`"
 ---
 
 <objective>
@@ -81,6 +83,9 @@ Output: a complete `setup.rs`, an extended `report.rs`, both wired through `cli.
     - The confirmed size shown equals the plan builder's total for the chosen categories, not a separately computed number.
     - The rendered outcome contains no substring of the token and no substring of the passphrase.
     - Re-running setup on an already-paired machine reuses the existing pairing rather than issuing a second one, and says so.
+    - A public repository with the credentials category **off** proceeds past step 1 with the warning rendered — `check_drift` and `assert_pushable` receive the same flag and agree.
+    - A public repository with the credentials category **on** stops at step 1 with the incident, before the passphrase prompt is reached.
+    - Every path written — keyfile, pairing record, token file, `config.toml` — resolves from the injected `SyncRoots`; a test asserts nothing lands outside its `TempDir`.
   </behavior>
   <action>
 Expand `github::setup::run` behind the entry point plan 3-01 froze, into UX-03's five steps.
@@ -93,13 +98,31 @@ production; every test uses a scripted double that records which methods were re
 order. That recording is what lets the ordering itself be asserted, which is the point of this
 plan. Do not read from stdin anywhere outside `TtyPrompt`.
 
+Adding the prompt parameter changes `setup::run`'s signature. That is expected and safe: plan
+3-01 marked this signature explicitly **not** frozen, you own `setup.rs` outright, its only
+caller is `src/sync/cli.rs` which you also own, and no wave-2 plan calls it. `roots: &SyncRoots`
+is already in it from 3-01 and stays — it is the only way this module reaches a filesystem path,
+and every "in the injected config directory" requirement below resolves from it. Do not
+introduce a second path source, and do not call `SyncRoots::resolve` anywhere in `setup.rs`.
+
 **Step 1 — the repository, and the gate.** Read `cfg.repo`; absent is the D-01 error naming the
 config key and the create command. Parse it, resolve the token through `TokenChain`, build the
-`Client`, `fetch_facts`, read the pairing record, `check_drift`, then `assert_pushable`. Every
-refusal exits here, before any prompt is shown, with the message plan 3-03 or 3-04 produced —
-do not re-word them at the call site, or the phase acquires two copies of every message and one
-of them rots. Render `assert_pushable`'s warnings, including the administrative-permission one,
-before continuing.
+`Client`, `fetch_facts`, read the pairing record from `roots`, `check_drift`, then
+`assert_pushable`. Every refusal exits here, before any prompt is shown, with the message plan
+3-03 or 3-04 produced — do not re-word them at the call site, or the phase acquires two copies
+of every message and one of them rots.
+
+Both gate calls take a `credentials_in_bundle` flag, and it comes from exactly one place:
+`cfg.includes(SyncCategory::Credentials)`, the helper plan 2-01 put on `SyncConfig`. Pass the
+same value to `check_drift` and to `assert_pushable`. Deriving it twice, or passing a literal
+to one of them, reintroduces the contradiction plan 3-04 exists to remove: `check_drift` carves
+out the credentials-off case and `assert_pushable` would then overrule it.
+
+`assert_pushable` returns `(PushClearance, Vec<String>)`. Destructure it and render the
+warnings before continuing — including the public-repository-with-credentials-off warning,
+which is the one case where the flow proceeds past a repository that is not private. Note that
+no administrative-permission warning arrives here: plan 3-04 withheld it pending plan 3-06's
+probe, so do not write rendering code expecting one.
 
 **Step 2 — the passphrase.** Only reachable once the gate has cleared. Use Phase 1's
 `sync::passphrase` generation as the default path and its strength floor for a supplied one;
@@ -138,7 +161,8 @@ over the rendered outcome, checking for both the value and its eight-character p
     <automated>cargo test --lib sync::github::setup</automated>
   </verify>
   <done>The five steps run in order against a scripted prompt double and a mockito private repository, ending at "ready to push" with nothing uploaded. Every refusal case stops before the password prompt is reached, asserted by the double's recording. The keyfile and the pairing record are written at mode 0600 in the injected directory. No rendered line contains the token or the passphrase or an eight-character prefix of either.</done>
-  <precondition>Plans 3-02, 3-03, and 3-04 are merged: this flow calls `token::store`, `http::actionable`, `gate::assert_pushable`, and `pairing::check_drift`, none of which is complete at the tracer.</precondition>
+  <precondition>Plans 3-02, 3-03, and 3-04 are merged: this flow calls `token::store`, `http::actionable`, `gate::assert_pushable`'s full assertion set, and `pairing::check_drift`, none of which is complete at the tracer.</precondition>
+  <precondition>Phase 2 plans **2-05 and 2-07** are merged. `SyncConfig`, `SyncRoots`, `sync::cli::run`, `SyncAction::Status`, and `sync::report`'s builder/renderer split are verified present from 2-01; the plan builder this task calls for the size total is 2-05's, and `report.rs`'s final shape is 2-07's. Neither summary exists at planning time — if either is missing, stop rather than inventing a signature for it.</precondition>
 </task>
 
 <task type="auto" tdd="true">
@@ -170,11 +194,19 @@ A drift outcome that is the SAFE-02 incident renders as the incident, using plan
 verbatim — not a status-flavoured paraphrase of it. A repository going public is the same event
 whichever command noticed it.
 
-In `src/sync/cli.rs`, extend the `Status` arm to build the client and drive the repository
-section when `[sync] repo` is set, and to skip it silently when it is not — an unconfigured
-machine reporting a network error would be a lie. Return non-zero for the failure cases above.
-Do not run the gate twice in one invocation; fetch the facts once and pass them to both the
-drift check and the report.
+In `src/sync/cli.rs`, extend the `Status` arm of **`run_with`** — the injected-seam entry plan
+3-01 introduced, taking `(&SyncAction, &Config, &SyncRoots, &Endpoints, &TokenChain, now)`. All
+logic lives there and all tests drive it. `run` stays the thin wrapper that resolves
+`Config::load()`, `SyncRoots::resolve`, `Endpoints::default()`, `TokenChain::production()`, and
+`Utc::now()`, and no test calls it. Without that split a status test reads a real `$HOME`, and
+the AUR `check()` runs `cargo test` during `makepkg` on installers' machines — a test coupled
+to the developer's own config fails other people's installs.
+
+The arm builds the client and drives the repository section when `[sync] repo` is set, and skips
+it silently when it is not — an unconfigured machine reporting a network error would be a lie.
+Return non-zero for the failure cases above. Do not run the gate twice in one invocation; fetch
+the facts once and pass them to both the drift check and the report. Both gate calls take
+`cfg.includes(SyncCategory::Credentials)`, the same single source as the setup flow.
 
 Reconcile against `docs/sync-github.md` from plan 3-05, which was written in wave 1 before any
 of this merged: confirm the command name, the config key, the token source labels, and the
@@ -183,9 +215,9 @@ they diverged. Do not change the shipped names to match the document — the doc
 that was written ahead of the code.
   </action>
   <verify>
-    <automated>cargo test --lib sync::report sync::cli</automated>
+    <automated>cargo test --lib -- sync::report sync::cli</automated>
   </verify>
-  <done>`sync status` renders the repository, visibility, token source, and last-verified time; reports the incident distinctly when the repository turned public; keeps the category listing visible when the repository section cannot be filled; exits non-zero on any repository-section failure; and issues exactly one repository request per invocation. `docs/sync-github.md` agrees with the shipped command name, config key, and token source labels.</done>
+  <done>`sync status` renders the repository, visibility, token source, and last-verified time; reports the incident distinctly when the repository turned public; keeps the category listing visible when the repository section cannot be filled; exits non-zero on any repository-section failure; and issues exactly one repository request per invocation. Every test drives `run_with` with injected values and none calls `run`, `Config::load`, `SyncRoots::resolve`, or `TokenChain::production`. `docs/sync-github.md` agrees with the shipped command name, config key, and token source labels.</done>
 </task>
 
 </tasks>
@@ -214,8 +246,10 @@ that was written ahead of the code.
 </threat_model>
 
 <verification>
-- `cargo test --lib sync::github::setup sync::report sync::cli` is green.
-- No test drives a real terminal, reads a real `$HOME`, or reaches the network.
+- `cargo test --lib -- sync::github::setup sync::report sync::cli` is green. (The `--`
+  separator is required; `cargo test --lib a b` takes one positional and errors.)
+- No test drives a real terminal, reads a real `$HOME`, or reaches the network; every one goes
+  through `run_with` and `SyncRoots::at` over a `TempDir`.
 - The rendered success output of both commands is asserted free of the token and the
   passphrase.
 - `docs/sync-github.md` and the shipped command name, config key, and source labels agree.
