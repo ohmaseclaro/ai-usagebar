@@ -155,3 +155,21 @@ The canonical end-of-phase gate is **`make test` + `cargo clippy --all-targets -
   Swift change through untested.
 
 Phase 6 is the phase this bites, and its plans already verify with the harness directly.
+
+## Parallelism hazard found in Phase 3 — file-disjointness is necessary, not sufficient
+
+`3-05` (docs) and `3-04` (the gate) were file-disjoint and merged without a conflict. They still
+contradicted each other: `3-05` documented "the tool will warn you if it detects a token with
+Administration permissions" while `3-04`, running at the same time, decided that warning must not
+ship (`permissions.admin` reports the *user's* role, so it would fire on every correct install).
+
+Neither plan was wrong when written. The defect lived in the gap between them, and no
+file-overlap check can see it — the two never touched the same byte.
+
+**What to check when running plans in parallel, beyond `files_modified`:** does any plan in the
+wave *describe* behaviour that another plan in the same wave *decides*? Docs, error messages, and
+`--help` text are the usual carriers, because they assert things implemented elsewhere.
+
+This is the sixth instance in the milestone of a statement outrunning its implementation, and the
+first caused by concurrency rather than by sequence. Phases 4–6 run docs plans alongside
+behaviour plans (`4-07`, `6-05`), so the same shape can recur there.
