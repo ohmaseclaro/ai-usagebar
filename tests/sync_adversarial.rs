@@ -101,7 +101,7 @@ fn fixture(len: usize) -> Vec<u8> {
 }
 
 fn suite_keys() -> (Keyfile, Keys) {
-    Keyfile::create(PASSWORD.as_bytes(), CHEAP).expect("keyfile creation")
+    Keyfile::create_with_floor(PASSWORD.as_bytes(), CHEAP, CHEAP.m_kib).expect("keyfile creation")
 }
 
 /// Fixed, injected, never `Utc::now()`.
@@ -409,7 +409,8 @@ fn attack_2_downgraded_kdf_parameters() -> String {
         p: 1,
     };
     let (keyfile, keys) =
-        Keyfile::create(PASSWORD.as_bytes(), SEALED_AT).expect("keyfile creation");
+        Keyfile::create_with_floor(PASSWORD.as_bytes(), SEALED_AT, SEALED_AT.m_kib)
+            .expect("keyfile creation");
     let data = fixture(FIXTURE_LEN);
     let (pack, _, root) = bundle(&keys, &data);
 
@@ -642,9 +643,10 @@ fn attack_8_transposed_manifest_ids() -> String {
     // requires the key", stated as an assertion rather than as prose.
     let mut transposed = ordered.clone();
     transposed.swap(0, 1);
-    let stranger = Keyfile::create(b"a key the attacker actually holds", CHEAP)
-        .expect("keyfile creation")
-        .1;
+    let stranger =
+        Keyfile::create_with_floor(b"a key the attacker actually holds", CHEAP, CHEAP.m_kib)
+            .expect("keyfile creation")
+            .1;
     let forged = Root::new(
         SNAPSHOT_COUNTER,
         fixed_time(),

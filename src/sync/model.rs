@@ -381,7 +381,7 @@ mod tests {
     };
 
     fn keys_from(password: &[u8]) -> Keys {
-        Keyfile::create(password, CHEAP)
+        Keyfile::create_with_floor(password, CHEAP, CHEAP.m_kib)
             .expect("keyfile creation")
             .1
     }

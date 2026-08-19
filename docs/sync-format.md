@@ -76,6 +76,25 @@ A reader must use the parameters **stored in the keyfile it is opening**, never
 its own compiled default. A bundle initialised at a lower `--kdf-memory` stays
 openable; one initialised higher stays strong.
 
+**`m_kib` is bounded on both sides, and the two bounds are not symmetrical.**
+
+- **Writing** a new keyfile — at initialisation or at a password change — is
+  refused below **8 MiB**. Argon2's own floor is `8 * p` KiB, which is the
+  smallest input the algorithm is defined for rather than a security parameter,
+  and the 12-character password rule in §9 is arithmetic against the guess rate
+  the *shipped* parameters buy. The two are also coupled directly: below the
+  default memory cost, a user-supplied password is refused unless it is of
+  generated strength (20 characters, 100 bits), which is uncrackable at any KDF
+  cost. Lowering the cost therefore trades against password strength instead of
+  against security.
+- **Reading** is refused above **4 GiB**, and is deliberately unbounded below.
+  `m_kib` reaches a reader from a keyfile a hostile remote may have edited, and
+  an implementation whose Argon2 allocates infallibly turns one edited integer
+  into an abort — before the AAD binding gets a chance to reject it. Refuse the
+  value before allocating for it. Nothing is refused for being *too low* on
+  read: a bundle written before a floor existed must stay openable, or raising
+  a floor destroys data.
+
 ---
 
 ## 2. The keyfile
@@ -601,6 +620,11 @@ guess on their own hardware, forever. That is why a generated 20-character
 passphrase (100 bits, straight from the OS CSPRNG) is the default path, a
 user-supplied password is the exception, and a supplied one under 12 characters
 is refused outright.
+
+That 12 is not a round number: it is arithmetic against the guess rate the
+shipped Argon2id parameters buy, so it means nothing unless those parameters are
+held to. **Below the default memory cost, a user-supplied password is refused
+unless it is of generated strength** — see §1. The two controls are one control.
 
 **Changing the password is not revocation.** A rewrap unwraps the master key
 under the old password and rewraps *the same* master key under the new one — 48

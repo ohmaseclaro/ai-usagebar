@@ -286,7 +286,7 @@ mod tests {
     };
 
     fn keys() -> Keys {
-        Keyfile::create(b"correct horse battery staple", CHEAP)
+        Keyfile::create_with_floor(b"correct horse battery staple", CHEAP, CHEAP.m_kib)
             .expect("keyfile creation")
             .1
     }

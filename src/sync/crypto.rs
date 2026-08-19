@@ -20,7 +20,10 @@
 //! point takes [`KdfParams`] by argument rather than reading a default inside
 //! itself; that is the cheap-KDF test seam. Tests pass `{ m_kib: 8, t: 1, p: 1 }`
 //! and run in microseconds, which keeps the AUR `check()` inside its time budget.
-//! Production passes [`KdfParams::default`].
+//! Production passes [`KdfParams::default`]. Those parameters are bounded rather
+//! than trusted: [`MIN_KDF_MEMORY_KIB`] on the write path (with the floor itself
+//! as an argument, so the cheap seam survives it) and [`MAX_KDF_MEMORY_KIB`] on
+//! the read path, where `m_kib` arrives from a hostile remote.
 //!
 //! Secret hygiene is structural, not aspirational: key material lives in
 //! `Zeroizing`, [`Keys`] has a hand-written `Debug` that prints `<redacted>`,
@@ -78,6 +81,25 @@ impl Default for KdfParams {
     }
 }
 
+/// The smallest Argon2id working set a *new* keyfile may be written at: 8 MiB.
+///
+/// Argon2's own floor is `8 * p` KiB, which is not a security parameter — it is
+/// the smallest input the algorithm is defined for. Accepting it made the
+/// 12-character password floor in [`crate::sync::passphrase`] arithmetic against
+/// a guess rate nothing enforced: that figure is derived from what the *shipped*
+/// parameters buy, and at 8 KiB a 12-character password falls in an afternoon.
+///
+/// 8 MiB is 1/128 of the shipped default and a thousand times argon2's floor.
+/// The floor and the passphrase policy are also coupled directly — below
+/// [`KdfParams::default`]'s memory, `passphrase::check` accepts nothing short of
+/// generated strength — because a floor alone only moves the line, while the
+/// coupling makes lowering the KDF cost pay for itself in password strength.
+///
+/// Only new keyfiles. An existing bundle written below this stays openable
+/// forever: refusing to *read* it would destroy data to enforce a policy the
+/// user cannot retroactively satisfy.
+pub const MIN_KDF_MEMORY_KIB: u32 = 8 * 1024;
+
 /// The largest Argon2id working set this build will ever ask for: 4 GiB.
 ///
 /// `m_kib` arrives from the keyfile, which arrives from a remote the format
@@ -92,6 +114,24 @@ impl Default for KdfParams {
 /// hard ceiling, not a fit-in-RAM check; [`check_memory_budget`] is the separate,
 /// actionable pre-flight a surface runs against the machine it is on.
 pub const MAX_KDF_MEMORY_KIB: u32 = 4 * 1024 * 1024;
+
+/// Refuse writing a new keyfile below `min_m_kib` — normally
+/// [`MIN_KDF_MEMORY_KIB`].
+///
+/// Only ever applied on the *write* path. Reading is deliberately unbounded
+/// below, so raising the floor later cannot strand a bundle already on a user's
+/// disk.
+fn check_kdf_floor(m_kib: u32, min_m_kib: u32) -> Result<()> {
+    if m_kib >= min_m_kib {
+        return Ok(());
+    }
+    Err(AppError::Other(format!(
+        "refusing to write a keyfile at {m_kib} KiB of key-derivation memory: \
+         the floor is {min_m_kib} KiB. Below it, guessing the password offline \
+         is cheap enough that the length rules stop meaning anything — and a \
+         bundle written now is attackable forever"
+    )))
+}
 
 /// Refuse an Argon2id memory parameter above [`MAX_KDF_MEMORY_KIB`], before
 /// anything allocates it.
@@ -283,10 +323,25 @@ pub struct Keyfile {
 impl Keyfile {
     /// Draw a fresh master key and wrap it under `pw`. Returns both the keyfile
     /// to persist and the live subkeys, so the caller never pays the KDF twice.
+    ///
+    /// Refuses `k.m_kib` below [`MIN_KDF_MEMORY_KIB`]. **Every production caller
+    /// uses this**, not [`Keyfile::create_with_floor`].
     pub fn create(pw: &[u8], k: KdfParams) -> Result<(Keyfile, Keys)> {
+        Self::create_with_floor(pw, k, MIN_KDF_MEMORY_KIB)
+    }
+
+    /// [`Keyfile::create`] with the memory floor as an argument — the cheap-KDF
+    /// test seam, the same shape as `Cache::at` beside `Cache::for_vendor`.
+    ///
+    /// Tests wrap at `m_kib = 8` and run in microseconds, which is what keeps
+    /// the AUR `check()` inside its budget on an installer's machine; they pass
+    /// their own parameters as the floor. Production has no reason to call this:
+    /// a caller that wants a lower floor wants [`MIN_KDF_MEMORY_KIB`] lowered,
+    /// where the argument for it can be read.
+    pub fn create_with_floor(pw: &[u8], k: KdfParams, min_m_kib: u32) -> Result<(Keyfile, Keys)> {
         let mut mk = Zeroizing::new([0u8; 32]);
         fill(&mut mk[..])?;
-        let keyfile = Self::wrap(&mk, pw, k)?;
+        let keyfile = Self::wrap(&mk, pw, k, min_m_kib)?;
         Ok((keyfile, subkeys(&mk)))
     }
 
@@ -307,12 +362,31 @@ impl Keyfile {
     /// needs the old keyfile asset deleted from the remote, which Phase 4 owns —
     /// and even then, a keyfile already in git history stays unwrappable with
     /// the old password forever. Password change is not revocation.
+    /// Refuses `k.m_kib` below [`MIN_KDF_MEMORY_KIB`], exactly as
+    /// [`Keyfile::create`] does: a rewrap is the other way to choose the
+    /// parameters a bundle lives at, so a floor that only guarded `create` would
+    /// be a floor with a documented way around it.
     pub fn rewrap(&self, old_pw: &[u8], new_pw: &[u8], k: KdfParams) -> Result<Keyfile> {
-        let mk = self.unwrap_master_key(old_pw)?;
-        Self::wrap(&mk, new_pw, k)
+        self.rewrap_with_floor(old_pw, new_pw, k, MIN_KDF_MEMORY_KIB)
     }
 
-    fn wrap(mk: &[u8; 32], pw: &[u8], k: KdfParams) -> Result<Keyfile> {
+    /// [`Keyfile::rewrap`] with the memory floor as an argument. The test seam;
+    /// see [`Keyfile::create_with_floor`].
+    pub fn rewrap_with_floor(
+        &self,
+        old_pw: &[u8],
+        new_pw: &[u8],
+        k: KdfParams,
+        min_m_kib: u32,
+    ) -> Result<Keyfile> {
+        let mk = self.unwrap_master_key(old_pw)?;
+        Self::wrap(&mk, new_pw, k, min_m_kib)
+    }
+
+    fn wrap(mk: &[u8; 32], pw: &[u8], k: KdfParams, min_m_kib: u32) -> Result<Keyfile> {
+        check_kdf_floor(k.m_kib, min_m_kib)?;
+        check_kdf_ceiling(k.m_kib)?;
+
         let mut salt = [0u8; 16];
         let mut nonce = [0u8; NONCE_LEN];
         fill(&mut salt)?;
@@ -684,7 +758,7 @@ mod tests {
     };
 
     fn keys() -> Keys {
-        Keyfile::create(b"correct horse battery staple", CHEAP)
+        Keyfile::create_with_floor(b"correct horse battery staple", CHEAP, CHEAP.m_kib)
             .expect("keyfile creation")
             .1
     }
@@ -695,7 +769,9 @@ mod tests {
 
     #[test]
     fn password_round_trips_to_a_sealed_and_reopened_buffer() {
-        let (keyfile, keys) = Keyfile::create(b"correct horse battery staple", CHEAP).unwrap();
+        let (keyfile, keys) =
+            Keyfile::create_with_floor(b"correct horse battery staple", CHEAP, CHEAP.m_kib)
+                .unwrap();
 
         let plaintext = b"the quick brown fox".as_slice();
         let id = keys.chunk_id(plaintext);
@@ -782,7 +858,8 @@ mod tests {
 
     #[test]
     fn a_wrong_password_yields_an_error_and_no_plaintext() {
-        let (keyfile, _) = Keyfile::create(b"the real password", CHEAP).unwrap();
+        let (keyfile, _) =
+            Keyfile::create_with_floor(b"the real password", CHEAP, CHEAP.m_kib).unwrap();
         let err = keyfile
             .open(b"not the real password")
             .expect_err("a wrong password must not open the keyfile")
@@ -874,9 +951,10 @@ mod tests {
 
     #[test]
     fn rewrap_under_a_new_password_preserves_the_subkeys() {
-        let (keyfile, original) = Keyfile::create(b"first password", CHEAP).unwrap();
+        let (keyfile, original) =
+            Keyfile::create_with_floor(b"first password", CHEAP, CHEAP.m_kib).unwrap();
         let rewrapped = keyfile
-            .rewrap(b"first password", b"second password", CHEAP)
+            .rewrap_with_floor(b"first password", b"second password", CHEAP, CHEAP.m_kib)
             .unwrap();
 
         // A fresh salt and nonce, so the bytes differ …
@@ -895,12 +973,57 @@ mod tests {
 
     #[test]
     fn rewrap_with_the_wrong_old_password_produces_no_keyfile() {
-        let (keyfile, _) = Keyfile::create(b"first password", CHEAP).unwrap();
+        let (keyfile, _) =
+            Keyfile::create_with_floor(b"first password", CHEAP, CHEAP.m_kib).unwrap();
         assert!(
             keyfile
-                .rewrap(b"guessed wrong", b"second password", CHEAP)
+                .rewrap_with_floor(b"guessed wrong", b"second password", CHEAP, CHEAP.m_kib)
                 .is_err()
         );
+    }
+
+    /// The write path refuses a KDF cost the passphrase policy is not calibrated
+    /// against — through both entry points, because a rewrap is the other way to
+    /// choose the parameters a bundle lives at.
+    ///
+    /// Deliberately asserted through `create`/`rewrap`, the functions production
+    /// calls, rather than through `check_kdf_floor`: a floor only guarding one
+    /// of the two is a floor with a documented way around it.
+    #[test]
+    fn a_new_keyfile_below_the_memory_floor_is_refused_through_both_entry_points() {
+        let below = KdfParams {
+            m_kib: MIN_KDF_MEMORY_KIB - 1,
+            t: 1,
+            p: 1,
+        };
+        let err = Keyfile::create(b"a twelve-char", below)
+            .expect_err("a keyfile below the floor must not be written")
+            .to_string();
+        assert!(err.contains("the floor is"), "{err}");
+        assert!(
+            !err.contains("a twelve-char"),
+            "a refusal echoed the password"
+        );
+
+        // The floor is real rather than argon2's own 8 KiB: that one is the
+        // smallest input the algorithm is defined for, not a security parameter.
+        assert!(MIN_KDF_MEMORY_KIB > 8);
+        assert!(MIN_KDF_MEMORY_KIB < KdfParams::default().m_kib);
+
+        // …and the same refusal on the rewrap path, from a keyfile that exists.
+        let (keyfile, _) = Keyfile::create_with_floor(b"first password", CHEAP, CHEAP.m_kib)
+            .expect("the seam still wraps cheaply");
+        assert!(
+            keyfile
+                .rewrap(b"first password", b"second password", below)
+                .is_err(),
+            "rewrap must apply the same floor create does"
+        );
+
+        // An *existing* bundle below the floor still opens: refusing to read it
+        // would destroy data to enforce a policy its owner cannot retroactively
+        // satisfy.
+        assert!(keyfile.open(b"first password").is_ok());
     }
 
     #[test]
@@ -915,14 +1038,15 @@ mod tests {
         assert_eq!(KdfParams::default().m_kib, 1_048_576);
         assert_ne!(stored, KdfParams::default());
 
-        let (keyfile, _) = Keyfile::create(b"stored params please", stored).unwrap();
+        let (keyfile, _) =
+            Keyfile::create_with_floor(b"stored params please", stored, stored.m_kib).unwrap();
         assert_eq!(keyfile.kdf.params(), stored);
         assert!(keyfile.open(b"stored params please").is_ok());
     }
 
     #[test]
     fn kdf_parameters_edited_in_transit_fail_to_unwrap() {
-        let (keyfile, _) = Keyfile::create(b"in transit", CHEAP).unwrap();
+        let (keyfile, _) = Keyfile::create_with_floor(b"in transit", CHEAP, CHEAP.m_kib).unwrap();
 
         // An attacker downgrading the work factor on the wire. The parameters
         // are bound as AEAD associated data, so the KEK they now describe is not
@@ -942,7 +1066,8 @@ mod tests {
 
     #[test]
     fn a_keyfile_above_the_read_ceiling_is_refused_before_any_cryptographic_work() {
-        let (keyfile, _) = Keyfile::create(b"future bundle", CHEAP).unwrap();
+        let (keyfile, _) =
+            Keyfile::create_with_floor(b"future bundle", CHEAP, CHEAP.m_kib).unwrap();
 
         // At the ceiling: accepted.
         assert_eq!(keyfile.format, MAX_SUPPORTED_KEYFILE);
@@ -970,7 +1095,8 @@ mod tests {
     /// widget stops exiting 0.
     #[test]
     fn a_keyfile_demanding_more_memory_than_the_ceiling_is_refused_before_allocating() {
-        let (keyfile, _) = Keyfile::create(b"a hostile remote", CHEAP).unwrap();
+        let (keyfile, _) =
+            Keyfile::create_with_floor(b"a hostile remote", CHEAP, CHEAP.m_kib).unwrap();
 
         let mut absurd = keyfile.clone();
         absurd.kdf.m_kib = u32::MAX;
