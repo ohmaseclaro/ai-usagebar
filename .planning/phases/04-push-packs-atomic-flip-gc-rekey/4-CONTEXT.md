@@ -131,3 +131,22 @@ pushed with absolute paths is a bundle no correct restore can read.
 Phase 5's `5-01` was drafted to own this fix. With `4-02` doing it correctly, `5-01`'s job
 becomes **verifying** the encoding rather than changing it — and a test asserting no manifest
 entry is absolute or contains `..` belongs on both sides of the boundary.
+
+---
+
+## Standing rule inherited from 3-04's REPO-03 guard
+
+The guard walks all of `src/` for four fragments — `/user/repos`, `/orgs/`, `/generate`,
+`/forks` — and fails on any occurrence.
+
+**They may not appear anywhere under `src/`, not even inside a comment saying the endpoint is
+unused.** A substring guard cannot tell a comment from a call site, and weakening it to
+understand Rust syntax is how a structural guarantee becomes a heuristic. This phase adds write
+verbs, so it is the most likely place someone documents "we deliberately never call
+`POST /user/repos`" and turns the build red for a sentence that was trying to be helpful.
+
+If a later phase genuinely needs one of those endpoints, that is a decision to reopen REPO-03 —
+not a reason to relax the guard.
+
+The guard excludes only its own file (`file!()`), and asserts non-vacuity both ways
+(`skipped == 1`, `scanned > 50`), so a refactor cannot quietly turn it into a green no-op.
