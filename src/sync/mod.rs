@@ -14,14 +14,34 @@
 //! - [`model`] — snapshot root, manifest, and index objects.
 //! - [`passphrase`] — passphrase generation and strength floor.
 //! - [`anchor`] — the local monotonic rollback anchor.
+//! - [`scope`] — the one bounded, symlink-refusing walker plus the D2
+//!   exclusion predicate every category funnels through.
+//! - [`transcripts`] — the bounded transcript selector.
+//! - [`index`] — the local `(path, size, mtime_ns, inode)` change-detection db.
+//! - [`plan`] — dry-run planning over a scan.
+//! - [`report`] — the pure `sync status` model and its renderer.
+//! - [`cli`] — the `ai-usagebar sync …` entry point.
+//!
+//! The scanning half of this module touches the filesystem, but only through
+//! [`SyncRoots`], whose every root is injected — no test here reads a real
+//! `$HOME`.
 
 pub mod anchor;
 pub mod chunk;
+pub mod cli;
 pub mod crypto;
+pub mod index;
 pub mod model;
 pub mod pack;
 pub mod passphrase;
+pub mod plan;
+pub mod report;
+pub mod scope;
+pub mod transcripts;
 
+use std::path::PathBuf;
+
+use crate::config::Config;
 use crate::error::{AppError, Result};
 
 /// Fixed chunk size. Fixed-size, *not* content-defined: CDC boundary positions
@@ -92,6 +112,75 @@ pub fn check_version(found: u32, ceiling: u32, object: &str) -> Result<()> {
         "this {object} was written at format version {found}, but this build of \
          ai-usagebar reads at most version {ceiling} — upgrade ai-usagebar to read it"
     )))
+}
+
+/// Every filesystem root the collectors are allowed to look at.
+///
+/// The same seam as [`crate::claude_desktop::Paths`]: [`SyncRoots::at`] is what
+/// every test constructs, [`SyncRoots::resolve`] is the one production wrapper
+/// that touches `$HOME`. Nothing under [`scope`] resolves a path itself, so a
+/// collector physically cannot wander outside what it was handed.
+#[derive(Debug, Clone)]
+pub struct SyncRoots {
+    /// The effective `config.toml`.
+    pub config_file: PathBuf,
+    /// Its parent — where `accounts/<label>/.credentials.json` lives.
+    pub config_dir: PathBuf,
+    /// Claude Desktop's data dir, parent of `claude-code-sessions`.
+    pub desktop_data_dir: PathBuf,
+    /// The claude-acc profile store, `~/.claude-acc/profiles`.
+    pub desktop_profiles_dir: PathBuf,
+    /// `~/.claude`, parent of `scheduled-tasks/` and `projects/`.
+    pub claude_home: PathBuf,
+}
+
+impl SyncRoots {
+    /// Test seam: every root explicit, none derived.
+    pub fn at(
+        config_file: PathBuf,
+        config_dir: PathBuf,
+        desktop_data_dir: PathBuf,
+        desktop_profiles_dir: PathBuf,
+        claude_home: PathBuf,
+    ) -> Self {
+        Self {
+            config_file,
+            config_dir,
+            desktop_data_dir,
+            desktop_profiles_dir,
+            claude_home,
+        }
+    }
+
+    /// Production paths, all derived from resolvers that already exist. No new
+    /// config knob: a second path to the same tree is a second thing to get
+    /// wrong.
+    pub fn resolve(config: &Config) -> Result<Self> {
+        let config_file = crate::config::resolved_path().ok_or_else(|| {
+            AppError::Other(
+                "could not resolve the ai-usagebar config directory (no HOME?) — \
+                 sync needs to know where config.toml lives"
+                    .into(),
+            )
+        })?;
+        let config_dir = config_file
+            .parent()
+            .ok_or_else(|| {
+                AppError::Other(format!(
+                    "config path has no parent directory: {}",
+                    config_file.display()
+                ))
+            })?
+            .to_path_buf();
+        let desktop = crate::claude_desktop::Paths::resolve(&config.anthropic)?;
+        Ok(Self {
+            config_file,
+            config_dir,
+            desktop_data_dir: desktop.data_dir,
+            desktop_profiles_dir: desktop.profiles_dir,
+            claude_home: crate::cache::home_dir()?.join(".claude"),
+        })
+    }
 }
 
 #[cfg(test)]
