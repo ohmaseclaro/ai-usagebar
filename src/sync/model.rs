@@ -1,11 +1,11 @@
 //! The snapshot object graph: the root (fresh random nonce, monotonic counter),
-//! the manifest carried as an ordinary sealed chunk, and the index object with
+//! the manifest carried as ordinary sealed chunks, and the index object with
 //! its `supersedes` link.
 //!
 //! # The chain, and why every hop names the next one
 //!
 //! ```text
-//! root  --manifest_id-->  manifest  --chunk ids-->  chunks
+//! root  --manifest_chunks-->  manifest  --chunk ids-->  chunks
 //! ```
 //!
 //! Each hop's identifier is bound as associated data into the object it names:
@@ -26,25 +26,34 @@
 //!
 //! It is closed by construction rather than by a check: the list of ids sits
 //! inside the manifest's sealed plaintext, so transposing two of them either
-//! breaks the manifest's Poly1305 tag (if edited in place) or changes the
-//! manifest's own id (if re-sealed), and the root names the old id. Either way
-//! the reader gets an error and zero entries, never a reordered manifest.
+//! breaks the Poly1305 tag of the chunk they live in (if edited in place) or
+//! changes that chunk's own id (if re-sealed), and the root names the old ids.
+//! The root's own `manifest_chunks` list is closed the same way one level up:
+//! it sits inside the root's sealed plaintext, which only the key holder can
+//! re-seal. Either way the reader gets an error and zero entries, never a
+//! reordered manifest.
 //!
-//! # A large bundle's manifest exceeds one chunk — a known Phase 2 boundary
+//! # The manifest spans as many chunks as it needs
 //!
-//! [`crate::sync::chunk::seal_chunk`] seals exactly one buffer of at most
-//! [`CHUNK_SIZE`], and the milestone's chat-session-index category alone is
-//! several thousand files. At roughly 135 bytes of JSON per entry — a path, a
-//! mode, a length, and a 64-hex chunk id — a manifest passes 256 KiB somewhere
-//! around 2,000 files, so a ~4,000-file bundle does **not** fit in one chunk.
+//! One chunk holds at most [`crate::sync::CHUNK_SIZE`] of plaintext, and the
+//! manifest passes that long before any single payload file does. Each entry is
+//! a path, a mode, a length, and a 64-hex chunk id — call it 290 bytes once the
+//! paths are real ones — so the *default* bundle measured on this milestone's
+//! target machine is 1,558 entries and 448 KiB, already 192 KiB past one chunk.
+//! Enabling transcripts takes it past 5,700 entries. A single-chunk manifest
+//! could not express the common case, let alone the large one, and compression
+//! does not rescue it: the refusal is on the plaintext length handed to
+//! [`crate::sync::chunk::frame`], long before zstd sees it.
 //!
-//! Phase 1 does not implement that split: [`Manifest::seal`] refuses an
-//! oversized manifest **by name**, so Phase 2 hits a loud error rather than
-//! inheriting a silent single-chunk assumption. Splitting it means a list of
-//! ids where [`Root::manifest_id`] currently holds one, which is a format
-//! change and therefore a Phase 2 decision, not a Phase 1 improvisation.
+//! So [`Manifest::seal`] returns the ordered [`Blob`] list
+//! [`crate::sync::chunk::seal_all`] produced, [`Root::manifest_chunks`] holds
+//! their ids in that order, and [`Manifest::open`] goes back through
+//! [`crate::sync::chunk::reassemble`], which rechecks every chunk against the id
+//! it was served under before a byte of it is parsed. The index object shares
+//! those helpers and is therefore unbounded in the same way — no bundle-sized
+//! object in this format has to fit in one chunk.
 //!
-//! Owned by plan 1-04.
+//! Owned by plan 1-04, split across chunks by plan 1-09.
 
 use std::collections::HashSet;
 
@@ -54,11 +63,11 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::error::{AppError, Result};
-use crate::sync::chunk::{open_chunk, seal_chunk};
+use crate::sync::chunk::{Blob, reassemble, seal_all};
 use crate::sync::crypto::{ChunkId, KdfParams, Keys};
 use crate::sync::{
-    CHUNK_SIZE, CHUNKER_ID, INDEX_VERSION, MANIFEST_VERSION, MAX_SUPPORTED_INDEX,
-    MAX_SUPPORTED_MANIFEST, MAX_SUPPORTED_ROOT, ROOT_VERSION, check_version,
+    CHUNKER_ID, INDEX_VERSION, MANIFEST_VERSION, MAX_SUPPORTED_INDEX, MAX_SUPPORTED_MANIFEST,
+    MAX_SUPPORTED_ROOT, ROOT_VERSION, check_version,
 };
 
 /// Every chunker this build knows how to read.
@@ -101,36 +110,35 @@ fn probe_version(json: &[u8], ceiling: u32, object: &str) -> Result<()> {
     check_version(probe.format, ceiling, object)
 }
 
-/// Serialize to JSON and seal it as an ordinary chunk.
+/// Serialize to JSON and seal it as ordinary chunks, in order.
 ///
-/// No compression here: [`seal_chunk`] already runs zstd inside the frame, and
+/// No compression here: [`seal_all`] already runs zstd inside each frame, and
 /// compressing twice costs CPU for nothing while adding a second determinism
 /// surface to keep byte-stable.
-fn seal_object<T: Serialize>(keys: &Keys, value: &T, object: &str) -> Result<(ChunkId, Vec<u8>)> {
+///
+/// Small objects still seal to exactly one chunk — [`seal_all`] splits only when
+/// the JSON actually exceeds one — so nothing pays for the general case.
+fn seal_object<T: Serialize>(keys: &Keys, value: &T, object: &str) -> Result<Vec<Blob>> {
     let json = Zeroizing::new(
         serde_json::to_vec(value)
             .map_err(|_| AppError::Other(format!("{object} serialization failed")))?,
     );
-    if json.len() > CHUNK_SIZE {
-        return Err(AppError::Other(format!(
-            "this {object} serializes to {} bytes, past the {CHUNK_SIZE}-byte single-chunk \
-             limit — splitting a {object} across chunks is not implemented",
-            json.len()
-        )));
-    }
-    let blob = seal_chunk(keys, &json)?;
-    Ok((blob.id, blob.ciphertext))
+    seal_all(keys, &json)
 }
 
-/// Open a sealed object: AEAD tag, id recheck, version ceiling, then the shape.
+/// Open a sealed object: per-chunk AEAD tag and id recheck, reassembly in the
+/// order given, version ceiling, then the shape.
+///
+/// A failure anywhere returns no object at all rather than a partial one, which
+/// is what makes a reordered or truncated chunk list read as an error instead of
+/// as a shorter manifest.
 fn open_object<T: DeserializeOwned>(
     keys: &Keys,
-    id: &ChunkId,
-    ciphertext: &[u8],
+    chunks: &[(ChunkId, Vec<u8>)],
     ceiling: u32,
     object: &str,
 ) -> Result<T> {
-    let json = open_chunk(keys, id, ciphertext)?;
+    let json = reassemble(keys, chunks)?;
     probe_version(&json, ceiling, object)?;
     serde_json::from_slice(&json).map_err(|_| AppError::Other(format!("{object} is malformed")))
 }
@@ -176,26 +184,27 @@ impl Manifest {
         }
     }
 
-    /// Seal to `(id, ciphertext)`. The id is what [`Root::manifest_id`] names.
-    pub fn seal(&self, keys: &Keys) -> Result<(ChunkId, Vec<u8>)> {
+    /// Seal into one chunk or several, in order. Their ids, in that order, are
+    /// what [`Root::manifest_chunks`] names.
+    pub fn seal(&self, keys: &Keys) -> Result<Vec<Blob>> {
         seal_object(keys, self, "manifest")
     }
 
-    /// Open the manifest `id` names, refusing a version above this build's
-    /// ceiling and a chunker it does not know.
-    pub fn open(keys: &Keys, id: &ChunkId, ciphertext: &[u8]) -> Result<Manifest> {
-        Self::open_with_ceiling(keys, id, ciphertext, MAX_SUPPORTED_MANIFEST)
+    /// Open the manifest [`Root::manifest_chunks`] names, in that order,
+    /// refusing a version above this build's ceiling and a chunker it does not
+    /// know.
+    pub fn open(keys: &Keys, chunks: &[(ChunkId, Vec<u8>)]) -> Result<Manifest> {
+        Self::open_with_ceiling(keys, chunks, MAX_SUPPORTED_MANIFEST)
     }
 
     /// The ceiling as a parameter, following the same seam as [`KdfParams`]:
     /// nothing below this line reads a constant it could instead be handed.
     fn open_with_ceiling(
         keys: &Keys,
-        id: &ChunkId,
-        ciphertext: &[u8],
+        chunks: &[(ChunkId, Vec<u8>)],
         ceiling: u32,
     ) -> Result<Manifest> {
-        let manifest: Manifest = open_object(keys, id, ciphertext, ceiling, "manifest")?;
+        let manifest: Manifest = open_object(keys, chunks, ceiling, "manifest")?;
         check_chunker(&manifest.chunker)?;
         Ok(manifest)
     }
@@ -248,12 +257,16 @@ impl IndexObject {
         }
     }
 
-    pub fn seal(&self, keys: &Keys) -> Result<(ChunkId, Vec<u8>)> {
+    /// Sealed the same way a manifest is, and for the same reason: one entry per
+    /// chunk in the bundle puts a large snapshot's index past [`CHUNK_SIZE`] too.
+    ///
+    /// [`CHUNK_SIZE`]: crate::sync::CHUNK_SIZE
+    pub fn seal(&self, keys: &Keys) -> Result<Vec<Blob>> {
         seal_object(keys, self, "index object")
     }
 
-    pub fn open(keys: &Keys, id: &ChunkId, ciphertext: &[u8]) -> Result<IndexObject> {
-        open_object(keys, id, ciphertext, MAX_SUPPORTED_INDEX, "index object")
+    pub fn open(keys: &Keys, chunks: &[(ChunkId, Vec<u8>)]) -> Result<IndexObject> {
+        open_object(keys, chunks, MAX_SUPPORTED_INDEX, "index object")
     }
 
     /// Linear scan. `ponytail:` fine at Phase 1 sizes; if a restore ever
@@ -274,13 +287,18 @@ impl IndexObject {
 /// A mismatch between the two copies is a signal worth reporting rather than
 /// silently preferring one: the keyfile wins, but the disagreement itself means
 /// somebody rewrote something.
+///
+/// `manifest_chunks` is ordered and is the only place the manifest's chunk order
+/// is recorded. It is a list rather than a single id because a real bundle's
+/// manifest does not fit in one chunk — and it lives here, inside the root's
+/// sealed plaintext, so reordering it is not something a hostile remote can do.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Root {
     pub format: u32,
     pub counter: u64,
     pub created_at: DateTime<Utc>,
     pub repo_id: String,
-    pub manifest_id: ChunkId,
+    pub manifest_chunks: Vec<ChunkId>,
     pub chunker: String,
     pub kdf: KdfParams,
 }
@@ -293,7 +311,7 @@ impl Root {
         counter: u64,
         now: DateTime<Utc>,
         repo_id: String,
-        manifest_id: ChunkId,
+        manifest_chunks: Vec<ChunkId>,
         kdf: KdfParams,
     ) -> Self {
         Self {
@@ -301,7 +319,7 @@ impl Root {
             counter,
             created_at: now,
             repo_id,
-            manifest_id,
+            manifest_chunks,
             chunker: CHUNKER_ID.to_string(),
             kdf,
         }
@@ -371,6 +389,12 @@ mod tests {
         ChunkId::from_bytes([n; 32])
     }
 
+    /// What a reader following a root's `manifest_chunks` list would fetch and
+    /// hand to `open`: the `(id, ciphertext)` pairs, in order.
+    fn served(blobs: &[Blob]) -> Vec<(ChunkId, Vec<u8>)> {
+        blobs.iter().map(|b| (b.id, b.ciphertext.clone())).collect()
+    }
+
     fn three_files() -> Vec<FileEntry> {
         vec![
             FileEntry {
@@ -400,9 +424,10 @@ mod tests {
     fn a_three_file_manifest_seals_and_reopens_identically() {
         let keys = keys();
         let manifest = Manifest::new(three_files());
-        let (id, ciphertext) = manifest.seal(&keys).expect("seal");
+        let blobs = manifest.seal(&keys).expect("seal");
+        assert_eq!(blobs.len(), 1, "a small manifest must not be split");
         assert_eq!(
-            Manifest::open(&keys, &id, &ciphertext).expect("open"),
+            Manifest::open(&keys, &served(&blobs)).expect("open"),
             manifest
         );
     }
@@ -410,23 +435,32 @@ mod tests {
     #[test]
     fn a_manifest_opened_under_the_wrong_id_is_refused() {
         let keys = keys();
-        let (id, ciphertext) = Manifest::new(three_files()).seal(&keys).expect("seal");
-        let mut wrong = *id.as_bytes();
+        let blobs = Manifest::new(three_files()).seal(&keys).expect("seal");
+        let mut chunks = served(&blobs);
+        let mut wrong = *chunks[0].0.as_bytes();
         wrong[0] ^= 1;
-        let wrong = ChunkId::from_bytes(wrong);
-        assert!(Manifest::open(&keys, &wrong, &ciphertext).is_err());
+        chunks[0].0 = ChunkId::from_bytes(wrong);
+        assert!(Manifest::open(&keys, &chunks).is_err());
     }
 
     #[test]
-    fn a_manifest_written_by_an_older_client_opens_when_the_ceiling_is_raised() {
+    fn a_manifest_below_the_ceiling_opens_and_the_ceiling_may_be_raised() {
         let keys = keys();
-        let manifest = Manifest::new(three_files());
-        assert_eq!(manifest.format, 1);
-        let (id, ciphertext) = manifest.seal(&keys).expect("seal");
-        // A future build with MAX_SUPPORTED_MANIFEST = 2 must still read this
-        // v1 bundle. Equality against the current version would break it.
-        let reopened = Manifest::open_with_ceiling(&keys, &id, &ciphertext, 2).expect("open");
-        assert_eq!(reopened, manifest);
+
+        // An older client's manifest still opens under today's ceiling…
+        let mut older = Manifest::new(three_files());
+        older.format = MAX_SUPPORTED_MANIFEST - 1;
+        let blobs = older.seal(&keys).expect("seal");
+        assert_eq!(Manifest::open(&keys, &served(&blobs)).expect("open"), older);
+
+        // …and today's manifest still opens on a future build whose ceiling is
+        // higher. An equality check against the current version breaks both
+        // directions, which is the whole reason the rule is at-or-below.
+        let today = Manifest::new(three_files());
+        let blobs = today.seal(&keys).expect("seal");
+        let raised = MAX_SUPPORTED_MANIFEST + 1;
+        let reopened = Manifest::open_with_ceiling(&keys, &served(&blobs), raised).expect("open");
+        assert_eq!(reopened, today);
     }
 
     #[test]
@@ -437,8 +471,8 @@ mod tests {
             chunker: CHUNKER_ID.to_string(),
             files: three_files(),
         };
-        let (id, ciphertext) = future.seal(&keys).expect("seal");
-        let err = Manifest::open(&keys, &id, &ciphertext).expect_err("must refuse");
+        let blobs = future.seal(&keys).expect("seal");
+        let err = Manifest::open(&keys, &served(&blobs)).expect_err("must refuse");
         assert!(err.to_string().contains("upgrade ai-usagebar"));
     }
 
@@ -450,32 +484,41 @@ mod tests {
             chunker: "rolling-cdc-v9".into(),
             files: three_files(),
         };
-        let (id, ciphertext) = odd.seal(&keys).expect("seal");
-        let err = Manifest::open(&keys, &id, &ciphertext).expect_err("must refuse");
+        let blobs = odd.seal(&keys).expect("seal");
+        let err = Manifest::open(&keys, &served(&blobs)).expect_err("must refuse");
         assert!(err.to_string().contains("rolling-cdc-v9"));
     }
 
     #[test]
-    fn the_sealed_manifest_carries_no_file_path_in_the_clear() {
+    fn no_sealed_manifest_chunk_carries_a_file_path_in_the_clear() {
         let keys = keys();
-        let (_, ciphertext) = Manifest::new(three_files()).seal(&keys).expect("seal");
+        // A multi-chunk manifest, so the check covers every chunk rather than
+        // only the first one.
+        let mut files = three_files();
+        files.extend(many_files(4_000));
+        let blobs = Manifest::new(files).seal(&keys).expect("seal");
+        assert!(blobs.len() > 1, "the fixture must span several chunks");
+
         for needle in [
             b".credentials.json".as_slice(),
             b"config.toml".as_slice(),
             b"history.jsonl".as_slice(),
+            b".claude/projects".as_slice(),
         ] {
-            assert!(
-                !ciphertext.windows(needle.len()).any(|w| w == needle),
-                "a file path leaked into the sealed manifest"
-            );
+            for blob in &blobs {
+                assert!(
+                    !blob.ciphertext.windows(needle.len()).any(|w| w == needle),
+                    "a file path leaked into a sealed manifest chunk"
+                );
+            }
         }
     }
 
     #[test]
     fn the_chunker_reads_back_as_the_constant_this_build_writes() {
         let keys = keys();
-        let (id, ciphertext) = Manifest::new(three_files()).seal(&keys).expect("seal");
-        let reopened = Manifest::open(&keys, &id, &ciphertext).expect("open");
+        let blobs = Manifest::new(three_files()).seal(&keys).expect("seal");
+        let reopened = Manifest::open(&keys, &served(&blobs)).expect("open");
         assert_eq!(reopened.chunker, "fixed-256k");
         assert_eq!(reopened.chunker, CHUNKER_ID);
     }
@@ -492,26 +535,69 @@ mod tests {
             true_len: 900_000,
             chunks: vec![id(1), id(2), id(3), id(4)],
         }]);
-        let (manifest_id, ciphertext) = ordered.seal(&keys).expect("seal");
+        let blobs = ordered.seal(&keys).expect("seal");
+        let honest = served(&blobs);
 
         let mut transposed = ordered.clone();
         transposed.files[0].chunks.swap(1, 2);
-        let (evil_id, evil_ciphertext) = transposed.seal(&keys).expect("seal");
+        let evil = served(&transposed.seal(&keys).expect("seal"));
 
         // Re-sealing a reordered list produces a *different* address, so the
-        // root that names `manifest_id` never points at it...
-        assert_ne!(evil_id, manifest_id);
-        // ...and serving it under the original id fails outright.
-        assert!(Manifest::open(&keys, &manifest_id, &evil_ciphertext).is_err());
+        // root that names the honest ids never points at it...
+        assert_ne!(evil[0].0, honest[0].0);
+        // ...and serving its bytes under the honest id fails outright.
+        let mut swapped_in = honest.clone();
+        swapped_in[0].1 = evil[0].1.clone();
+        assert!(Manifest::open(&keys, &swapped_in).is_err());
 
         // Editing the ordered list in place breaks the tag just as hard.
-        let mut flipped = ciphertext.clone();
-        flipped[0] ^= 1;
-        assert!(Manifest::open(&keys, &manifest_id, &flipped).is_err());
+        let mut flipped = honest.clone();
+        flipped[0].1[0] ^= 1;
+        assert!(Manifest::open(&keys, &flipped).is_err());
 
         // And the honest manifest still opens with its order intact.
-        let reopened = Manifest::open(&keys, &manifest_id, &ciphertext).expect("open");
+        let reopened = Manifest::open(&keys, &honest).expect("open");
         assert_eq!(reopened.files[0].chunks, vec![id(1), id(2), id(3), id(4)]);
+    }
+
+    /// The same requirement one level up: the *manifest's own* chunk order lives
+    /// in `Root.manifest_chunks`, so the attack has to happen after the root is
+    /// sealed — which is exactly what it cannot do. 1-06 Attack 8 asserts this
+    /// shape.
+    #[test]
+    fn transposing_manifest_chunks_after_the_root_is_sealed_yields_zero_entries() {
+        let keys = keys();
+        let manifest = Manifest::new(many_files(1_600));
+        let blobs = manifest.seal(&keys).expect("seal");
+        assert!(blobs.len() > 1, "the fixture must span several chunks");
+
+        let ordered: Vec<ChunkId> = blobs.iter().map(|b| b.id).collect();
+        let framed = Root::new(
+            7,
+            fixed_time(),
+            "usagebar-sync-abc123".into(),
+            ordered.clone(),
+            KdfParams::default(),
+        )
+        .seal(&keys)
+        .expect("seal");
+
+        // The list is inside the root's sealed plaintext: transposing two ids
+        // means re-sealing the root, which needs the key. Served under the
+        // original root ciphertext, the order comes back exactly as written.
+        assert_eq!(
+            Root::open(&keys, &framed).expect("open").manifest_chunks,
+            ordered
+        );
+
+        // And if a reader did follow a reordered list, reassembly hands back an
+        // error rather than a manifest — `Result` carries no `Manifest`, so
+        // "zero entries" is structural, not a length check.
+        let mut reordered = served(&blobs);
+        reordered.swap(0, 1);
+        let err = Manifest::open(&keys, &reordered).expect_err("must refuse");
+        assert!(err.to_string().contains("manifest is malformed"));
+        assert!(!err.to_string().contains(".claude/projects"));
     }
 
     #[test]
@@ -524,10 +610,17 @@ mod tests {
         assert!(manifest.missing_chunks(&all).is_empty());
     }
 
+    /// Entries shaped like the ones the measurement in the module doc came from:
+    /// project-scoped chat-session-index paths, one chunk each. A fixture built
+    /// from short synthetic paths seals far smaller than the real thing and would
+    /// let a size test pass without ever exercising a split.
     fn many_files(n: u32) -> Vec<FileEntry> {
         (0..n)
             .map(|i| FileEntry {
-                path: format!("chat-sessions/2026-08-19/session-{i:06}.jsonl"),
+                path: format!(
+                    ".claude/projects/-Users-someone-src-a-project-with-a-fairly-long-name/\
+                     0199f{i:03x}-4a1b-7c2d-9e3f-{i:012x}.jsonl"
+                ),
                 mode: 0o600,
                 true_len: 4096,
                 chunks: vec![id((i % 251) as u8)],
@@ -535,30 +628,75 @@ mod tests {
             .collect()
     }
 
+    /// Guards the fixture itself: the size tests below are only meaningful while
+    /// one entry costs roughly what a real one does (~290 bytes, from a measured
+    /// 1,558-entry / 448 KiB default bundle).
+    #[test]
+    fn the_many_files_fixture_matches_the_measured_bundles_bytes_per_entry() {
+        let bytes = serde_json::to_vec(&Manifest::new(many_files(1_600)))
+            .expect("serialize")
+            .len();
+        let per_entry = bytes / 1_600;
+        assert!(
+            (150..400).contains(&per_entry),
+            "one entry serializes to {per_entry} bytes, far from a real bundle's ~290"
+        );
+    }
+
     #[test]
     fn a_thousand_file_manifest_still_fits_in_one_chunk_and_round_trips() {
         let keys = keys();
         let manifest = Manifest::new(many_files(1_000));
-        let (id, ciphertext) = manifest.seal(&keys).expect("seal");
+        let blobs = manifest.seal(&keys).expect("seal");
+        assert_eq!(blobs.len(), 1, "this one really does fit in a single chunk");
         assert_eq!(
-            Manifest::open(&keys, &id, &ciphertext).expect("open"),
+            Manifest::open(&keys, &served(&blobs)).expect("open"),
             manifest
         );
     }
 
-    /// The Phase 2 boundary, exercised now rather than discovered later: a
-    /// realistic chat-session-index manifest does not fit in one chunk, and the
-    /// refusal says so by name instead of truncating.
+    /// The measured default bundle on this milestone's target machine: 1,558
+    /// entries, 448 KiB, against a 256 KiB chunk. Before 1-09 this could not
+    /// seal at all — the *default* configuration was unshippable.
     #[test]
-    fn a_four_thousand_file_manifest_exceeds_one_chunk_and_is_refused_by_name() {
+    fn the_default_bundles_manifest_spans_several_chunks_and_round_trips() {
         let keys = keys();
-        let manifest = Manifest::new(many_files(4_000));
+        let manifest = Manifest::new(many_files(1_600));
+        let blobs = manifest.seal(&keys).expect("seal");
         assert!(
-            serde_json::to_vec(&manifest).expect("serialize").len() > CHUNK_SIZE,
-            "the fixture must actually exceed one chunk for this test to mean anything"
+            blobs.len() > 1,
+            "the fixture must actually be split, or this test passes vacuously"
         );
-        let err = manifest.seal(&keys).expect_err("must refuse");
-        assert!(err.to_string().contains("single-chunk"));
+        assert_eq!(
+            Manifest::open(&keys, &served(&blobs)).expect("open"),
+            manifest
+        );
+    }
+
+    /// The same bundle with transcripts enabled — the case 1-04 assumed was the
+    /// only one that mattered.
+    #[test]
+    fn a_fifty_seven_hundred_file_manifest_round_trips() {
+        let keys = keys();
+        let manifest = Manifest::new(many_files(5_700));
+        let blobs = manifest.seal(&keys).expect("seal");
+        assert!(blobs.len() > 2, "several chunks, not merely two");
+        assert_eq!(
+            Manifest::open(&keys, &served(&blobs)).expect("open"),
+            manifest
+        );
+    }
+
+    /// A truncated chunk list is a detected error, never a shorter manifest —
+    /// the same reason `missing_chunks` exists one layer down.
+    #[test]
+    fn dropping_the_last_manifest_chunk_is_refused_rather_than_read_short() {
+        let keys = keys();
+        let blobs = Manifest::new(many_files(1_600)).seal(&keys).expect("seal");
+        let mut truncated = served(&blobs);
+        truncated.pop();
+        assert!(Manifest::open(&keys, &truncated).is_err());
+        assert!(Manifest::open(&keys, &[]).is_err());
     }
 
     // ---- snapshot root --------------------------------------------------
@@ -568,7 +706,7 @@ mod tests {
             7,
             fixed_time(),
             "usagebar-sync-abc123".into(),
-            id(9),
+            vec![id(9), id(10), id(11)],
             KdfParams::default(),
         )
     }
@@ -580,7 +718,7 @@ mod tests {
         let reopened = Root::open(&keys, &root.seal(&keys).expect("seal")).expect("open");
         assert_eq!(reopened, root);
         assert_eq!(reopened.counter, 7);
-        assert_eq!(reopened.manifest_id, id(9));
+        assert_eq!(reopened.manifest_chunks, vec![id(9), id(10), id(11)]);
         assert_eq!(reopened.chunker, CHUNKER_ID);
         assert_eq!(reopened.kdf, KdfParams::default());
         assert_eq!(reopened.created_at, fixed_time());
@@ -668,8 +806,8 @@ mod tests {
             ],
             vec![id(50), id(51)],
         );
-        let (chunk_id, ciphertext) = index.seal(&keys).expect("seal");
-        let reopened = IndexObject::open(&keys, &chunk_id, &ciphertext).expect("open");
+        let blobs = index.seal(&keys).expect("seal");
+        let reopened = IndexObject::open(&keys, &served(&blobs)).expect("open");
         assert_eq!(reopened, index);
         assert_eq!(reopened.supersedes, vec![id(50), id(51)]);
 
@@ -689,8 +827,34 @@ mod tests {
             entries: vec![],
             supersedes: vec![],
         };
-        let (chunk_id, ciphertext) = future.seal(&keys).expect("seal");
-        let err = IndexObject::open(&keys, &chunk_id, &ciphertext).expect_err("must refuse");
+        let blobs = future.seal(&keys).expect("seal");
+        let err = IndexObject::open(&keys, &served(&blobs)).expect_err("must refuse");
         assert!(err.to_string().contains("upgrade ai-usagebar"));
+    }
+
+    /// The index has one entry per chunk in the bundle, so it outgrows a single
+    /// chunk for the same reason the manifest does. It shares the helpers, so it
+    /// gets the split for free — this pins that it actually works.
+    #[test]
+    fn a_bundle_sized_index_object_spans_several_chunks_and_round_trips() {
+        let keys = keys();
+        let index = IndexObject::new(
+            (0..4_000)
+                .map(|i| IndexEntry {
+                    id: id((i % 251) as u8),
+                    pack: id(200),
+                    offset: i as u64 * 4_096,
+                    clen: 4_096,
+                    true_len: 3_000,
+                })
+                .collect(),
+            vec![id(50)],
+        );
+        let blobs = index.seal(&keys).expect("seal");
+        assert!(blobs.len() > 1, "the fixture must span several chunks");
+        assert_eq!(
+            IndexObject::open(&keys, &served(&blobs)).expect("open"),
+            index
+        );
     }
 }

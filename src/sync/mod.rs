@@ -55,14 +55,19 @@ pub const KEYFILE_VERSION: u32 = 1;
 pub const MAX_SUPPORTED_KEYFILE: u32 = 1;
 
 /// Manifest version written by this build.
-pub const MANIFEST_VERSION: u32 = 1;
+///
+/// v2 carries the manifest across as many chunks as it needs; v1 assumed one.
+pub const MANIFEST_VERSION: u32 = 2;
 /// Highest manifest version this build can read.
-pub const MAX_SUPPORTED_MANIFEST: u32 = 1;
+pub const MAX_SUPPORTED_MANIFEST: u32 = 2;
 
 /// Snapshot-root version written by this build.
-pub const ROOT_VERSION: u32 = 1;
+///
+/// v2 names the manifest with an ordered list of chunk ids; v1 named a single
+/// id, which could not express a manifest past [`CHUNK_SIZE`].
+pub const ROOT_VERSION: u32 = 2;
 /// Highest snapshot-root version this build can read.
-pub const MAX_SUPPORTED_ROOT: u32 = 1;
+pub const MAX_SUPPORTED_ROOT: u32 = 2;
 
 /// Index-object version written by this build.
 pub const INDEX_VERSION: u32 = 1;
