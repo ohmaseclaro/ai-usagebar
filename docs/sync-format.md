@@ -1,0 +1,612 @@
+# Encrypted sync bundle format
+
+The on-disk format ai-usagebar uses to push local state to a git remote it
+treats as fully hostile. Everything is encrypted before it leaves the machine;
+the remote holds ciphertext, sizes, and timings, and nothing else.
+
+This document is the format, not a tour of the code. Someone holding only this
+page should be able to write a reader. Where a number or a context string is
+load-bearing it is spelled out exactly — a re-implementation that gets one of
+them wrong produces a bundle that authenticates against nothing.
+
+The implementation lives in `src/sync/`, one module per concern, and
+`src/sync/crypto.rs` is the only file in it that imports a cryptographic crate.
+
+Primitives: **Argon2id** (RFC 9106), **XChaCha20-Poly1305**, **BLAKE3**
+(`keyed_hash` and `derive_key`), **zstd** level 3.
+
+---
+
+## 1. Key hierarchy
+
+```text
+    password + salt (16 random bytes, stored in the keyfile)
+        |  Argon2id  m = 1 GiB  t = 3  p = 1  ->  32 bytes
+    KEK [32B]                                   ephemeral, zeroized after use
+        |  XChaCha20-Poly1305 unwrap
+        |  aad = canonical JSON of {format, kdf}
+    master key [32B]                            random at init, never on disk
+        |  BLAKE3 derive_key, one context string each
+    chunk_key            name_key            root_key
+```
+
+The master key is 32 bytes straight from the OS CSPRNG, drawn once when the
+bundle is initialised. It is never written down in the clear: the keyfile holds
+only its wrapped form. The password never touches anything but Argon2id.
+
+**Argon2id parameters.** Algorithm `Argon2id`, version `0x13` (19), memory
+`m_kib = 1048576` (1 GiB), time `t = 3`, lanes `p = 1`, 32 bytes of output.
+
+`p = 1` is deliberate and is not a portability compromise: the `argon2` 0.5.3
+crate has no threading, so raising `p` does not make the defender's derivation
+any faster — it measured about 10% *worse* — while it hands an attacker with
+wide SIMD free intra-hash parallelism. One lane is the honest setting for a
+single-threaded implementation.
+
+**The three subkeys**, each `blake3::derive_key(context, master_key)`:
+
+| Subkey | Context string | Used for |
+|---|---|---|
+| `chunk_key` | `ai-usagebar.sync.v1 chunk-encryption-key` | sealing and opening every chunk |
+| `name_key` | `ai-usagebar.sync.v1 chunk-name-key` | the keyed hash that addresses a chunk |
+| `root_key` | `ai-usagebar.sync.v1 snapshot-root-key` | sealing and opening the snapshot root |
+
+A fourth context string, `ai-usagebar.sync.v1 chunk-nonce`, is **not** a subkey:
+it is applied to a chunk's (public) id to derive that chunk's nonce, and is
+listed here because a reader needs it. The `v1` token in all four is
+load-bearing — a future v2 hierarchy must not be able to collide with v1's.
+
+**The KDF parameters are bound as associated data**, which is what makes a
+downgrade fail rather than succeed weakly. The AAD for the master-key wrap is
+the JSON serialization of a two-field struct, in declaration order:
+
+```json
+{"format":1,"kdf":{"algo":"argon2id","version":19,"m_kib":1048576,"t":3,"p":1,"salt":"<base64>"}}
+```
+
+An attacker who rewrites `m_kib` to 8 in transit gets a victim who derives a
+cheap KEK — and that KEK is not the one the master key was wrapped under,
+because the AAD no longer matches. The unwrap fails. It fails with the same
+message a wrong password gets (`wrong password or corrupted keyfile`), because
+there is nothing useful to distinguish and nothing an attacker should learn from
+the difference.
+
+A reader must use the parameters **stored in the keyfile it is opening**, never
+its own compiled default. A bundle initialised at a lower `--kdf-memory` stays
+openable; one initialised higher stays strong.
+
+---
+
+## 2. The keyfile
+
+JSON. Holds no plaintext key material — the wrapped key is ciphertext and the
+salt is public — so it is safe to store beside the bundle.
+
+```json
+{
+  "format": 1,
+  "kdf": {
+    "algo": "argon2id",
+    "version": 19,
+    "m_kib": 1048576,
+    "t": 3,
+    "p": 1,
+    "salt": "PhRZ9m0k4iCWr7YyE1x2Aw=="
+  },
+  "nonce": "0zP9m…24 bytes…",
+  "wrapped_master_key": "Qk1…48 bytes…"
+}
+```
+
+| Field | Type | Encoding |
+|---|---|---|
+| `format` | u32 | keyfile format version — 1 |
+| `kdf.algo` | string | `"argon2id"` |
+| `kdf.version` | u32 | Argon2 version, `19` (0x13) |
+| `kdf.m_kib` | u32 | memory cost in KiB |
+| `kdf.t` | u32 | time cost (passes) |
+| `kdf.p` | u32 | lanes |
+| `kdf.salt` | string | base64 (standard alphabet, padded) of 16 random bytes |
+| `nonce` | string | base64 of the 24-byte XChaCha20 wrap nonce |
+| `wrapped_master_key` | string | base64 of 48 bytes — 32 ciphertext + 16 Poly1305 tag |
+
+Field order in the `kdf` object is the canonical AAD byte order. It is
+serialized as a struct rather than a map for exactly that reason: an AAD whose
+bytes depend on hash iteration order is an AAD that intermittently fails to
+authenticate.
+
+The version gate runs *before* any cryptographic work. Refusing a bundle from a
+newer client must not cost a gibibyte and a second and a half first.
+
+---
+
+## 3. Chunking
+
+Each file is split at fixed **256 KiB** boundaries from its own offset zero,
+plus a shorter explicit tail when the length is not a multiple. Offsets are
+aligned to the start of *each file*, never across a concatenation of files — a
+change to one small file must not re-chunk anything else.
+
+Fixed-size, not content-defined. CDC boundary positions are visible as
+ciphertext lengths and fingerprint the plaintext (arXiv:2504.02095), and the
+payload here is append-only JSONL and page-aligned SQLite, which fixed blocks
+dedup just as well. The chunker is identified in the format as `fixed-256k`.
+
+### The chunk id addresses the raw plaintext
+
+```text
+id = blake3::keyed_hash(name_key, plaintext)      // 32 bytes, hex-encoded when serialized
+```
+
+Computed **before** framing or compression ever touches the bytes. Two
+properties, both of which a later "optimisation" would happily undo:
+
+- **It hashes the plaintext, not the compressed frame.** Hashing the frame would
+  tie every chunk id in every user's bundle to the zstd version. A routine crate
+  bump, or a change to its default window size or level tuning, would re-id
+  every chunk, force a full re-upload, and drop dedup to zero across the upgrade
+  boundary.
+- **It is keyed.** An unkeyed content hash lets anyone holding the repository
+  hash a guessed plaintext and check whether that chunk is present — a
+  confirmation-of-file oracle. Restic and Borg made opposite choices here; this
+  format takes Borg's, because keying costs nothing.
+
+The consequence of hashing plaintext is that two machines running different
+zstd versions may produce *different ciphertext* for the same id. That is
+harmless: both decrypt to identical plaintext, and the first upload wins.
+
+### Frame layout
+
+The bytes handed to the AEAD:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | `true_len`, u32 little-endian — the uncompressed size |
+| 4 | 4 | `comp_len`, u32 little-endian — the zstd frame size |
+| 8 | `comp_len` | the zstd level-3 frame |
+| … | rest | zero padding |
+
+Total length is `(8 + comp_len)` rounded up to the next power of two, capped at
+256 KiB, and never below `8 + comp_len` itself — so an incompressible chunk that
+zstd grows past the cap is left unpadded rather than truncated.
+
+- **Explicit `comp_len`** makes the padding unambiguous; decoding never guesses
+  where the zstd frame ends and the zeros begin.
+- **Padding after compression** is what actually hides a tail's length. Padding
+  first would let zstd collapse the zeros and hand the exact plaintext size
+  straight back out through the ciphertext length.
+
+### Sealing
+
+```text
+nonce      = blake3::derive_key("ai-usagebar.sync.v1 chunk-nonce", id)[..24]
+ciphertext = XChaCha20-Poly1305(key = chunk_key, nonce, aad = id, msg = frame)
+```
+
+Deterministic by construction: the nonce is a function of the id, which is a
+function of the plaintext. Identical plaintext therefore yields byte-identical
+ciphertext, which is what makes dedup work and what stops a re-sync of unchanged
+data from creating new remote objects forever. Two different plaintexts get two
+different ids and therefore two different nonces, so a nonce is never reused
+across distinct messages under `chunk_key`.
+
+Binding the id as associated data means a chunk served under the wrong name
+fails its tag.
+
+### Reading
+
+Open, unframe, then **recheck** that `keyed_hash(name_key, plaintext) == id`.
+The recheck cannot live in the AEAD layer: the id addresses the raw plaintext
+while the decryption returns its framed-and-compressed form. It is belt and
+braces on top of the tag, and it catches our own framing bugs as readily as an
+adversary.
+
+Both length fields are attacker-influenced right up until the tag verifies, and
+are range-checked anyway. A crafted frame must produce an error, never a panic
+and never an unbounded allocation: decompression allocates exactly `true_len`
+and fails if the frame expands past it, so no decompression bomb can be built
+out of a header that passes the bounds check.
+
+**Ordering is not a chunk-layer property.** A chunk carries no position, so
+transposing two whole `(id, ciphertext)` pairs cannot be detected here: each
+pair still decrypts cleanly and still hashes to its own id. Order lives in the
+manifest, and that is where it is defended — see §5.
+
+---
+
+## 4. Pack files
+
+The unit of transfer. Many sealed blobs concatenated into one remote object,
+followed by a sealed header describing them.
+
+```text
+<blob0 ciphertext><blob1 ciphertext>…<blobN ciphertext>
+<sealed header><32-byte header id><u32 LE header length>
+```
+
+Packing is not an optimisation. GitHub caps content creation at 80 requests per
+minute and 500 per hour, so one request per chunk is structurally impossible at
+a few thousand chunks; a handful of 32 MiB objects is not.
+
+**The header** is JSON, sealed through the ordinary chunk path — framed,
+compressed, and sealed under its own keyed chunk id:
+
+```json
+{"format":1,"entries":[{"id":"<64 hex>","offset":0,"clen":4112,"true_len":4096}]}
+```
+
+`offset` is a byte offset from the start of the pack, `clen` the ciphertext
+length to slice out, `true_len` the plaintext length the blob's frame declares.
+There is no path, no filename, and no directory structure anywhere in a pack
+header — local paths leak account UUIDs and session ids, and they live in the
+sealed manifest instead.
+
+**The header id is keyed, and it lives in the trailer.** Both halves matter:
+
+- *Keyed.* A pack header is a list of chunk ids anyone holding the repository
+  can already see, plus offsets and lengths he can measure against the file he
+  is looking at. It is the single most guessable object in the format. Sealing
+  it under an unkeyed content address would let him hash his guess and compare —
+  exactly the oracle keyed chunk ids exist to deny. **Nothing in this format is
+  ever sealed under an unkeyed address.**
+- *In the trailer, in the clear.* A reader needs that id *before* it can
+  decrypt, because the id derives the nonce and is bound as associated data.
+  Writing it down costs nothing — it is a keyed hash, so an attacker without
+  `name_key` cannot recompute it from the header he is staring at, and
+  substituting any other id simply breaks the tag. Without it the reader is not
+  merely slower, it is impossible to write.
+
+**Reading a pack**: take the last 4 bytes as the header length, the 32 before
+them as the header id, and the `header_length` bytes before *those* as the
+sealed header. Every number in that walk arrives from a hostile remote, so the
+declared header length must be checked against the pack's own length before a
+byte is allocated, and every entry's `offset + clen` must land inside the blob
+region — which ends where the sealed header begins. A header that fails any
+check returns no entries at all.
+
+**The pack's name** is `packs/<first two hex chars>/<full 64 hex>.pack`, where
+the hex is the **unkeyed** BLAKE3 hash of the finished pack bytes. This is the
+one use of an unkeyed address in the format, and it is naming only, over bytes
+that are already public ciphertext: it means a pack substituted on the remote
+cannot keep the name it is served under. Two-level fanout keeps any single
+listing far below GitHub's 3,000-entry directory width.
+
+**Sizes**: a writer aims for `PACK_TARGET` = 32 MiB and is sealed before a blob
+would carry it past `PACK_MAX` = 48 MiB. The 32 MiB comes from CAL-1's recorded
+fallback — see §7.
+
+A pack header is itself a single sealed chunk, so it is bounded at 256 KiB of
+JSON, some thousands of entries. A 32 MiB pack of 256 KiB chunks holds about
+128, so this is slack rather than a limit; unlike the manifest and the index, it
+has never been near its ceiling.
+
+**Packs are immutable once sealed.** A chunk already inside a pack is never
+re-packed; only an explicit prune-repack rewrites one. That immutability is what
+makes a crashed sync leave *orphan packs* — garbage to be collected later, never
+corruption.
+
+---
+
+## 5. The object graph
+
+```text
+root  --manifest_chunks-->  manifest  --FileEntry.chunks-->  chunks
+                                                              ^
+                             index object  --IndexEntry-------+
+                                            (chunk id -> pack, offset, clen)
+```
+
+Every hop's identifier is bound as associated data into the object it names, and
+rechecked against the plaintext after opening. Substituting a manifest or a
+chunk therefore fails its tag rather than quietly restoring something else.
+
+### Root — the one mutable object
+
+Sealed under `root_key` with a **fresh random 24-byte nonce**, stored inline as
+the first 24 bytes of the framed output, and a fixed literal as associated data:
+`ai-usagebar.sync.v1 root`. The framing is `nonce ‖ ciphertext ‖ tag`.
+
+This is the one place the deterministic-nonce rule is inverted, and deliberately:
+every other object's nonce is derived from its content address because identical
+plaintext *must* seal identically or dedup dies. The root's plaintext changes on
+every sync, and a content-derived nonce would publish whether two consecutive
+snapshots are identical. The root is the mutable entry point and so has no
+content address of its own — hence the fixed AAD literal.
+
+```json
+{
+  "format": 2,
+  "counter": 7,
+  "created_at": "2026-08-19T12:00:00Z",
+  "repo_id": "usagebar-sync-abc123",
+  "manifest_chunks": ["<64 hex>", "<64 hex>"],
+  "chunker": "fixed-256k",
+  "kdf": {"m_kib": 1048576, "t": 3, "p": 1}
+}
+```
+
+- `counter` is the monotonic snapshot counter the rollback anchor compares
+  against (§9).
+- `repo_id` pins the repository's identity *inside* the plaintext, so swapping
+  the whole repository for a different one is detectable on top of the wrong
+  keyfile simply failing to unwrap.
+- `chunker` and `kdf` are **informational duplicates**. The authoritative copy of
+  the KDF parameters is the keyfile's, where they are bound as associated data
+  and cannot be edited in transit. They are repeated here because the root is
+  the *first* object a reader touches, so an unknown chunker or an unsupported
+  KDF configuration can be refused before a single pack is fetched. If the two
+  copies disagree the keyfile wins — but the disagreement itself is worth
+  reporting, because it means somebody rewrote something.
+- `manifest_chunks` is ordered, and is the only place the manifest's chunk order
+  is recorded.
+
+### Manifest
+
+```json
+{
+  "format": 2,
+  "chunker": "fixed-256k",
+  "files": [
+    {"path": ".claude/.credentials.json", "mode": 384, "true_len": 812,
+     "chunks": ["<64 hex>"]}
+  ]
+}
+```
+
+`mode` is the Unix mode as an integer (`384` = `0o600`). `true_len` is the
+file's real length, which the sealed chunks do not carry — the last one is
+padded to a power of two, so its size reveals only a bucket.
+
+Paths, sizes, modes, and the whole directory shape are exactly the metadata a
+hostile remote would like, so the manifest is sealed like any other chunk and
+none of it sits in the clear beside the data it describes.
+
+**The manifest spans as many chunks as it needs.** It is serialized to JSON and
+handed to the ordinary chunker, which splits it at 256 KiB like anything else;
+`Root.manifest_chunks` holds the resulting ids in order, and a reader
+reassembles them through the same path — per-chunk tag, per-chunk id recheck,
+then parse.
+
+This is not a hypothetical generality. Each entry is a path, a mode, a length
+and a 64-hex id, about 294 bytes once the paths are real, and the *default*
+bundle measured on this milestone's target machine is 1,558 entries and 448 KiB
+— already 192 KiB past a single chunk. Enabling transcript sync takes it past
+5,700. Measured, at a representative 229 bytes per entry: 1,000 entries →
+224 KiB → 1 chunk; 1,600 → 358 KiB → 2 chunks; 5,700 → 1.25 MiB → 5 chunks.
+Compression does not rescue a single-chunk design, because the refusal is on the
+plaintext length handed to the framer, long before zstd sees it.
+
+**Ordering integrity is closed by construction, at both levels.** A file's
+chunk list sits inside the manifest's sealed plaintext, and the manifest's own
+chunk list sits inside the root's. Transposing either means re-sealing the
+container, which needs the key. Editing one in place breaks a Poly1305 tag;
+re-sealing a reordered list produces a *different* id, which the container does
+not name. A reader that somehow followed a reordered list gets an error and zero
+entries, never a silently scrambled restore.
+
+A referenced chunk that is absent is reported as missing, never skipped:
+concatenating whatever arrived would write a *shorter* credential file and call
+it a success.
+
+### Index object
+
+```json
+{
+  "format": 1,
+  "entries": [{"id": "<64 hex>", "pack": "<64 hex>", "offset": 0,
+               "clen": 4112, "true_len": 4096}],
+  "supersedes": ["<64 hex>"]
+}
+```
+
+The chunk-id → pack-location map, sealed exactly like the manifest and
+multi-chunk for the same reason — it carries one entry per chunk in the bundle,
+so at scale it is the *larger* of the two.
+
+`supersedes` names the index objects a repack replaced. Deletion follows that
+order: an index must stop referencing a pack **before** the pack is deleted, or
+a concurrent reader follows a pointer to nothing.
+
+---
+
+## 6. Versioning and evolution
+
+Every versioned object carries two numbers: the version this build **writes**,
+and the highest version it can **read**.
+
+| Object | Written | Read ceiling |
+|---|---|---|
+| keyfile | 1 | 1 |
+| snapshot root | 2 | 2 |
+| manifest | 2 | 2 |
+| index object | 1 | 1 |
+| pack header | 1 | 1 |
+
+The rule is **at or below the ceiling**, never equality:
+
+```text
+accept if found <= ceiling; refuse only found > ceiling
+```
+
+An equality check would mean a v2 client could not read a v1 bundle, which
+inverts the promise the versioning exists to keep — that the KDF parameters, the
+chunker, or the object shapes can be raised later without stranding bundles
+already written. This project has been bitten once by a format that could not
+evolve; a format that refuses its own past is the same mistake facing the other
+way.
+
+A refusal says plainly that the *client* is the old thing, not the data:
+"upgrade ai-usagebar to read it".
+
+The version is read by probing only the `format` field before deserializing the
+whole object. A newer object may carry required fields this build has never
+heard of, and full deserialization would fail with a confusing complaint about a
+missing field instead of the true problem.
+
+The chunker is checked the same way — **membership in a known set**, not
+equality with the one this build writes. A build that introduces a second
+chunker must still read the bundles it wrote with the first.
+
+---
+
+## 7. Calibrations
+
+### CAL-3 — Argon2id at the shipped parameters: measured
+
+Three runs, `m = 1 GiB / t = 3 / p = 1` and the two steps down, on:
+
+**Apple M3 Max, 36 GiB, macOS (Darwin 25.5.0), aarch64, `--release`, rustc 1.96.0.**
+
+| Memory | t | p | Run 1 | Run 2 | Run 3 |
+|---|---|---|---|---|---|
+| 1024 MiB | 3 | 1 | 1503 ms | 1492 ms | 1548 ms |
+| 512 MiB | 3 | 1 | 701 ms | 816 ms | 779 ms |
+| 256 MiB | 3 | 1 | 336 ms | 376 ms | 380 ms |
+
+Reproduce with the probe that produced them:
+
+```bash
+cargo test --release --test live -- --ignored --nocapture \
+    cal3_argon2id_timing_at_production_parameters
+```
+
+Cost is close to linear in the memory parameter, which is the useful part: a
+user who must halve `--kdf-memory` roughly halves both the wait and the
+attacker's cost per guess, and can make that trade knowingly.
+
+**No aarch64 Linux measurement was obtained.** The roadmap wanted one on a slow
+aarch64 Linux box, and no such machine was reachable during this phase; a Linux
+VM on this same M3 Max silicon would have answered a question nobody asked and
+risked being read as a clearance for slow hardware. The documented fallback
+applies unchanged: `m = 1 GiB` stays the default, the parameters travel in the
+keyfile and are settable at initialisation, and a machine that cannot afford the
+working set gets an actionable refusal naming `--kdf-memory` rather than an OOM
+kill. Scaling the table above, a target four times slower than this one derives
+in about 6 s at 1 GiB and about 1.5 s at 256 MiB.
+
+The research figure this phase set out to check was 1582 ms on an M3 Max; the
+implementation measures 1492–1548 ms on the same class of machine, so the
+estimate was sound. It remains an M3 Max number, and every consumer of it should
+treat it as the fast end of the range.
+
+### CAL-1 — does a private-repo release asset honour `Range:`? Not measured
+
+**This was not run.** It needs a GitHub token and a throwaway private repository
+with a release asset over 1 MiB — credentials this phase deliberately does not
+have, since everything else in it is pure and offline.
+
+The fallback is the recorded answer and it is a *fallback*, not a measurement:
+assume ranged reads are **not** honoured, and pack at 32 MiB, which is where the
+waste of fetching a whole pack to read one chunk stays tolerable. That value is
+already baked into `PACK_TARGET`, so nothing is blocked by the probe being
+unrun; if it later comes back `206 Partial Content`, a future phase may raise
+the pack target and nothing else in the format changes.
+
+The probe is written and waiting in `tests/live.rs` as
+`cal1_range_on_private_release_asset`. It skips with a printed message when its
+token variable is absent, so it is never a hard failure:
+
+```bash
+GSD_CAL1_TOKEN=<fine-grained read-only PAT> \
+GSD_CAL1_REPO=owner/throwaway-repo \
+GSD_CAL1_ASSET=payload.bin \
+  cargo test --test live -- --ignored --nocapture \
+    cal1_range_on_private_release_asset
+```
+
+Delete the throwaway repository and revoke the token afterwards.
+
+---
+
+## 8. What this format does not hide
+
+Encryption hides contents. It does not hide the shape of the traffic, and this
+design accepts that rather than pretending otherwise. Anyone who can see the
+objects — the hosting service, anyone who forks the repository, anyone who later
+gets into the account — learns:
+
+- **Total bundle size**, to within the padding of its last chunks.
+- **When each sync happened**, from commit or object timestamps.
+- **How much changed per sync**, from the number and size of new packs. A day of
+  heavy work and a day of none look different.
+- **Roughly how many chunks exist**, and therefore roughly how much data.
+
+Hiding any of that would need constant-rate cover traffic — uploading a fixed
+volume on a fixed schedule whether or not anything changed. That is absurd for a
+usage-monitor's state backup, so it is a decision, not an oversight.
+
+What *is* mitigated, and worth knowing is not accidental:
+
+- **Chunk ids are keyed**, so possession of the repository does not let anyone
+  confirm that a guessed file is present.
+- **Tails are padded to a power of two** after compression, so a sealed size
+  names a bucket rather than an exact length.
+- **The manifest is sealed and carries no paths in the clear**, and pack headers
+  carry no names at all — so the directory structure, the file names, and the
+  account UUIDs and session ids embedded in them stay hidden.
+
+---
+
+## 9. Honest limits
+
+**There is no password recovery.** No reset link, no support address, no escrow
+copy, no back door. If the password is lost the bundle is permanently unreadable
+and its contents are gone. That is the only way a hosted backup can be safe to
+hand to a server you do not control, and every surface that sets a password says
+so before it is set.
+
+**The password is attacked offline, without a rate limit.** A login form locks
+someone out after three tries; a repository does not. Whoever holds a copy can
+guess on their own hardware, forever. That is why a generated 20-character
+passphrase (100 bits, straight from the OS CSPRNG) is the default path, a
+user-supplied password is the exception, and a supplied one under 12 characters
+is refused outright.
+
+**Changing the password is not revocation.** A rewrap unwraps the master key
+under the old password and rewraps *the same* master key under the new one — 48
+bytes rewritten instead of the whole bundle. The data keys do not change. Anyone
+holding an old keyfile, including one still in git history, can still unwrap it
+with the old password forever. Real revocation means a new master key and a
+re-encrypted bundle.
+
+**The 1 GiB Argon2 working set is not `mlock`ed.** It cannot be under a default
+memory-lock limit, and locking a fraction of it would be theatre. Key material
+is held in `Zeroizing` and wiped on drop, and no key, password, nonce, or
+plaintext is ever formatted into an error message, a log line, or a `Debug`
+impl. But the allocating AEAD API hands back a plain `Vec` holding the unwrapped
+master key and does not zeroize it; it is wiped explicitly after copying, and a
+`Vec` that reallocated during construction may still leave an unreachable copy
+behind. That is unavoidable with this API and is accepted knowingly.
+
+### Residual risk: trust-on-first-use on the rollback anchor
+
+A rollback is the one attack that produces something which authenticates
+perfectly. An attacker with write access to the remote serves an *older*
+snapshot root — genuinely produced by the real key, verifying flawlessly.
+Nothing inside the bundle can tell the client that a newer one exists. Only
+state the attacker cannot reach detects it: a monotonic counter kept on this
+machine, compared against the root's `counter`, refusing anything lower unless
+rollback is explicitly requested.
+
+**On first contact there is no such counter, and the remote is believed. This is
+accepted risk, not mitigated risk.** A machine that has never seen this bundle
+has nothing to compare against, so an attacker who already controls the remote at
+the moment of the very first fetch can serve an old snapshot and it will be
+taken. Every fetch afterwards is protected. Closing it would require carrying a
+counter out of band, which is a different trade than this design makes.
+
+Two consequences a caller must respect:
+
+- **The anchor lives in the config directory, never the cache.** The cache is
+  documented as wipeable and users, packagers, and `rm -rf ~/.cache/*` treat it
+  that way. A wiped anchor is a free rollback: it silently downgrades the next
+  fetch to first contact. An attacker with local write access can delete it
+  anyway — the same residual, and the reason it is durable state rather than
+  disposable state. An anchor file that exists but does not parse is an *error*,
+  never a reset: treating corruption as first contact would turn a damaged
+  anchor into the same free rollback.
+- **The rollback check decides; it does not persist.** Advancing the high-water
+  mark is the caller's job and **must happen only after the snapshot verifies**.
+  Advancing on a *claim* rather than on a verified snapshot means a forged high
+  counter locks the user out of their own real bundle — a denial of service
+  built out of the very mechanism meant to protect them.
