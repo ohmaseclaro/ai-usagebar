@@ -21,6 +21,12 @@
 //! item — a hash tied to the account's own directory can't collide with a
 //! different account's, which is what issue #15 needed the strict
 //! `Explicit`-only rule to avoid in the first place.
+//!
+//! The `*_service` workers are `pub(crate)` because the sync token
+//! ([`crate::sync::github::keychain`]) stores itself through these same three
+//! under its own service name. The read/write account-selector agreement below
+//! is a rule with one copy in this crate, not two — a second implementation is
+//! a second place for it to drift back apart.
 
 use std::io::Write;
 use std::path::Path;
@@ -90,7 +96,7 @@ pub fn read_raw_for(config_dir: &Path) -> Result<Option<String>> {
     read_raw_service(&service_name_for(config_dir)?)
 }
 
-fn read_raw_service(service: &str) -> Result<Option<String>> {
+pub(crate) fn read_raw_service(service: &str) -> Result<Option<String>> {
     let mut cmd = Command::new("/usr/bin/security");
     cmd.args(["find-generic-password", "-s", service, "-w"]);
     if let Some(acct) = account() {
@@ -160,7 +166,7 @@ pub fn delete_raw_for(config_dir: &Path) -> Result<()> {
     delete_raw_service(&service_name_for(config_dir)?)
 }
 
-fn write_raw_service(service: &str, json: &str) -> Result<()> {
+pub(crate) fn write_raw_service(service: &str, json: &str) -> Result<()> {
     // Must mirror `read_raw`'s selection exactly, or an update can create a
     // second item the read will never find. The native API updates by this
     // exact (service, account) pair without exposing the secret in argv.
@@ -183,7 +189,7 @@ fn write_raw_service(service: &str, json: &str) -> Result<()> {
     ))
 }
 
-fn delete_raw_service(service: &str) -> Result<()> {
+pub(crate) fn delete_raw_service(service: &str) -> Result<()> {
     let mut cmd = Command::new("/usr/bin/security");
     cmd.args(["delete-generic-password", "-s", service]);
     if let Some(acct) = account() {
