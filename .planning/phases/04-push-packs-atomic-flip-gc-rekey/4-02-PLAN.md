@@ -14,7 +14,7 @@ must_haves:
     - "A `SyncPlan` of ~5,000 new chunks becomes a handful of packs, never one object per chunk — the property REPO-06 names, asserted as a pack count."
     - "A chunk already recorded in the local `chunk` table is not re-sealed and not re-packed; the table has a writer for the first time, closing 2-05's recorded gap."
     - "A chunk shared with a file that failed its append check is recognised as already-present instead of being re-uploaded."
-    - "`PACK_TARGET` is unchanged at 32 MiB, and a test proves the pack header of a worst-case full pack still fits one sealed chunk — the ceiling Phase 1's gap-closure deliberately did not reach."
+    - "Neither pack constant moves, and a worst-case header built at `PACK_MAX` — the constant `should_seal` actually compares against, not the advisory `PACK_TARGET` — still fits one sealed chunk. That is the ceiling Phase 1's gap-closure deliberately did not reach."
     - "The manifest, the index object, and the snapshot root are produced by Phase 1's own `seal`/`new` entry points; nothing here re-implements a format."
     - "`referenced_packs` names every pack the snapshot needs, reused ones included, so prune can be computed from the pointer with no download and no key."
     - "Nothing in this file seals a new kind of object under `chunk_key`."
@@ -24,7 +24,7 @@ must_haves:
   key_links:
     - "`packer::build` is the only producer of `PushBundle`; upload, pointer, and prune all consume what it names"
     - "The `chunk` table is what makes `already uploaded` survive a lost local plan; without it the answer comes only from the `file` table"
-    - "`should_seal` and `PACK_TARGET` come from `pack.rs` and are read, never redefined — a second literal is how the header ceiling gets re-broken"
+    - "`should_seal` and `PACK_MAX` come from `pack.rs` and are read, never redefined — a second size literal is how the header ceiling gets re-broken, and `PACK_TARGET` is not the constant to read"
 ---
 
 <objective>
@@ -208,7 +208,7 @@ stays untriggered. If the implementation finds itself calling `seal_chunk` on so
 none of those four, stop and raise it rather than proceeding.
 
 Fixtures are sized for the AUR `check()` — the pack-count test needs enough plaintext to cross
-`PACK_TARGET` a few times, so generate it rather than writing it to disk, and keep the on-disk
+`PACK_MAX` a few times, so generate it rather than writing it to disk, and keep the on-disk
 fixture small. Every test injects its roots through `SyncRoots::at` and its index through
 `Index::at`, with cheap KDF parameters.
   </action>

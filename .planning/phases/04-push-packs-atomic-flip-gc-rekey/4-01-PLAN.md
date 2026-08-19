@@ -514,7 +514,8 @@ that changes the sync password. Each gets a doc comment that reads as its help t
 password one says in that text that changing the password is not revocation.
 
 In `src/sync/cli.rs`, extend `run_with` — plan 3-01's injected-seam entry — with arms for all
-three. Each resolves the pairing record for the numeric repo id, builds the `PushCtx`, and
+three: push dispatches to `push::run`, prune to `prune::run_on_demand`, and the password change to
+`rekey::run`. Each resolves the pairing record for the numeric repo id, builds the `PushCtx`, and
 `block_on`s the async call on the local current-thread runtime 3-01 established. The push arm
 prints `PushOutcome`: packs uploaded, packs skipped, bytes, snapshots kept, packs deleted, and
 `prune_warning` on its own clearly-marked line when present. **A run whose only failure is the
