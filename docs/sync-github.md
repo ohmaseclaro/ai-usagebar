@@ -1,6 +1,10 @@
 # GitHub sync setup and authentication
 
-The sync feature backs up your usage history and configuration to a private GitHub repository. This guide covers repository creation, token setup, and what the tool checks before accessing it.
+The sync feature will back up your usage history and configuration to a private GitHub
+repository, encrypted with a password only you hold. **This release pairs with the
+repository and verifies it; it does not upload anything yet** — see "What this release
+does" below. This guide covers repository creation, token setup, and what the tool
+checks before it will touch your data.
 
 ## Create your backup repository
 
