@@ -300,7 +300,24 @@ the PAT documentation, and mockito coverage of every refusal path.
 6. `grep` over the crate finds no call to `POST /user/repos` and no request for
    `Administration` permission.
 
-**Plans**: TBD
+**Plans:** 7 plans across 3 waves (2 / 3 / 2). Wave 1's tracer freezes every cross-file
+signature, so the three wave-2 plans each own whole files and compile in isolation.
+
+Plans:
+- [ ] 3-01-PLAN.md — wave 1 — the `src/sync/github/` module tree, frozen seams, and config → token → request → gate → CLI end to end (tracer)
+- [ ] 3-05-PLAN.md — wave 1 — the fine-grained PAT recipe, `[sync] repo`, and the README entry point
+- [ ] 3-02-PLAN.md — wave 2 — D-02's token chain: the macOS Keychain half, the `gh` half, and the mode-0600 write path
+- [ ] 3-03-PLAN.md — wave 2 — the failure taxonomy and header-derived backoff, six outcomes with six actionable messages
+- [ ] 3-04-PLAN.md — wave 2 — the full gate assertion set, the pairing record, drift, and the SAFE-02 incident
+- [ ] 3-06-PLAN.md — wave 3 — CAL-1, run or explicitly declined, with `PACK_TARGET` reconciled *(checkpoint; must not block)*
+- [ ] 3-07-PLAN.md — wave 3 — guided `sync setup` end to end, and `sync status` learning about the repo
+
+**Note:** `3-CONTEXT.md` D-05 names the guided command `sync setup`; the scope list above says
+`sync init`. CONTEXT is the locked artifact, so it ships as `sync setup`.
+
+**REPO-06 / REPO-07:** foundation only in this phase — `Endpoints.uploads_base` and the frozen
+`Conflict` error arm exist so Phase 4's upload and CAS paths are testable. Both requirements
+stay assigned to Phase 4, where they are observable; D-05 forbids an upload here.
 
 ---
 
@@ -546,7 +563,7 @@ Assignment notes where a requirement could have gone elsewhere:
 |-------|----------------|--------|-----------|
 | 1. Encrypted Bundle Core | 0/8 | Not started | - |
 | 2. Bundle Scope, Local Index, Dry-Run Planning | 0/7 | Not started | - |
-| 3. GitHub Auth and the Private-Repo Gate | 0/TBD | Not started | - |
+| 3. GitHub Auth and the Private-Repo Gate | 0/7 | Planned | - |
 | 4. Push — Packs, Atomic Flip, GC, Rekey | 0/TBD | Not started | - |
 | 5. Pull and Restore | 0/TBD | Not started | - |
 | 6. Surfaces and Ship | 0/TBD | Not started | - |
