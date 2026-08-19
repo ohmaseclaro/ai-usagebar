@@ -51,7 +51,7 @@ The token must be scoped to your single backup repository with exactly two permi
 6. **Repository permissions:**
    - **Contents:** Check **Read and write**
    - **Metadata:** **Read-only** (checked by default, cannot be removed)
-7. **Do NOT grant Administration permissions.** This field must remain unchecked. The lack of this permission is what structurally prevents the token from creating or modifying repository settings. The tool will warn you if it detects a token with Administration permissions, because a token that has it silently weakens the guarantee — but it is your responsibility to not grant it in the first place.
+7. **Do NOT grant Administration permissions.** This field must remain unchecked. The lack of this permission is what structurally prevents the token from creating or modifying repository settings. The tool cannot check this for you — GitHub's repository endpoint reports *your* role on the repository, not your token's grant, so there is nothing it can read that would tell the difference (see `docs/sync-format.md` §7). Leaving the box unchecked here is the whole enforcement.
 8. Click **Generate token** and copy the token value immediately (GitHub only displays it once)
 
 Your token carries exactly two permissions:

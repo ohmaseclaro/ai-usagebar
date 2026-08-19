@@ -62,10 +62,13 @@ use crate::sync::chunk::{Blob, open_chunk, seal_chunk};
 use crate::sync::crypto::{ChunkId, Keys, content_address};
 use crate::sync::{MAX_SUPPORTED_PACK_HEADER, PACK_HEADER_VERSION, check_version};
 
-/// Size a pack aims for. CAL-1's recorded fallback: private-repo release assets
-/// are assumed **not** to honour `Range:`, so fetching one chunk may mean
-/// fetching its whole pack, and 32 MiB is where that waste stays tolerable.
-/// Plan 1-08 runs the real probe; phase 3 may raise this if `Range:` works.
+/// Size a pack aims for. CAL-1's fallback, still unmeasured: private-repo
+/// release assets are assumed **not** to honour `Range:`, so fetching one chunk
+/// means fetching its whole pack, and 32 MiB is where that waste stays
+/// tolerable. The probe was offered in phase 3 and declined — see
+/// `docs/sync-format.md` §7. Raising this is an optimisation for a partial
+/// restore, not a gate: a restore fetches whole packs regardless, and
+/// [`PACK_MAX`] already sits under the 64 MiB asset-download cap.
 pub const PACK_TARGET: usize = 32 * 1024 * 1024;
 
 /// Hard ceiling — a writer is sealed before a blob would carry it past this.
