@@ -126,3 +126,34 @@ in `docs/sync-format.md` §3.
 Also carried forward from `1-09`: `manifest_chunks` is unbounded, which is safe only because it
 sits inside authenticated plaintext. **If this phase grows any path that reads an id list before
 its container authenticates, that path needs its own bound.**
+
+---
+
+## Measured during execution (plan 2-04) — the byte bound binds first, not the days
+
+D3 sets two bounds and I assumed the 30-day one would decide. On the real target tree it does
+not. Measured (metadata only, no reads):
+
+```
+total .jsonl              4208 files / 3.65 GiB
+inside 30 days            3729 files / 3.41 GiB
+actually selected         2073 files / 1.989 GiB   <- transcript_max_bytes binds
+reach                     back to ~2026-07-29, i.e. ~21 of the 30 days
+stopped on                a 50 MiB transcript
+```
+
+**Consequence for any user-facing text:** never say "30 days of transcripts". Quote what was
+actually selected (files + bytes) and the excluded remainder. The day bound is a ceiling the
+byte budget usually reaches first, and which one binds depends entirely on how heavy the user's
+recent months were — so it must be *reported*, not *predicted*.
+
+Selection stops at the first in-window file that would exceed the budget; it does not back-fill
+with smaller older files. That keeps "newest-first" honest — a bundle is a contiguous recent
+window, not a scattered subset chosen to pack the budget efficiently.
+
+Also: `excluded_files` / `excluded_bytes` count only bound-dropped files, not D2 exclusions or
+non-`.jsonl`. Plan 2-07 must not render that column for the other four categories, where it is
+structurally always zero.
+
+Cowork (`local-agent-mode-sessions/`) contributes 0 files on this machine today, so that D2
+exclusion currently costs nothing — but it remains correct to keep.

@@ -9,6 +9,7 @@ files_modified:
   - src/sync/mod.rs
   - src/sync/cli.rs
   - src/widget/cli.rs
+  - src/bin/ai-usagebar.rs
   - src/sync/github/mod.rs
   - src/sync/github/http.rs
   - src/sync/github/token.rs
@@ -26,15 +27,17 @@ must_haves:
     - "The token's value never appears in output at any verbosity; only its source does (D-02)."
     - "Nothing in the phase opens a socket to a host that is not an injected `Endpoints` base (D-05)."
   artifacts:
-    - src/sync/github/mod.rs declaring the seven submodules, `Endpoints`, `RepoRef`, and the client
+    - src/sync/github/mod.rs declaring the six submodules, `Endpoints`, `RepoRef`, and the client
     - src/sync/github/http.rs with the frozen `GithubError` enum every later plan matches on
     - "`[sync] repo` on `SyncConfig` in src/config.rs"
-    - "`SyncAction::Setup` in src/widget/cli.rs, dispatched from src/sync/cli.rs"
+    - "`SyncAction::Setup` in src/widget/cli.rs, dispatched from `sync::cli::run_with`"
   key_links:
     - "src/sync/mod.rs declares `pub mod github;` — without it nothing in the phase compiles"
-    - "github/mod.rs declares all seven submodules, so each wave-2 plan owns exactly one or two files and never touches mod.rs"
-    - "`GithubError`'s variants and `TokenChain`'s fields are frozen here; wave-2 plans fill bodies, never signatures"
+    - "github/mod.rs declares all six submodules, so each wave-2 plan owns exactly one or two files and never touches mod.rs"
+    - "`GithubError`, `TokenChain`, `Client::get_json`, and `assert_pushable` are frozen here; wave-2 plans fill bodies, never signatures"
+    - "`assert_pushable` returns its warnings in the tuple, so plan 3-04 adds warning cases without touching `setup.rs`, which it does not own"
     - "`Endpoints` carries `uploads_base` even though Phase 3 never uploads — hard-coding it would make Phase 4's upload path untestable"
+    - "`run_with` is the injected-seam entry every CLI test drives; `run` is the thin wrapper that resolves real paths and is never called from a test"
 ---
 
 <objective>
@@ -121,8 +124,9 @@ Every file is created here so that each wave-2 plan owns whole files and no two 
 edit the same one. Files this plan does not fill carry their frozen public signature plus a
 working minimum; the gaps are functional, never architectural.
 
-**`github/mod.rs`** — declares `pub mod gate; pub mod http; pub mod pairing; pub mod setup;
-pub mod token;` and, gated on `#[cfg(target_os = "macos")]`, `pub mod keychain;`. It holds:
+**`github/mod.rs`** — declares five unconditional submodules (`gate`, `http`, `pairing`,
+`setup`, `token`) plus `keychain` gated on `#[cfg(target_os = "macos")]` — six files, five of
+them compiled on every target. It holds:
 
 `Endpoints { pub api_base: String, pub uploads_base: String }` with a `Default` of the two
 real GitHub hosts (`https://api.github.com` and `https://uploads.github.com`). Both fields
@@ -142,16 +146,26 @@ same-origin policy is what stops a bearer token following a cross-host redirect.
 a hand-written `Debug` that prints the endpoints and the token *source* and nothing else; the
 derived one would print the token.
 
-`Client::get_json(&self, path: &str) -> Result<(reqwest::StatusCode, reqwest::header::HeaderMap, bytes::Bytes)>`
+`Client::get_json(&self, path: &str) -> Result<(reqwest::StatusCode, reqwest::header::HeaderMap, Vec<u8>)>`
 is the single outbound call site for the whole phase. It sends `Authorization: Bearer …`,
 `Accept: application/vnd.github+json`, `X-GitHub-Api-Version: 2022-11-28`, and a
 `User-Agent` of `ai-usagebar/` plus `env!("CARGO_PKG_VERSION")` (GitHub rejects a request
 without one). It reads the body through `crate::vendor::read_body_capped` with
 `crate::vendor::MAX_BODY_BYTES` — every response in this phase is a few kilobytes of JSON.
-It returns status, headers, and body unclassified; classification is `http.rs`'s job.
+The body type is `Vec<u8>` because that is exactly what `read_body_capped` returns. Do **not**
+reach for `bytes::Bytes`: it is a transitive dependency of `reqwest`, not a declared one, so
+`use bytes::…` will not resolve, and declaring it would both break the phase's zero-new-crates
+constraint and be flagged by `cargo machete`.
 
 There is no `post`, `put`, or `patch` method on `Client` in this phase, and no code path
-that hands it a request body. That absence is D-05: the type itself cannot upload.
+that hands it a request body. That absence is D-05: the type itself cannot upload. Lock it
+down with a test — `Client`'s inherent impl exposes exactly one request method, and a
+compile-time guard is worth more than a review convention. The cheap version that actually
+catches a regression: a `#[test]` reading this module's own source via
+`include_str!("mod.rs")` and asserting the impl block contains no `.post(`, `.put(`,
+`.patch(`, `.body(`, or `.multipart(` outside a string literal. Keep the check crude and the
+message loud; its job is to fail when someone adds an upload here rather than in Phase 4's
+own module.
 
 **`github/http.rs`** — the failure taxonomy's *type*, frozen here so no wave-2 plan changes a
 variant another plan matches on. Define `pub enum GithubError` with exactly these variants and
@@ -210,24 +224,60 @@ token is not scoped to it — GitHub returns the same 404 for both and we must s
 the literal `gh repo create <owner>/<name> --private` line with the configured owner and name
 substituted.
 
-Add `pub fn assert_pushable(facts: &RepoFacts, repo: &RepoRef, now: DateTime<Utc>) -> Result<PushClearance>`
-asserting, in this tracer, that `facts.private` is true. Plan 3-04 adds the remaining
-assertions inside this same function. `PushClearance { checked_at: DateTime<Utc> }` has a
-**private** field and no public constructor, so the only way to obtain one is to have just
-run the gate. Phase 4's upload entry point will take a `PushClearance` by value, which is what
-makes D-04's "immediately before every push" structural rather than a sequencing convention.
-Do not derive `Clone` or `Copy` on it — a clearance that can be stashed and reused is a cached
-check, which is exactly what D-04 forbids.
+Add, with this **exact** frozen signature:
+
+`pub fn assert_pushable(facts: &RepoFacts, repo: &RepoRef, credentials_in_bundle: bool, now: DateTime<Utc>) -> Result<(PushClearance, Vec<String>)>`
+
+Three things about it are decided here and are not plan 3-04's to revisit.
+
+*It returns its warnings in the tuple.* Plan 3-04 adds warning cases to this function, and
+3-04's worktree contains this plan's `setup.rs` — a file 3-04 does not own. If warnings
+arrived by a signature change, 3-04's branch would not compile. So the tuple exists from the
+tracer, and `setup.rs` here already destructures it as `let (clearance, warnings) = …` and
+renders `warnings`, which is empty at the tracer. That is the whole reason for a `Vec` nobody
+fills yet.
+
+*It takes `credentials_in_bundle`.* This is D-04 read exactly as written: a public repository
+aborts **when credentials are in the bundle**, and is allowed-with-a-warning when the
+credentials category is off. Without this parameter the assertion and plan 3-04's
+`check_drift` contradict each other — one hard-refuses on `private == false` knowing nothing
+about the bundle, the other carves out the credentials-off case — and because `setup.rs` calls
+`check_drift` and then `assert_pushable`, the second would silently kill the first's carve-out.
+One function decides, and it is this one. In this tracer, `false` still refuses a public
+repository (with a distinct message) rather than warning, because the tracer has no bundle to
+inspect; plan 3-04 implements both arms.
+
+*It is the sole constructor of `PushClearance { checked_at: DateTime<Utc> }`*, whose field is
+**private**, with no public constructor and no `Clone` or `Copy` derive. A clearance that can
+be stashed and duplicated is a cached check, which is what D-04 forbids.
+
+Non-`Clone` stops forging and duplication but says nothing about age, and D-04's word is
+"immediately". Add `pub fn assert_fresh(&self, now: DateTime<Utc>, max_age: Duration) -> Result<()>`
+and a `pub const MAX_CLEARANCE_AGE: Duration` of a small number of seconds. It is three lines
+while the type is still cheap to change, and it turns "immediately" from prose in a plan into
+something Phase 4's upload entry point can call. Say so in the summary: Phase 4 takes a
+`PushClearance` by value **and** calls `assert_fresh` before the first byte.
 
 **`github/pairing.rs`** — created with its module doc stating what the record is for and its
 mode-0600 requirement; plan 3-04 fills it.
 
-**`github/setup.rs`** — `pub async fn run(cfg: &SyncConfig, endpoints: &Endpoints, chain: &TokenChain, now: DateTime<Utc>) -> Result<SetupOutcome>`
+**`github/setup.rs`** — `pub async fn run(cfg: &SyncConfig, roots: &SyncRoots, endpoints: &Endpoints, chain: &TokenChain, now: DateTime<Utc>) -> Result<SetupOutcome>`
 performing, in order: read `cfg.repo` (absent ⇒ the D-01 error naming the config key and the
 create command), `RepoRef::parse` it, `token::resolve` the chain, build a `Client`, call
-`gate::fetch_facts`, call `gate::assert_pushable`, and return a `SetupOutcome` carrying the
-`RepoRef`, the `TokenSource`, the visibility string, and the `PushClearance`. Plan 3-07
-expands this into the full guided flow behind the same entry point.
+`gate::fetch_facts`, call `gate::assert_pushable` with
+`cfg.includes(SyncCategory::Credentials)` as `credentials_in_bundle`, destructure the
+`(PushClearance, Vec<String>)`, render the warnings, and return a `SetupOutcome` carrying the
+`RepoRef`, the `TokenSource`, the visibility string, the warnings, and the `PushClearance`.
+
+`roots: &SyncRoots` is in the signature from the start and is the **only** way this module
+reaches a filesystem path — the keyfile, the pairing record, the token file, and the
+`config.toml` write-back plan 3-07 adds all resolve from it. Without it in the signature the
+executor has no injected directory and reaches for a real `$HOME`, which the AUR `check()`
+runs on installers' machines.
+
+Unlike everything above, this signature is **not** frozen: plan 3-07 owns `setup.rs` outright,
+in a later wave, and its only caller is `sync/cli.rs`, which 3-07 also owns. It adds a prompt
+seam parameter there. Nothing in wave 2 calls it.
 
 Everything in this module is `async` because `reqwest` is. Follow the existing vendor
 fetchers' shape.
@@ -250,7 +300,8 @@ real home directory.
   <behavior>
     - A `config.toml` carrying `[sync]` with `repo = "owner/name"` round-trips that value onto `SyncConfig`.
     - A `config.toml` with a `[sync]` section and no `repo` key still loads, leaving `repo` as `None`.
-    - `sync setup` with `repo` unset returns a non-zero exit code and a message containing the create command.
+    - `run_with` on `SyncAction::Setup` with `repo` unset returns a non-zero exit code and a message containing the create command.
+    - `run_with` on `SyncAction::Setup` against a mockito private repo returns `0`, driven entirely from injected `Config`, `SyncRoots`, `Endpoints`, and `TokenChain` values.
   </behavior>
   <action>
 Add `pub repo: Option<String>` to `SyncConfig` in `src/config.rs`, with a doc comment stating
@@ -272,11 +323,31 @@ repository named in `[sync] repo`, verify it is private, and store the token. No
 uploaded. Add the variant only — the `Command::Sync` arm and its dispatch in
 `src/bin/ai-usagebar.rs` already exist from plan 2-01 and are not touched by this phase.
 
-In `src/sync/cli.rs`, extend the existing `run(action: &SyncAction) -> i32` with the `Setup`
-arm: load `Config`, build `Endpoints::default()` and `TokenChain::production()`, drive the
-async `github::setup::run` on a current-thread tokio runtime the way the other CLI entry
-points do, print the outcome, and return `0` on success or a non-zero code on any error. The
-error path prints the message and nothing else — no token, no prefix of one, no header dump.
+In `src/sync/cli.rs`, split the entry point in two. The shipped `run(action: &SyncAction) -> i32`
+resolves the real world — `Config::load()`, `SyncRoots::resolve`, `Endpoints::default()`,
+`TokenChain::production()`, `Utc::now()` — and hands them to:
+
+`pub fn run_with(action: &SyncAction, cfg: &Config, roots: &SyncRoots, endpoints: &Endpoints, chain: &TokenChain, now: DateTime<Utc>) -> i32`
+
+`run_with` holds all the logic and is what every test drives. `run` is a thin wrapper no test
+calls. This is not ceremony: without it, a test of the `Setup` arm has to go through
+`Config::load()` and `TokenChain::production()`, which read a real `$HOME` — and the AUR
+`check()` runs `cargo test` during `makepkg` on installers' machines, so such a test fails the
+*install* for anyone whose config differs. It is the same seam the project already uses in
+`Cache::at`, `creds::read_from`, `SyncRoots::at`, and `Cli::resolve_vendor_with`.
+
+`run_with`'s `Setup` arm drives the async `github::setup::run`, prints the outcome, and returns
+`0` or a non-zero code. The error path prints the message and nothing else — no token, no
+prefix of one, no header dump.
+
+**Build the runtime here.** `src/bin/ai-usagebar.rs` dispatches `Command::Sync` *before* it
+constructs the tokio runtime, under a comment saying sync does local filesystem scanning only
+and so needs no runtime — true when plan 2-01 wrote it, false as of this plan. So `run_with`
+constructs its own current-thread runtime with `tokio::runtime::Builder` and `block_on`s the
+async call. Do **not** move the dispatch: leaving it where it is keeps runtime construction out
+of the two subcommands that still do not need one, and the widget's own runtime-failure
+fallback below it is unaffected. Fix that now-false comment in place — one line, and it is the
+thing that would otherwise mislead the next reader into removing the local runtime.
 
 The success line reports the repository, its visibility, and the token's **source**, in the
 shape `token: present (Keychain)`. Assert in a test that the rendered success output does not
@@ -286,9 +357,9 @@ The widget's exit-0 invariant is a property of `widget::run::fallback`, not of `
 returns non-zero on failure, per D-06. Do not route any of this through the widget path.
   </action>
   <verify>
-    <automated>cargo test --lib sync:: config::tests</automated>
+    <automated>cargo test --lib -- sync:: config::tests</automated>
   </verify>
-  <done>`ai-usagebar sync setup` exists and runs. A fixture config with `[sync] repo = "o/n"` parses; one with a malformed value fails at load naming the expected shape. A test drives the setup arm against a mockito private repo and asserts the printed output names the repo, the visibility, and the token source, and contains no substring of the token.</done>
+  <done>`ai-usagebar sync setup` exists and runs. A fixture config with `[sync] repo = "o/n"` parses; one with a malformed value fails at load naming the expected shape. A test drives `run_with` against a mockito private repo and asserts the printed output names the repo, the visibility, and the token source, and contains no substring of the token. No test calls `run`, `Config::load`, `SyncRoots::resolve`, or `TokenChain::production`.</done>
   <reversibility rating="costly">`[sync] repo` and the `sync setup` subcommand name are user-facing surfaces; `Config` denies unknown sections and a renamed key breaks existing config files. Both names come from D-01 and D-05.</reversibility>
 </task>
 
