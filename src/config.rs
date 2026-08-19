@@ -38,6 +38,7 @@ use crate::vendor::VendorId;
 pub struct Config {
     pub ui: UiConfig,
     pub context: ContextConfig,
+    pub sync: SyncConfig,
     pub anthropic: AnthropicConfig,
     pub anthropic_api: AnthropicApiConfig,
     pub openai: OpenAiConfig,
@@ -120,6 +121,87 @@ impl ContextLayout {
             ContextLayout::Split => "split",
             ContextLayout::Bottom => "bottom",
         }
+    }
+}
+
+/// One collectable class of local state. The variants are the D1 mapping and
+/// their order here is the canonical display order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncCategory {
+    /// This file, plus `accounts/*/.credentials.json` beside it.
+    Config,
+    /// The claude-acc profile store — the saved Desktop logins.
+    Credentials,
+    /// `~/.claude/scheduled-tasks/**` and the per-account registries.
+    Routines,
+    /// Claude Desktop's `claude-code-sessions/<account>/<org>/local_*.json`.
+    ChatIndex,
+    /// `~/.claude/projects/**/*.jsonl`. Large, and off by default.
+    Transcripts,
+}
+
+impl SyncCategory {
+    /// Canonical D1 order — what `sync status` lists and what any later
+    /// per-category loop iterates.
+    pub const ALL: [SyncCategory; 5] = [
+        SyncCategory::Config,
+        SyncCategory::Credentials,
+        SyncCategory::Routines,
+        SyncCategory::ChatIndex,
+        SyncCategory::Transcripts,
+    ];
+
+    /// The snake_case token, identical to what the TOML carries — one spelling
+    /// for config, display, and any future machine-readable output.
+    pub fn label(self) -> &'static str {
+        match self {
+            SyncCategory::Config => "config",
+            SyncCategory::Credentials => "credentials",
+            SyncCategory::Routines => "routines",
+            SyncCategory::ChatIndex => "chat_index",
+            SyncCategory::Transcripts => "transcripts",
+        }
+    }
+}
+
+/// What the encrypted sync bundles, and the bounds on the one category big
+/// enough to need them.
+///
+/// This section is itself inside the `config` category, so a second machine
+/// inherits the same selection rather than silently differing (SCOPE-05).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SyncConfig {
+    /// Categories to collect. Transcripts is deliberately absent from the
+    /// default: 4 GB of JSONL is not what "fast, light sync" means.
+    pub categories: Vec<SyncCategory>,
+    /// Newest-first age bound on transcripts, in days. Applied with
+    /// [`transcript_max_bytes`](SyncConfig::transcript_max_bytes); whichever
+    /// binds first wins.
+    pub transcript_days: u32,
+    /// Byte backstop on transcripts, so a heavy month cannot balloon silently.
+    pub transcript_max_bytes: u64,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            categories: vec![
+                SyncCategory::Config,
+                SyncCategory::Credentials,
+                SyncCategory::Routines,
+                SyncCategory::ChatIndex,
+            ],
+            transcript_days: 30,
+            transcript_max_bytes: 2 * 1024 * 1024 * 1024,
+        }
+    }
+}
+
+impl SyncConfig {
+    pub fn includes(&self, cat: SyncCategory) -> bool {
+        self.categories.contains(&cat)
     }
 }
 
@@ -1093,6 +1175,66 @@ mod tests {
         f.write_all(s.as_bytes()).unwrap();
         f.flush().unwrap();
         f
+    }
+
+    // --- [sync] ------------------------------------------------------------
+
+    #[test]
+    fn sync_defaults_are_the_four_d6_categories_with_transcripts_off() {
+        let c = SyncConfig::default();
+        assert_eq!(
+            c.categories,
+            vec![
+                SyncCategory::Config,
+                SyncCategory::Credentials,
+                SyncCategory::Routines,
+                SyncCategory::ChatIndex,
+            ]
+        );
+        assert!(!c.includes(SyncCategory::Transcripts));
+        assert_eq!(c.transcript_days, 30);
+        assert_eq!(c.transcript_max_bytes, 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn config_without_a_sync_section_still_loads_and_gets_the_defaults() {
+        let f = write_toml("[anthropic]\nenabled = true\n");
+        let c = Config::load_from(f.path()).unwrap();
+        assert_eq!(c.sync.categories.len(), 4);
+        assert!(!c.sync.includes(SyncCategory::Transcripts));
+        assert_eq!(c.sync.transcript_days, 30);
+    }
+
+    #[test]
+    fn sync_section_round_trips_all_three_keys() {
+        let f = write_toml(
+            "[sync]\ncategories = [\"config\", \"transcripts\"]\n\
+             transcript_days = 7\ntranscript_max_bytes = 1024\n",
+        );
+        let c = Config::load_from(f.path()).unwrap();
+        assert_eq!(
+            c.sync.categories,
+            vec![SyncCategory::Config, SyncCategory::Transcripts]
+        );
+        assert!(c.sync.includes(SyncCategory::Transcripts));
+        assert!(!c.sync.includes(SyncCategory::Credentials));
+        assert_eq!(c.sync.transcript_days, 7);
+        assert_eq!(c.sync.transcript_max_bytes, 1024);
+    }
+
+    #[test]
+    fn sync_category_labels_match_the_toml_spelling() {
+        let toml = format!(
+            "[sync]\ncategories = [{}]\n",
+            SyncCategory::ALL
+                .iter()
+                .map(|c| format!("{:?}", c.label()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let f = write_toml(&toml);
+        let c = Config::load_from(f.path()).unwrap();
+        assert_eq!(c.sync.categories, SyncCategory::ALL.to_vec());
     }
 
     #[test]
