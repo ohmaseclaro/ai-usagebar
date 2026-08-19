@@ -9,8 +9,8 @@
 //! ```
 //!
 //! Each hop's identifier is bound as associated data into the object it names:
-//! [`crate::sync::crypto::Keys::seal`] takes the [`ChunkId`] as AAD *and*
-//! derives the nonce from it, and [`crate::sync::chunk::open_chunk`] rechecks
+//! [`crate::sync::crypto::Keys::seal`] takes the [`ChunkId`] as AAD, and
+//! [`crate::sync::chunk::open_chunk`] rechecks
 //! that the plaintext really hashes to the id it was served under. Substituting
 //! a manifest or a chunk therefore fails its tag rather than quietly restoring
 //! something else.
@@ -328,10 +328,10 @@ impl Root {
     /// Seal under the root subkey with a **fresh random** nonce.
     ///
     /// This is the one place the format's deterministic-nonce rule is inverted,
-    /// and deliberately: every other object's nonce is derived from its content
-    /// address because identical plaintext *must* seal identically or dedup
-    /// dies. The root's plaintext changes on every sync, and a content-derived
-    /// nonce would publish whether two consecutive snapshots are identical.
+    /// and deliberately: every other object's nonce is derived from the bytes it
+    /// seals, because identical plaintext *must* seal identically or dedup dies.
+    /// The root's plaintext changes on every sync, and a content-derived nonce
+    /// would publish whether two consecutive snapshots are identical.
     pub fn seal(&self, keys: &Keys) -> Result<Vec<u8>> {
         let json = Zeroizing::new(
             serde_json::to_vec(self)

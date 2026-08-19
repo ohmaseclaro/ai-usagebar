@@ -52,9 +52,10 @@ single-threaded implementation.
 | `root_key` | `ai-usagebar.sync.v1 snapshot-root-key` | sealing and opening the snapshot root |
 
 A fourth context string, `ai-usagebar.sync.v1 chunk-nonce`, is **not** a subkey:
-it is applied to a chunk's (public) id to derive that chunk's nonce, and is
-listed here because a reader needs it. The `v1` token in all four is
-load-bearing — a future v2 hierarchy must not be able to collide with v1's.
+it is applied to `keyed_hash(name_key, <the bytes being sealed>)` to derive that
+chunk's nonce (§3), and is listed here because a reader needs it. The `v1` token
+in all four is load-bearing — a future v2 hierarchy must not be able to collide
+with v1's.
 
 **The KDF parameters are bound as associated data**, which is what makes a
 downgrade fail rather than succeed weakly. The AAD for the master-key wrap is
@@ -152,8 +153,16 @@ properties, both of which a later "optimisation" would happily undo:
   format takes Borg's, because keying costs nothing.
 
 The consequence of hashing plaintext is that two machines running different
-zstd versions may produce *different ciphertext* for the same id. That is
-harmless: both decrypt to identical plaintext, and the first upload wins.
+zstd versions may produce *different ciphertext* for the same id. State that
+precisely, because the sloppy version of it was a real vulnerability:
+
+- **Harmless for dedup.** Both decrypt to identical plaintext, and the first
+  upload wins.
+- **Not harmless for nonce safety.** One id covering two distinct messages is
+  exactly the input that reuses an AEAD nonce. That is why the nonce below is
+  derived from the framed bytes actually encrypted rather than from the id, and
+  is stored inline: two framings of one plaintext get two nonces, so the reuse
+  cannot arise.
 
 ### Frame layout
 
@@ -179,16 +188,32 @@ zstd grows past the cap is left unpadded rather than truncated.
 ### Sealing
 
 ```text
-nonce      = blake3::derive_key("ai-usagebar.sync.v1 chunk-nonce", id)[..24]
-ciphertext = XChaCha20-Poly1305(key = chunk_key, nonce, aad = id, msg = frame)
+nonce  = blake3::derive_key("ai-usagebar.sync.v1 chunk-nonce",
+                            blake3::keyed_hash(name_key, frame))[..24]
+sealed = nonce ‖ XChaCha20-Poly1305(key = chunk_key, nonce, aad = id, msg = frame)
 ```
 
-Deterministic by construction: the nonce is a function of the id, which is a
-function of the plaintext. Identical plaintext therefore yields byte-identical
-ciphertext, which is what makes dedup work and what stops a re-sync of unchanged
-data from creating new remote objects forever. Two different plaintexts get two
-different ids and therefore two different nonces, so a nonce is never reused
-across distinct messages under `chunk_key`.
+The 24-byte nonce is stored inline as the first bytes of the sealed blob, the
+same framing the snapshot root uses (§5). A reader cannot re-derive it — it is a
+keyed hash of the plaintext it is about to recover — so it has to travel.
+
+**The nonce is derived from the bytes actually encrypted, never from the id.**
+This is the property that keeps the AEAD safe, and it is not the same property
+as determinism. A derived nonce is only sound under **nonce ↔ message**
+injectivity. The id addresses the *raw plaintext*, while the message sealed is
+that plaintext's compressed frame, and zstd guarantees format compatibility
+across versions rather than byte-identical output. Deriving the nonce from the
+id therefore let two builds seal two *distinct* messages under one
+`(chunk_key, nonce, aad)` — a solvable Poly1305 one-time key, hence forgery, and
+`C_A ⊕ C_B = F_A ⊕ F_B` with an identical 4-byte `true_len` prefix handing over
+free known keystream. Hashing the frame instead closes it: a message that
+differs by one byte gets a different nonce whether or not its id moved. A nonce
+is never reused across distinct messages under `chunk_key`.
+
+Still deterministic within a build: the same plaintext frames to the same bytes,
+which derive the same nonce, which yield byte-identical output. That is what
+makes dedup work and what stops a re-sync of unchanged data from creating new
+remote objects forever.
 
 Binding the id as associated data means a chunk served under the wrong name
 fails its tag.
@@ -250,8 +275,8 @@ sealed manifest instead.
   exactly the oracle keyed chunk ids exist to deny. **Nothing in this format is
   ever sealed under an unkeyed address.**
 - *In the trailer, in the clear.* A reader needs that id *before* it can
-  decrypt, because the id derives the nonce and is bound as associated data.
-  Writing it down costs nothing — it is a keyed hash, so an attacker without
+  decrypt, because the id is bound as associated data. Writing it down costs
+  nothing — it is a keyed hash, so an attacker without
   `name_key` cannot recompute it from the header he is staring at, and
   substituting any other id simply breaks the tag. Without it the reader is not
   merely slower, it is impossible to write.

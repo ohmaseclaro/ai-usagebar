@@ -372,27 +372,73 @@ impl Keys {
         ChunkId(*blake3::keyed_hash(&self.name, plaintext).as_bytes())
     }
 
-    /// Seal a chunk under its own id. Deterministic by construction: the nonce
-    /// is a function of the id, which is a function of the plaintext. Identical
-    /// plaintext therefore yields byte-identical ciphertext, which is what makes
-    /// dedup work at all and what keeps re-syncing unchanged data from creating
-    /// new git objects forever.
+    /// Seal `message` under `id`, with the nonce derived from **the message
+    /// itself** and stored inline as the first [`NONCE_LEN`] bytes — the same
+    /// framing [`Keys::seal_root`] uses.
     ///
-    /// The id is bound as associated data, so a chunk served under the wrong
-    /// name fails the tag.
-    pub fn seal(&self, id: &ChunkId, plaintext: &[u8]) -> Result<Vec<u8>> {
-        XChaCha20Poly1305::new((&*self.chunk).into())
+    /// # Safety contract: the nonce binds to the message, the AAD binds to the id
+    ///
+    /// A derived nonce is only safe under **nonce ↔ message** injectivity. This
+    /// used to derive the nonce from `id`, which addresses the *pre-image* the
+    /// caller framed and compressed rather than the bytes handed to the AEAD —
+    /// and zstd guarantees format compatibility across versions, not
+    /// byte-identical output. Two builds compressing one plaintext differently
+    /// therefore sealed two distinct messages under one
+    /// `(chunk_key, nonce, aad)`: Poly1305 one-time-key recovery and keystream
+    /// recovery, both reachable from an ordinary heterogeneous fleet. The nonce
+    /// is now `derive_key(CTX_NONCE, keyed_hash(name_key, message))[..24]`, so a
+    /// message that differs by one bit is sealed under a different nonce whether
+    /// or not its id moved.
+    ///
+    /// **Any future caller must preserve that.** The nonce may be derived only
+    /// from the exact bytes passed as `message`; the id may be anything that
+    /// addresses them, because it is authenticated as associated data rather
+    /// than trusted to be unique per message.
+    ///
+    /// `pub(crate)` because `chunk::seal_chunk` is the one caller that gets the
+    /// framing right. Callers outside this crate go through
+    /// [`crate::sync::chunk::seal_chunk`].
+    ///
+    /// Deterministic within a build: the same message yields the same nonce and
+    /// therefore byte-identical output, which is what makes dedup work at all
+    /// and what keeps re-syncing unchanged data from creating new git objects
+    /// forever.
+    pub(crate) fn seal(&self, id: &ChunkId, message: &[u8]) -> Result<Vec<u8>> {
+        let nonce = self.chunk_nonce(message);
+        let sealed = XChaCha20Poly1305::new((&*self.chunk).into())
             .encrypt(
-                &nonce_for(id).into(),
+                &nonce.into(),
                 Payload {
-                    msg: plaintext,
+                    msg: message,
                     aad: id.as_bytes(),
                 },
             )
-            .map_err(|_| AppError::Other("chunk encryption failed".into()))
+            .map_err(|_| AppError::Other("chunk encryption failed".into()))?;
+
+        let mut framed = Vec::with_capacity(NONCE_LEN + sealed.len());
+        framed.extend_from_slice(&nonce);
+        framed.extend_from_slice(&sealed);
+        Ok(framed)
     }
 
-    /// Open a chunk sealed under `id`.
+    /// A chunk's nonce: derived from the bytes actually encrypted, keyed so
+    /// nobody without `name_key` can predict it for a guessed message.
+    ///
+    /// See [`Keys::seal`] for why this takes the message rather than the id.
+    fn chunk_nonce(&self, message: &[u8]) -> [u8; NONCE_LEN] {
+        let derived = blake3::derive_key(
+            CTX_NONCE,
+            blake3::keyed_hash(&self.name, message).as_bytes(),
+        );
+        let mut nonce = [0u8; NONCE_LEN];
+        nonce.copy_from_slice(&derived[..NONCE_LEN]);
+        nonce
+    }
+
+    /// Open a chunk sealed under `id`. `framed` is `nonce ‖ ciphertext ‖ tag`,
+    /// and the length is validated before the split: the bytes arrive from a
+    /// remote an attacker may control, so a truncated chunk must be an error,
+    /// never a panic.
     ///
     /// This performs **no** `chunk_id(plaintext) == id` identity recheck, and
     /// that is deliberate. The id addresses the caller's *raw plaintext*, while
@@ -417,12 +463,17 @@ impl Keys {
     /// nobody without `name_key` can invert it or confirm a guess against it. It
     /// is an address, not a secret — CRYPTO-07 is about keys, passwords, and
     /// plaintext, none of which is here.
-    pub fn open(&self, id: &ChunkId, ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    pub fn open(&self, id: &ChunkId, framed: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+        if framed.len() < NONCE_LEN + TAG_LEN {
+            return Err(AppError::Other(format!("chunk {id} is truncated")));
+        }
+        let (nonce, sealed) = framed.split_at(NONCE_LEN);
+        let nonce: [u8; NONCE_LEN] = nonce.try_into().expect("length checked above");
         XChaCha20Poly1305::new((&*self.chunk).into())
             .decrypt(
-                &nonce_for(id).into(),
+                &nonce.into(),
                 Payload {
-                    msg: ciphertext,
+                    msg: sealed,
                     aad: id.as_bytes(),
                 },
             )
@@ -439,6 +490,10 @@ impl Keys {
     /// snapshots. It gets a fresh random 24-byte nonce, stored inline as the
     /// first `NONCE_LEN` bytes of the framed output; XChaCha's 192-bit nonce
     /// makes random generation safe with no counter accounting.
+    ///
+    /// `repo_id` is bound into the associated data, so a root belonging to
+    /// another bundle fails the tag here rather than depending on local state to
+    /// notice — see [`Keys::open_root`].
     pub fn seal_root(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
         let mut nonce = [0u8; NONCE_LEN];
         fill(&mut nonce)?;
@@ -483,15 +538,6 @@ impl Keys {
 /// Associated data for the snapshot root. A fixed literal, not the root's own
 /// address: the root is the mutable entry point and has no content address.
 const ROOT_AAD: &[u8] = b"ai-usagebar.sync.v1 root";
-
-/// A chunk's nonce, derived from its id. Never reused for two different
-/// plaintexts, because two different plaintexts get two different ids.
-fn nonce_for(id: &ChunkId) -> [u8; NONCE_LEN] {
-    let derived = blake3::derive_key(CTX_NONCE, id.as_bytes());
-    let mut nonce = [0u8; NONCE_LEN];
-    nonce.copy_from_slice(&derived[..NONCE_LEN]);
-    nonce
-}
 
 /// Unkeyed BLAKE3, for naming an object whose bytes are already public
 /// ciphertext — a pack file, say.
@@ -606,6 +652,57 @@ mod tests {
             keys.seal(&id, plaintext).unwrap(),
             keys.seal(&id, plaintext).unwrap()
         );
+    }
+
+    /// The regression guard for the nonce-reuse blocker.
+    ///
+    /// `seal_chunk` addresses a chunk by its *raw plaintext* and encrypts that
+    /// plaintext's compressed frame. zstd guarantees format compatibility across
+    /// versions, not byte-identical output, so two builds can hand one id two
+    /// different messages. If the nonce were still derived from the id, those
+    /// two messages would be sealed under one `(chunk_key, nonce, aad)` — a
+    /// solvable Poly1305 key and `C_A ⊕ C_B = F_A ⊕ F_B`.
+    ///
+    /// Two zstd versions are not installable in a unit test, so the differing
+    /// framing is simulated directly: the same id, two different messages, which
+    /// is exactly the shape a zstd bump produces.
+    #[test]
+    fn two_framings_of_one_plaintext_are_sealed_under_different_nonces() {
+        let keys = keys();
+        let id = keys.chunk_id(b"one plaintext, two zstd builds");
+
+        // Same declared `true_len`, different compressed bytes — the collision a
+        // heterogeneous fleet produces.
+        let mut a = 23u32.to_le_bytes().to_vec();
+        a.extend_from_slice(b"\x09\x00\x00\x00 frame as vN wrote it");
+        let mut b = 23u32.to_le_bytes().to_vec();
+        b.extend_from_slice(b"\x0a\x00\x00\x00 frame as vN+1 wrote");
+
+        let (sealed_a, sealed_b) = (keys.seal(&id, &a).unwrap(), keys.seal(&id, &b).unwrap());
+        assert_ne!(
+            sealed_a[..NONCE_LEN],
+            sealed_b[..NONCE_LEN],
+            "two distinct messages were sealed under one nonce — the AEAD's \
+             one-time-key assumption is broken and both are recoverable"
+        );
+
+        // …and both still open under the id they were sealed with, so the nonce
+        // really did travel inline rather than being re-derived from the id.
+        assert_eq!(&**keys.open(&id, &sealed_a).unwrap(), &a[..]);
+        assert_eq!(&**keys.open(&id, &sealed_b).unwrap(), &b[..]);
+    }
+
+    #[test]
+    fn a_chunk_shorter_than_a_nonce_and_a_tag_errors_instead_of_panicking() {
+        let keys = keys();
+        let id = keys.chunk_id(b"addressable");
+        for len in [0, 1, NONCE_LEN, NONCE_LEN + TAG_LEN - 1] {
+            let err = keys
+                .open(&id, &vec![0u8; len])
+                .expect_err("a {len}-byte chunk must be refused, not indexed into")
+                .to_string();
+            assert!(err.contains("is truncated"), "at {len} bytes: {err}");
+        }
     }
 
     #[test]
