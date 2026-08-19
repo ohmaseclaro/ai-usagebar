@@ -553,6 +553,26 @@ impl Keys {
     /// addresses them, because it is authenticated as associated data rather
     /// than trusted to be unique per message.
     ///
+    /// # Known gap: the AAD carries no object type
+    ///
+    /// Every object sealed through here — a data chunk, a manifest chunk, an
+    /// index chunk, a pack header — uses `chunk_key` with `aad = its own id` and
+    /// **no domain separator saying which kind it is**. Serde ignores unknown
+    /// fields, so an `IndexObject`'s JSON structurally deserializes as a
+    /// `PackHeader`, and nothing in the AEAD layer objects to an object of one
+    /// kind being served where another was expected.
+    ///
+    /// Traced in 1-11 and left as it is, deliberately. It dead-ends: the id is
+    /// still bound, `open_chunk` still rechecks `chunk_id(plaintext) == id`, and
+    /// `pack::read_header`'s bounds checks plus the per-blob tags stop the
+    /// confused header before it yields anything — a read that errors, not a
+    /// compromise. Closing it properly means a type byte in the AAD, which moves
+    /// every sealed byte in the format and touches ~60 call sites; that is a
+    /// format change and it belongs to a phase that can plan it, not to a
+    /// remediation pass on a format that has just been stabilised and pinned.
+    /// **Phase 2 owns it.** If you are adding a *new* kind of object to this
+    /// key, add the domain separator first.
+    ///
     /// `pub(crate)` because `chunk::seal_chunk` is the one caller that gets the
     /// framing right. Callers outside this crate go through
     /// [`crate::sync::chunk::seal_chunk`].

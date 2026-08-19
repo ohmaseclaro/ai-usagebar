@@ -237,6 +237,19 @@ which derive the same nonce, which yield byte-identical output. That is what
 makes dedup work and what stops a re-sync of unchanged data from creating new
 remote objects forever.
 
+**Known gap — the AAD carries no object type.** Data chunks, manifest chunks,
+index chunks and pack headers are all sealed under `chunk_key` with `aad = id`
+and nothing saying which kind of object they are, so the AEAD layer cannot tell
+one kind served in another's place from the genuine article. It dead-ends
+rather than opening anything: the id is bound, the `chunk_id(plaintext) == id`
+recheck still runs, and the entry bounds checks of §4 plus the per-blob tags
+refuse a confused header — the outcome is an error, not a recovery. It is
+recorded here because a re-implementer should know it is a gap and not a
+decision: the fix is a type byte in the AAD, which changes every sealed byte in
+the format and so is a versioned format change rather than an edit. **An
+implementation adding a new kind of object under `chunk_key` should introduce
+the domain separator at the same time.**
+
 Binding the id as associated data means a chunk served under the wrong name
 fails its tag.
 
