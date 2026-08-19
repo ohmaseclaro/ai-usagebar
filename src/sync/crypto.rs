@@ -653,6 +653,7 @@ impl Keys {
     /// another bundle fails the tag here rather than depending on local state to
     /// notice — see [`Keys::open_root`].
     pub fn seal_root(&self, plaintext: &[u8], repo_id: &str) -> Result<Vec<u8>> {
+        let aad = root_aad(repo_id)?;
         let mut nonce = [0u8; NONCE_LEN];
         fill(&mut nonce)?;
         let sealed = XChaCha20Poly1305::new((&*self.root).into())
@@ -660,7 +661,7 @@ impl Keys {
                 &nonce.into(),
                 Payload {
                     msg: plaintext,
-                    aad: &root_aad(repo_id),
+                    aad: &aad,
                 },
             )
             .map_err(|_| AppError::Other("snapshot root encryption failed".into()))?;
@@ -684,6 +685,7 @@ impl Keys {
     /// entirely on local anchor state to notice. Taking the id from the remote
     /// would make the binding say nothing at all.
     pub fn open_root(&self, framed: &[u8], repo_id: &str) -> Result<Zeroizing<Vec<u8>>> {
+        let aad = root_aad(repo_id)?;
         if framed.len() < NONCE_LEN + TAG_LEN {
             return Err(AppError::Other("snapshot root is truncated".into()));
         }
@@ -694,7 +696,7 @@ impl Keys {
                 &nonce.into(),
                 Payload {
                     msg: sealed,
-                    aad: &root_aad(repo_id),
+                    aad: &aad,
                 },
             )
             .map(Zeroizing::new)
@@ -710,10 +712,25 @@ impl Keys {
 /// constant in every bundle in the world — and any two bundles sharing a master
 /// key would open each other's roots. `repo_id` is not length-prefixed because
 /// it is the last field: no other value follows it to be confused with.
-fn root_aad(repo_id: &str) -> Vec<u8> {
+///
+/// **Which is why an empty one is refused here rather than at a caller.** An
+/// empty `repo_id` degenerates this to the bare literal — the pre-F-3 global
+/// constant, and the scoping silently gone. The check lives in the shared
+/// function both [`Keys::seal_root`] and [`Keys::open_root`] route through, so
+/// there is no path that forgets it; refusing symmetrically costs no reader
+/// anything, because no build has ever been able to *write* such a root.
+fn root_aad(repo_id: &str) -> Result<Vec<u8>> {
+    if repo_id.is_empty() {
+        return Err(AppError::Other(
+            "a snapshot root needs a non-empty bundle identifier: an empty one \
+             scopes its associated data to nothing, and two bundles sharing a \
+             master key would open each other's roots"
+                .into(),
+        ));
+    }
     let mut aad = ROOT_AAD.to_vec();
     aad.extend_from_slice(repo_id.as_bytes());
-    aad
+    Ok(aad)
 }
 
 /// The format-scoping half of [`root_aad`].
@@ -985,6 +1002,30 @@ mod tests {
         );
         // …and it is the scoping that refuses it, not a broken round trip.
         assert_eq!(&*keys.open_root(&sealed, "bundle-a").unwrap(), b"counter=7");
+    }
+
+    /// An empty `repo_id` is refused on both sides, because it is the scoping
+    /// silently switching itself off.
+    ///
+    /// `root_aad("")` is the bare literal — the same global constant in every
+    /// bundle in the world, which is exactly what F-3 replaced. Nothing else
+    /// required the identifier to be non-empty, so two bundles that both left it
+    /// blank and shared a master key opened each other's roots again.
+    #[test]
+    fn an_empty_bundle_identifier_is_refused_rather_than_scoping_the_root_to_nothing() {
+        let keys = keys();
+
+        let err = keys
+            .seal_root(b"counter=7", "")
+            .expect_err("an empty bundle identifier must not seal")
+            .to_string();
+        assert!(err.contains("non-empty bundle identifier"), "{err}");
+
+        // …and on the read side too, so a root written by some other tool with
+        // an empty identifier cannot be opened into the degenerate AAD either.
+        let sealed = keys.seal_root(b"counter=7", REPO_ID).unwrap();
+        assert!(keys.open_root(&sealed, "").is_err());
+        assert!(keys.open_root(&sealed, REPO_ID).is_ok());
     }
 
     #[test]

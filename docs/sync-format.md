@@ -367,6 +367,12 @@ state to notice. Binding the expected `repo_id` makes a repository swap fail the
 Poly1305 tag instead. `repo_id` is not length-prefixed because it is the last
 field: nothing follows it to be confused with.
 
+**`repo_id` must be non-empty, on write and on read.** An empty one leaves the
+AAD equal to the bare literal — the global constant this binding exists to
+replace — so the scoping switches itself off with no error anywhere and two
+bundles sharing a master key open each other's roots again. An implementation
+must refuse to seal or open a root under an empty identifier.
+
 This is the one place the deterministic-nonce rule is inverted, and deliberately:
 every other object's nonce is derived from its content address because identical
 plaintext *must* seal identically or dedup dies. The root's plaintext changes on
