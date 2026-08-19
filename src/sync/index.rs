@@ -1,16 +1,64 @@
-//! The local change-detection index (D5). Schema owned by plan 2-03; plan 2-01
-//! opens the file and reads the one key `sync status` needs.
+//! The local change-detection index (D5).
 //!
 //! It lives under `~/.cache`, **not** `~/.config`, precisely so it is never
 //! itself synced. It is a *hint*: deleting it must degrade to a full re-scan,
-//! never to a wrong answer.
+//! never to a wrong answer. Every read path here is written so that the only
+//! way to be wrong is to be slow — a miss re-chunks the file, which costs I/O;
+//! a false hit would silently omit a changed file from the snapshot, which is
+//! the one failure this module exists to prevent.
 
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 
 use crate::error::{AppError, Result};
+use crate::sync::scope::FileEntry;
+
+/// Schema version this build writes and is the only one it reads. Unlike the
+/// bundle format's `check_version` ceiling, an index at any other version is
+/// simply thrown away and rebuilt — it is a cache, so there is nothing to
+/// migrate and nothing to lose.
+pub const SCHEMA_VERSION: i64 = 1;
+
+/// Ceiling on a stored `chunk_ids` blob, enforced inside the SQL so an absurd
+/// row is never materialised. The local index is not authenticated — any local
+/// process can write to it — and Phase 1 left the rule that an id list read
+/// before its container authenticates needs its own bound. 32 MiB is a million
+/// ids, roughly a 256 GiB file: unreachable legitimately.
+const MAX_CHUNK_IDS_BYTES: i64 = 32 * 1024 * 1024;
+
+const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS file (
+  path          TEXT PRIMARY KEY,
+  size          INTEGER NOT NULL,
+  mtime_ns      INTEGER NOT NULL,
+  inode         INTEGER NOT NULL,
+  sealed_chunks INTEGER NOT NULL,
+  chunk_ids     BLOB    NOT NULL,
+  seen_gen      INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS chunk (
+  id        BLOB PRIMARY KEY,
+  pack      BLOB    NOT NULL,
+  \"offset\" INTEGER NOT NULL,
+  clen      INTEGER NOT NULL,
+  plen      INTEGER NOT NULL,
+  seen_gen  INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v BLOB);
+";
+
+/// What a hit on the change-detection tuple gives back: enough to reuse the
+/// file's chunks without opening it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRecord {
+    /// How many full [`crate::sync::CHUNK_SIZE`] chunks the file had. The tail
+    /// chunk is the one that grows, so an append can reuse everything below it.
+    pub sealed_chunks: u64,
+    /// The file's chunk ids, in file order.
+    pub chunk_ids: Vec<[u8; 32]>,
+}
 
 /// `~/.cache/ai-usagebar/sync/index.sqlite3`, via the same resolver the vendor
 /// caches use.
@@ -26,6 +74,7 @@ pub fn default_path() -> Result<PathBuf> {
 pub struct Index {
     conn: Connection,
     path: PathBuf,
+    rebuilt: bool,
 }
 
 impl Index {
@@ -34,22 +83,40 @@ impl Index {
     /// The file is created and set to mode 0600 **before** the connection is
     /// opened: its rows carry account UUIDs inside full paths, so the mode is
     /// never briefly wrong on a shared machine.
+    ///
+    /// A file that is not a database, fails SQLite's integrity check, carries a
+    /// schema version this build does not write, or has our table names with
+    /// the wrong columns is **discarded and recreated**, not repaired. Repair
+    /// could keep a stale row, and a stale row is a changed file reported as
+    /// unchanged. The cost of discarding is one slow sync; see
+    /// [`Index::was_rebuilt`].
     pub fn at(path: &Path) -> Result<Self> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| AppError::io_at(dir, e))?;
         }
         create_private(path)?;
-        let conn = Connection::open(path)
-            .map_err(|e| AppError::Other(format!("could not open {}: {e}", path.display())))?;
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v BLOB)",
-            [],
-        )
-        .map_err(|e| AppError::Other(format!("could not initialise {}: {e}", path.display())))?;
-        Ok(Self {
-            conn,
-            path: path.to_path_buf(),
-        })
+        match open_checked(path) {
+            Ok(conn) => Ok(Self {
+                conn,
+                path: path.to_path_buf(),
+                rebuilt: false,
+            }),
+            Err(why) => {
+                // Path and reason only — the rows themselves are account UUIDs.
+                eprintln!(
+                    "ai-usagebar sync: rebuilding the local index at {} ({why})",
+                    path.display()
+                );
+                discard(path)?;
+                create_private(path)?;
+                let conn = open_checked(path)?;
+                Ok(Self {
+                    conn,
+                    path: path.to_path_buf(),
+                    rebuilt: true,
+                })
+            }
+        }
     }
 
     /// Where this index lives — so a report can name it without resolving
@@ -58,23 +125,263 @@ impl Index {
         &self.path
     }
 
+    /// True when this open threw away a damaged index and started over, so the
+    /// dry-run can tell the user why the run is slow instead of leaving them
+    /// guessing.
+    pub fn was_rebuilt(&self) -> bool {
+        self.rebuilt
+    }
+
     /// When the last successful sync completed, if the index knows. `None` is
     /// a normal first-run answer, not an error.
     pub fn last_sync(&self) -> Option<DateTime<Utc>> {
-        let raw: String = self
-            .conn
-            .query_row("SELECT v FROM meta WHERE k = 'last_sync'", [], |row| {
-                row.get(0)
-            })
-            .ok()?;
+        let raw: String = self.meta("last_sync")?;
         DateTime::parse_from_rfc3339(&raw)
             .ok()
             .map(|t| t.with_timezone(&Utc))
     }
+
+    /// Record the completion time of a successful sync.
+    pub fn set_last_sync(&self, at: DateTime<Utc>) -> Result<()> {
+        self.set_meta("last_sync", at.to_rfc3339())
+    }
+
+    /// The current sync generation, `0` before the first bump.
+    pub fn generation(&self) -> u64 {
+        self.meta::<i64>("generation")
+            .and_then(|v| u64::try_from(v).ok())
+            .unwrap_or(0)
+    }
+
+    /// Start a new generation and return it. Every row touched during the run
+    /// is stamped with this, which is what [`Index::evict_unseen`] then ages.
+    pub fn bump_generation(&self) -> Result<u64> {
+        let next = self.generation().saturating_add(1);
+        self.set_meta("generation", clamp_i64(next))?;
+        Ok(next)
+    }
+
+    /// D5's change detection, and the only question the planner asks per file:
+    /// does `(path, size, mtime_ns, inode)` match what we stored?
+    ///
+    /// A hit means the caller never opens the file — the short-circuit SYNC-02
+    /// rests on — so this performs no I/O beyond the SQLite read. Anything
+    /// unexpected (no row, a field that does not fit, a `chunk_ids` blob that
+    /// is not a whole number of 32-byte ids, a SQL error) is a miss, never a
+    /// partial answer.
+    pub fn lookup(&self, entry: &FileEntry) -> Option<FileRecord> {
+        let path = entry.path.to_str()?;
+        let (size, mtime_ns, inode) = key_of(entry)?;
+        let (sealed, blob): (i64, Vec<u8>) = self
+            .conn
+            .query_row(
+                "SELECT sealed_chunks, chunk_ids FROM file \
+                 WHERE path = ?1 AND size = ?2 AND mtime_ns = ?3 AND inode = ?4 \
+                   AND length(chunk_ids) <= ?5",
+                params![path, size, mtime_ns, inode, MAX_CHUNK_IDS_BYTES],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok()?;
+        if !blob.len().is_multiple_of(32) {
+            // A truncated row would otherwise yield a short chunk list, i.e. a
+            // file uploaded with its tail missing. Re-chunk instead.
+            return None;
+        }
+        Some(FileRecord {
+            sealed_chunks: u64::try_from(sealed).ok()?,
+            chunk_ids: blob
+                .chunks_exact(32)
+                .map(|c| {
+                    let mut id = [0u8; 32];
+                    id.copy_from_slice(c);
+                    id
+                })
+                .collect(),
+        })
+    }
+
+    /// Store what chunking a file produced, stamped with the current
+    /// generation.
+    pub fn record(
+        &self,
+        entry: &FileEntry,
+        sealed_chunks: u64,
+        chunk_ids: &[[u8; 32]],
+    ) -> Result<()> {
+        // An entry that cannot be represented simply gets no row, which reads
+        // back as "changed": a re-chunk next run, not a failed sync.
+        let (Some(path), Some((size, mtime_ns, inode)), Ok(sealed)) = (
+            entry.path.to_str(),
+            key_of(entry),
+            i64::try_from(sealed_chunks),
+        ) else {
+            return Ok(());
+        };
+        // One statement, so SQLite commits it whole or not at all: a process
+        // killed mid-write leaves the previous row or none, and both are
+        // correct answers for a hint.
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO file \
+                 (path, size, mtime_ns, inode, sealed_chunks, chunk_ids, seen_gen) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    path,
+                    size,
+                    mtime_ns,
+                    inode,
+                    sealed,
+                    chunk_ids.concat(),
+                    clamp_i64(self.generation()),
+                ],
+            )
+            .map_err(|e| self.err(e))?;
+        Ok(())
+    }
+
+    /// Stamp the current generation on a row confirmed unchanged, so eviction
+    /// does not age out a file just because it never needed re-chunking.
+    pub fn touch(&self, path: &Path) -> Result<()> {
+        let Some(path) = path.to_str() else {
+            return Ok(());
+        };
+        self.conn
+            .execute(
+                "UPDATE file SET seen_gen = ?1 WHERE path = ?2",
+                params![clamp_i64(self.generation()), path],
+            )
+            .map_err(|e| self.err(e))?;
+        Ok(())
+    }
+
+    /// Drop every row not seen within the last `keep_generations` generations
+    /// and return how many went — borg's cache-age mechanic, so a deleted
+    /// file's row does not live forever.
+    pub fn evict_unseen(&self, keep_generations: u64) -> Result<usize> {
+        // Signed on purpose: on a fresh index `generation - keep` is negative,
+        // and a saturating unsigned zero would evict the rows just written.
+        let horizon = clamp_i64(self.generation()).saturating_sub(clamp_i64(keep_generations));
+        let mut removed = self
+            .conn
+            .execute("DELETE FROM file WHERE seen_gen <= ?1", [horizon])
+            .map_err(|e| self.err(e))?;
+        removed += self
+            .conn
+            .execute("DELETE FROM chunk WHERE seen_gen <= ?1", [horizon])
+            .map_err(|e| self.err(e))?;
+        Ok(removed)
+    }
+
+    fn meta<T: rusqlite::types::FromSql>(&self, key: &str) -> Option<T> {
+        self.conn
+            .query_row("SELECT v FROM meta WHERE k = ?1", [key], |row| row.get(0))
+            .ok()
+    }
+
+    fn set_meta(&self, key: &str, value: impl rusqlite::ToSql) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO meta (k, v) VALUES (?1, ?2)",
+                params![key, value],
+            )
+            .map_err(|e| self.err(e))?;
+        Ok(())
+    }
+
+    fn err(&self, e: rusqlite::Error) -> AppError {
+        sql_err(&self.path, e)
+    }
+}
+
+/// D5's three numeric fields as SQLite integers.
+///
+/// D5 locks the tuple as `(path, size, mtime_ns, inode)`. The research argued
+/// for borg's `ctime` as a fifth field, since ctime cannot be forged from user
+/// space; D5 decided against it. That is a decision, not an omission — an
+/// attacker who can set mtime on the user's own files can already edit them.
+///
+/// `None` — a value that does not fit an i64 — reads as "no match", so the file
+/// is re-chunked. Always the safe direction.
+fn key_of(entry: &FileEntry) -> Option<(i64, i64, i64)> {
+    Some((
+        i64::try_from(entry.size).ok()?,
+        i64::try_from(entry.mtime_ns).ok()?,
+        i64::try_from(entry.inode).ok()?,
+    ))
+}
+
+fn clamp_i64(v: u64) -> i64 {
+    i64::try_from(v).unwrap_or(i64::MAX)
+}
+
+fn sql_err(path: &Path, e: rusqlite::Error) -> AppError {
+    AppError::Other(format!("local sync index at {}: {e}", path.display()))
+}
+
+/// Open `path` and bring it to [`SCHEMA_VERSION`], or fail so [`Index::at`] can
+/// discard it. Every check here is a reason to throw the file away.
+fn open_checked(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path).map_err(|e| sql_err(path, e))?;
+    // Catches both "this is not a SQLite file at all" and a genuinely damaged
+    // one; a zero-length file is a valid empty database and passes.
+    let verdict: String = conn
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .map_err(|e| sql_err(path, e))?;
+    if verdict != "ok" {
+        return Err(AppError::Other(format!(
+            "local sync index at {} failed SQLite's integrity check",
+            path.display()
+        )));
+    }
+    let found: Option<i64> = conn
+        .query_row("SELECT v FROM meta WHERE k = 'schema_version'", [], |row| {
+            row.get(0)
+        })
+        .ok();
+    if let Some(v) = found
+        && v != SCHEMA_VERSION
+    {
+        return Err(AppError::Other(format!(
+            "local sync index at {} is schema version {v}, this build writes {SCHEMA_VERSION}",
+            path.display()
+        )));
+    }
+    conn.execute_batch(SCHEMA).map_err(|e| sql_err(path, e))?;
+    // Prepare-only probe: a file carrying our table names with different
+    // columns survives `CREATE TABLE IF NOT EXISTS`, and would otherwise fail
+    // at the first lookup — mid-sync, where the answer cannot be "discard".
+    conn.prepare(
+        "SELECT path, size, mtime_ns, inode, sealed_chunks, chunk_ids, seen_gen FROM file",
+    )
+    .map_err(|e| sql_err(path, e))?;
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (k, v) VALUES ('schema_version', ?1)",
+        [SCHEMA_VERSION],
+    )
+    .map_err(|e| sql_err(path, e))?;
+    Ok(conn)
+}
+
+/// Remove a damaged index, sidecars included: SQLite would happily replay a
+/// stale `-journal` or `-wal` over the fresh database and reinstate exactly the
+/// corruption we just removed.
+fn discard(path: &Path) -> Result<()> {
+    for suffix in ["", "-journal", "-wal", "-shm"] {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        let victim = PathBuf::from(name);
+        match std::fs::remove_file(&victim) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(AppError::io_at(&victim, e)),
+        }
+    }
+    Ok(())
 }
 
 /// Create the file mode-0600 if it does not exist. SQLite is happy to adopt a
-/// zero-length file, which is what lets the mode be right from byte zero.
+/// zero-length file, which is what lets the mode be right from byte zero — on
+/// the rebuild path just as much as on a fresh one.
 fn create_private(path: &Path) -> Result<()> {
     if path.exists() {
         return Ok(());
@@ -99,57 +406,278 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn entry(path: &Path, size: u64, mtime_ns: i128, inode: u64) -> FileEntry {
+        FileEntry {
+            path: path.to_path_buf(),
+            size,
+            mtime_ns,
+            inode,
+        }
+    }
+
+    fn sample(dir: &TempDir) -> FileEntry {
+        entry(
+            &dir.path().join("a.jsonl"),
+            4096,
+            1_700_000_000_123_456_789,
+            42,
+        )
+    }
+
+    fn ids(n: usize) -> Vec<[u8; 32]> {
+        (0..n)
+            .map(|i| {
+                let mut id = [0u8; 32];
+                id[0] = u8::try_from(i).unwrap();
+                id
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn assert_private(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+    }
+
+    // ---- schema and open ----------------------------------------------
+
     #[test]
     fn opening_a_fresh_index_creates_the_file_and_reports_no_last_sync() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("nested").join("index.sqlite3");
         let index = Index::at(&path).unwrap();
-        assert!(path.exists());
+        assert!(path.exists(), "a missing parent directory must be created");
         assert!(index.last_sync().is_none());
+        assert!(!index.was_rebuilt());
+        assert_eq!(index.meta::<i64>("schema_version"), Some(SCHEMA_VERSION));
     }
 
     #[cfg(unix)]
     #[test]
     fn the_index_file_is_created_mode_0600() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("index.sqlite3");
         let _index = Index::at(&path).unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+        assert_private(&path);
     }
 
     #[test]
-    fn a_recorded_last_sync_reads_back() {
+    fn reopening_an_index_of_the_current_version_keeps_what_was_written() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("index.sqlite3");
+        let e = sample(&dir);
+        {
+            let index = Index::at(&path).unwrap();
+            index.record(&e, 2, &ids(3)).unwrap();
+        }
         let index = Index::at(&path).unwrap();
+        assert!(
+            !index.was_rebuilt(),
+            "a healthy index must not be discarded"
+        );
+        assert_eq!(index.lookup(&e).unwrap().sealed_chunks, 2);
+    }
+
+    #[test]
+    fn last_sync_round_trips_and_a_garbage_value_reads_as_unknown() {
+        let dir = TempDir::new().unwrap();
+        let index = Index::at(&dir.path().join("index.sqlite3")).unwrap();
+        let at = DateTime::parse_from_rfc3339("2026-08-19T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        index.set_last_sync(at).unwrap();
+        assert_eq!(index.last_sync(), Some(at));
+
+        index.set_meta("last_sync", "not-a-date").unwrap();
+        assert!(index.last_sync().is_none());
+    }
+
+    // ---- the change-detection tuple -----------------------------------
+
+    #[test]
+    fn lookup_of_an_unknown_path_is_none() {
+        let dir = TempDir::new().unwrap();
+        let index = Index::at(&dir.path().join("index.sqlite3")).unwrap();
+        assert!(index.lookup(&sample(&dir)).is_none());
+    }
+
+    #[test]
+    fn lookup_hits_when_the_whole_tuple_matches() {
+        let dir = TempDir::new().unwrap();
+        let index = Index::at(&dir.path().join("index.sqlite3")).unwrap();
+        let e = sample(&dir);
+        index.record(&e, 7, &ids(2)).unwrap();
+        let hit = index.lookup(&e).expect("an identical tuple must hit");
+        assert_eq!(hit.sealed_chunks, 7);
+        assert_eq!(hit.chunk_ids, ids(2));
+    }
+
+    #[test]
+    fn lookup_misses_when_size_differs() {
+        let dir = TempDir::new().unwrap();
+        let index = Index::at(&dir.path().join("index.sqlite3")).unwrap();
+        let e = sample(&dir);
+        index.record(&e, 1, &ids(1)).unwrap();
+        let mut changed = e.clone();
+        changed.size += 1;
+        assert!(index.lookup(&changed).is_none());
+    }
+
+    #[test]
+    fn lookup_misses_when_mtime_ns_differs() {
+        let dir = TempDir::new().unwrap();
+        let index = Index::at(&dir.path().join("index.sqlite3")).unwrap();
+        let e = sample(&dir);
+        index.record(&e, 1, &ids(1)).unwrap();
+        let mut changed = e.clone();
+        changed.mtime_ns += 1;
+        assert!(index.lookup(&changed).is_none());
+    }
+
+    #[test]
+    fn lookup_misses_when_inode_differs() {
+        let dir = TempDir::new().unwrap();
+        let index = Index::at(&dir.path().join("index.sqlite3")).unwrap();
+        let e = sample(&dir);
+        index.record(&e, 1, &ids(1)).unwrap();
+        let mut changed = e.clone();
+        changed.inode += 1;
+        assert!(index.lookup(&changed).is_none());
+    }
+
+    #[test]
+    fn chunk_id_lists_round_trip_in_order_at_length_0_1_and_many() {
+        let dir = TempDir::new().unwrap();
+        let index = Index::at(&dir.path().join("index.sqlite3")).unwrap();
+        let e = sample(&dir);
+        for n in [0usize, 1, 200] {
+            let expected = ids(n);
+            index.record(&e, n as u64, &expected).unwrap();
+            assert_eq!(index.lookup(&e).unwrap().chunk_ids, expected, "n = {n}");
+        }
+    }
+
+    #[test]
+    fn a_chunk_ids_blob_that_is_not_a_whole_number_of_ids_reads_as_no_match() {
+        let dir = TempDir::new().unwrap();
+        let index = Index::at(&dir.path().join("index.sqlite3")).unwrap();
+        let e = sample(&dir);
+        index.record(&e, 2, &ids(2)).unwrap();
+        // Truncate the stored blob mid-id, as a partial write would.
         index
             .conn
-            .execute(
-                "INSERT INTO meta (k, v) VALUES ('last_sync', '2026-08-19T12:00:00Z')",
-                [],
-            )
+            .execute("UPDATE file SET chunk_ids = substr(chunk_ids, 1, 33)", [])
             .unwrap();
-        assert_eq!(
-            index.last_sync().map(|t| t.to_rfc3339()),
-            Some("2026-08-19T12:00:00+00:00".to_string())
+        assert!(
+            index.lookup(&e).is_none(),
+            "a truncated row must force a re-chunk, not yield a short list"
         );
     }
 
+    // ---- generations and eviction -------------------------------------
+
     #[test]
-    fn a_garbage_last_sync_value_reads_as_unknown_not_an_error() {
+    fn eviction_drops_an_untouched_row_and_keeps_a_touched_one() {
+        let dir = TempDir::new().unwrap();
+        let index = Index::at(&dir.path().join("index.sqlite3")).unwrap();
+        let stale = entry(&dir.path().join("stale"), 1, 1, 1);
+        let fresh = entry(&dir.path().join("fresh"), 2, 2, 2);
+        assert_eq!(index.generation(), 0);
+        index.record(&stale, 0, &[]).unwrap();
+        index.record(&fresh, 0, &[]).unwrap();
+
+        // Nothing is old enough yet on a first run.
+        assert_eq!(index.evict_unseen(1).unwrap(), 0);
+
+        assert_eq!(index.bump_generation().unwrap(), 1);
+        index.touch(&fresh.path).unwrap();
+        assert_eq!(index.evict_unseen(1).unwrap(), 1);
+        assert!(index.lookup(&stale).is_none());
+        assert!(index.lookup(&fresh).is_some());
+    }
+
+    // ---- the index is a hint ------------------------------------------
+
+    #[test]
+    fn deleting_the_index_reports_every_file_as_changed() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("index.sqlite3");
+        let e = sample(&dir);
+        {
+            let index = Index::at(&path).unwrap();
+            index.record(&e, 5, &ids(5)).unwrap();
+            assert!(index.lookup(&e).is_some());
+        }
+        std::fs::remove_file(&path).unwrap();
+
         let index = Index::at(&path).unwrap();
-        index
-            .conn
-            .execute(
-                "INSERT INTO meta (k, v) VALUES ('last_sync', 'not-a-date')",
-                [],
-            )
-            .unwrap();
-        assert!(index.last_sync().is_none());
+        assert!(
+            index.lookup(&e).is_none(),
+            "a deleted index must degrade to a full re-scan"
+        );
+        index.record(&e, 5, &ids(5)).unwrap();
+        assert!(index.lookup(&e).is_some());
+    }
+
+    #[test]
+    fn garbage_bytes_are_discarded_and_the_index_rebuilds_itself() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("index.sqlite3");
+        std::fs::write(&path, b"this is not a database, it is a pipe").unwrap();
+
+        let index = Index::at(&path).unwrap();
+        assert!(index.was_rebuilt());
+        assert!(index.lookup(&sample(&dir)).is_none());
+        #[cfg(unix)]
+        assert_private(&path);
+
+        let e = sample(&dir);
+        index.record(&e, 3, &ids(3)).unwrap();
+        assert_eq!(index.lookup(&e).unwrap().chunk_ids, ids(3));
+    }
+
+    #[test]
+    fn a_future_schema_version_is_discarded_rather_than_read() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("index.sqlite3");
+        let e = sample(&dir);
+        {
+            let index = Index::at(&path).unwrap();
+            index.record(&e, 9, &ids(9)).unwrap();
+            index
+                .set_meta("schema_version", SCHEMA_VERSION + 1)
+                .unwrap();
+        }
+
+        let index = Index::at(&path).unwrap();
+        assert!(index.was_rebuilt());
+        assert!(
+            index.lookup(&e).is_none(),
+            "rows written by an unknown schema must not be interpreted"
+        );
+        assert_eq!(index.meta::<i64>("schema_version"), Some(SCHEMA_VERSION));
+        #[cfg(unix)]
+        assert_private(&path);
+
+        index.record(&e, 3, &ids(3)).unwrap();
+        assert_eq!(index.lookup(&e).unwrap().sealed_chunks, 3);
+    }
+
+    #[test]
+    fn our_table_names_with_the_wrong_columns_are_discarded_too() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("index.sqlite3");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE file (path TEXT PRIMARY KEY, junk TEXT)")
+                .unwrap();
+        }
+        let index = Index::at(&path).unwrap();
+        assert!(index.was_rebuilt());
+        let e = sample(&dir);
+        index.record(&e, 1, &ids(1)).unwrap();
+        assert!(index.lookup(&e).is_some());
     }
 }
