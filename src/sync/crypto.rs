@@ -22,8 +22,10 @@
 //! and run in microseconds, which keeps the AUR `check()` inside its time budget.
 //! Production passes [`KdfParams::default`]. Those parameters are bounded rather
 //! than trusted: [`MIN_KDF_MEMORY_KIB`] on the write path (with the floor itself
-//! as an argument, so the cheap seam survives it) and [`MAX_KDF_MEMORY_KIB`] on
-//! the read path, where `m_kib` arrives from a hostile remote.
+//! as an argument, so the cheap seam survives it) and [`MAX_KDF_MEMORY_KIB`]
+//! inside [`derive_kek`] itself, which every derivation routes through — so a
+//! caller reaching for the primitive directly with a hostile remote's `m_kib`
+//! is bounded too, rather than only the two paths that remembered to ask.
 //!
 //! Secret hygiene is structural, not aspirational: key material lives in
 //! `Zeroizing`, [`Keys`] has a hand-written `Debug` that prints `<redacted>`,
@@ -91,9 +93,12 @@ impl Default for KdfParams {
 ///
 /// 8 MiB is 1/128 of the shipped default and a thousand times argon2's floor.
 /// The floor and the passphrase policy are also coupled directly — below
-/// [`KdfParams::default`]'s memory, `passphrase::check` accepts nothing short of
-/// generated strength — because a floor alone only moves the line, while the
-/// coupling makes lowering the KDF cost pay for itself in password strength.
+/// [`KdfParams::default`]'s memory, `passphrase::check` raises the accepted
+/// password length from 12 characters to 20 — because a floor alone only moves
+/// the line, while the coupling makes lowering the KDF cost pay for itself in
+/// password length. Length, not measured entropy: 20 is what the generator
+/// emits, and `passphrase` says plainly why nothing there can tell a generated
+/// passphrase from a typed one of the same length.
 ///
 /// Only new keyfiles. An existing bundle written below this stays openable
 /// forever: refusing to *read* it would destroy data to enforce a policy the
@@ -138,6 +143,9 @@ fn check_kdf_floor(m_kib: u32, min_m_kib: u32) -> Result<()> {
 ///
 /// Pure and clock-free, like everything else here. The parameters are public —
 /// they live in cleartext in the keyfile — so naming them is safe.
+///
+/// Private, and it stays private because [`derive_kek`] applies it to every
+/// derivation: an outside caller has nothing left to enforce by hand.
 fn check_kdf_ceiling(m_kib: u32) -> Result<()> {
     if m_kib <= MAX_KDF_MEMORY_KIB {
         return Ok(());
@@ -152,7 +160,20 @@ fn check_kdf_ceiling(m_kib: u32) -> Result<()> {
 }
 
 /// Password + salt -> key-encryption key.
+///
+/// **[`MAX_KDF_MEMORY_KIB`] is enforced here, not by the callers.** This is the
+/// one function every derivation routes through, including the idiom
+/// [`KdfDoc::params`] tells a caller to write —
+/// `derive_kek(pw, &salt, keyfile.kdf.params())`, whose `m_kib` is whatever a
+/// hostile remote put in the keyfile. The ceiling used to sit in `wrap` and in
+/// `unwrap_master_key` instead, which bounded two call sites rather than the
+/// rule: any third caller, in this crate or outside it, reached `argon2`
+/// 0.5.3's infallible `vec![]` and died in `handle_alloc_error` — an abort, in
+/// flat violation of the project's hard invariant that the widget always exits
+/// 0. A guard in the shared function is both the smaller diff and the only one
+/// a future caller cannot forget.
 pub fn derive_kek(pw: &[u8], salt: &[u8; 16], k: KdfParams) -> Result<Zeroizing<[u8; 32]>> {
+    check_kdf_ceiling(k.m_kib)?;
     let params = Params::new(k.m_kib, k.t, k.p, Some(32)).map_err(|_| {
         // The parameters are public (they live in cleartext in the keyfile), so
         // naming them is safe and is the only actionable thing to say.
@@ -310,6 +331,19 @@ fn aad_bytes(format: u32, kdf: &KdfDoc) -> Result<Vec<u8>> {
 /// The on-disk keyfile: KDF parameters in cleartext plus the wrapped master
 /// key. It holds no plaintext key material — the wrapped key is ciphertext and
 /// the salt is public — so deriving `Debug` here is safe.
+///
+/// **The fields stay `pub`, and that is a considered trade rather than an
+/// oversight.** They let an outside caller assemble a `Keyfile` struct without
+/// going through `wrap`, so the write-path floor is not enforced by the type.
+/// It is not enforced by the type in any case — a caller willing to build one by
+/// hand is also willing to run Argon2id and XChaCha20-Poly1305 by hand, which is
+/// what filling `wrapped_master_key` actually takes. What the fields buy is the
+/// one test that proves the *documented* format and the implemented one are the
+/// same thing: `tests/sync_vectors.rs` wraps a fixed master key from
+/// `docs/sync-format.md` §1 and asserts [`Keyfile::open`] accepts it, which is
+/// impossible against a private-field struct and irreplaceable as evidence. The
+/// hole that mattered — an exported entry point that *takes* the floor as an
+/// argument, so no crypto knowledge is needed to skip it — is closed above.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Keyfile {
     pub format: u32,
@@ -324,8 +358,9 @@ impl Keyfile {
     /// Draw a fresh master key and wrap it under `pw`. Returns both the keyfile
     /// to persist and the live subkeys, so the caller never pays the KDF twice.
     ///
-    /// Refuses `k.m_kib` below [`MIN_KDF_MEMORY_KIB`]. **Every production caller
-    /// uses this**, not [`Keyfile::create_with_floor`].
+    /// Refuses `k.m_kib` below [`MIN_KDF_MEMORY_KIB`]. This is the **only** way
+    /// to create a keyfile from outside the crate; `create_with_floor` beside it
+    /// is `pub(crate)`.
     pub fn create(pw: &[u8], k: KdfParams) -> Result<(Keyfile, Keys)> {
         Self::create_with_floor(pw, k, MIN_KDF_MEMORY_KIB)
     }
@@ -335,10 +370,21 @@ impl Keyfile {
     ///
     /// Tests wrap at `m_kib = 8` and run in microseconds, which is what keeps
     /// the AUR `check()` inside its budget on an installer's machine; they pass
-    /// their own parameters as the floor. Production has no reason to call this:
-    /// a caller that wants a lower floor wants [`MIN_KDF_MEMORY_KIB`] lowered,
-    /// where the argument for it can be read.
-    pub fn create_with_floor(pw: &[u8], k: KdfParams, min_m_kib: u32) -> Result<(Keyfile, Keys)> {
+    /// their own parameters as the floor.
+    ///
+    /// **`pub(crate)`, for the same reason `Keys::seal` is.** Exported, this was
+    /// not a seam but a hole: `create` at 8 KiB is refused while this wrote the
+    /// keyfile and it opened, so [`MIN_KDF_MEMORY_KIB`] bound `create` and
+    /// `rewrap` rather than the format. Production has no reason to call it
+    /// either — a caller that wants a lower floor wants [`MIN_KDF_MEMORY_KIB`]
+    /// lowered, where the argument for it can be read. An integration test that
+    /// needs a cheap keyfile builds one by hand from the public fields, which
+    /// `tests/sync_vectors.rs` has to do anyway to pin a fixed master key.
+    pub(crate) fn create_with_floor(
+        pw: &[u8],
+        k: KdfParams,
+        min_m_kib: u32,
+    ) -> Result<(Keyfile, Keys)> {
         let mut mk = Zeroizing::new([0u8; 32]);
         fill(&mut mk[..])?;
         let keyfile = Self::wrap(&mk, pw, k, min_m_kib)?;
@@ -370,9 +416,10 @@ impl Keyfile {
         self.rewrap_with_floor(old_pw, new_pw, k, MIN_KDF_MEMORY_KIB)
     }
 
-    /// [`Keyfile::rewrap`] with the memory floor as an argument. The test seam;
-    /// see [`Keyfile::create_with_floor`].
-    pub fn rewrap_with_floor(
+    /// [`Keyfile::rewrap`] with the memory floor as an argument. The test seam,
+    /// `pub(crate)` for the reason `create_with_floor` is: a floor a caller can
+    /// pass its own value for is not a floor at all.
+    pub(crate) fn rewrap_with_floor(
         &self,
         old_pw: &[u8],
         new_pw: &[u8],
@@ -384,8 +431,10 @@ impl Keyfile {
     }
 
     fn wrap(mk: &[u8; 32], pw: &[u8], k: KdfParams, min_m_kib: u32) -> Result<Keyfile> {
+        // The floor only. The ceiling is `derive_kek`'s, a few lines down, and
+        // repeating it here would be a second copy of one rule — the shape that
+        // let a third caller past it in the first place.
         check_kdf_floor(k.m_kib, min_m_kib)?;
-        check_kdf_ceiling(k.m_kib)?;
 
         let mut salt = [0u8; 16];
         let mut nonce = [0u8; NONCE_LEN];
@@ -414,11 +463,11 @@ impl Keyfile {
     }
 
     fn unwrap_master_key(&self, pw: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
-        // Both gates run *before* any cryptographic work: refusing a too-new
-        // bundle must not cost 1.5 s and a gibibyte first, and refusing an
-        // absurd working set must not cost the allocation it is refusing.
+        // Before any cryptographic work: refusing a too-new bundle must not cost
+        // 1.5 s and a gibibyte first. The absurd-working-set gate is one layer
+        // down in `derive_kek`, which is still ahead of every allocation — the
+        // only thing between here and there is base64 decoding.
         check_version(self.format, MAX_SUPPORTED_KEYFILE, "keyfile")?;
-        check_kdf_ceiling(self.kdf.m_kib)?;
 
         let salt = self.kdf.salt_bytes()?;
         let nonce = self.nonce_bytes()?;
@@ -503,6 +552,26 @@ impl Keys {
     /// from the exact bytes passed as `message`; the id may be anything that
     /// addresses them, because it is authenticated as associated data rather
     /// than trusted to be unique per message.
+    ///
+    /// # Known gap: the AAD carries no object type
+    ///
+    /// Every object sealed through here — a data chunk, a manifest chunk, an
+    /// index chunk, a pack header — uses `chunk_key` with `aad = its own id` and
+    /// **no domain separator saying which kind it is**. Serde ignores unknown
+    /// fields, so an `IndexObject`'s JSON structurally deserializes as a
+    /// `PackHeader`, and nothing in the AEAD layer objects to an object of one
+    /// kind being served where another was expected.
+    ///
+    /// Traced in 1-11 and left as it is, deliberately. It dead-ends: the id is
+    /// still bound, `open_chunk` still rechecks `chunk_id(plaintext) == id`, and
+    /// `pack::read_header`'s bounds checks plus the per-blob tags stop the
+    /// confused header before it yields anything — a read that errors, not a
+    /// compromise. Closing it properly means a type byte in the AAD, which moves
+    /// every sealed byte in the format and touches ~60 call sites; that is a
+    /// format change and it belongs to a phase that can plan it, not to a
+    /// remediation pass on a format that has just been stabilised and pinned.
+    /// **Phase 2 owns it.** If you are adding a *new* kind of object to this
+    /// key, add the domain separator first.
     ///
     /// `pub(crate)` because `chunk::seal_chunk` is the one caller that gets the
     /// framing right. Callers outside this crate go through
@@ -604,6 +673,7 @@ impl Keys {
     /// another bundle fails the tag here rather than depending on local state to
     /// notice — see [`Keys::open_root`].
     pub fn seal_root(&self, plaintext: &[u8], repo_id: &str) -> Result<Vec<u8>> {
+        let aad = root_aad(repo_id)?;
         let mut nonce = [0u8; NONCE_LEN];
         fill(&mut nonce)?;
         let sealed = XChaCha20Poly1305::new((&*self.root).into())
@@ -611,7 +681,7 @@ impl Keys {
                 &nonce.into(),
                 Payload {
                     msg: plaintext,
-                    aad: &root_aad(repo_id),
+                    aad: &aad,
                 },
             )
             .map_err(|_| AppError::Other("snapshot root encryption failed".into()))?;
@@ -635,6 +705,7 @@ impl Keys {
     /// entirely on local anchor state to notice. Taking the id from the remote
     /// would make the binding say nothing at all.
     pub fn open_root(&self, framed: &[u8], repo_id: &str) -> Result<Zeroizing<Vec<u8>>> {
+        let aad = root_aad(repo_id)?;
         if framed.len() < NONCE_LEN + TAG_LEN {
             return Err(AppError::Other("snapshot root is truncated".into()));
         }
@@ -645,7 +716,7 @@ impl Keys {
                 &nonce.into(),
                 Payload {
                     msg: sealed,
-                    aad: &root_aad(repo_id),
+                    aad: &aad,
                 },
             )
             .map(Zeroizing::new)
@@ -661,10 +732,25 @@ impl Keys {
 /// constant in every bundle in the world — and any two bundles sharing a master
 /// key would open each other's roots. `repo_id` is not length-prefixed because
 /// it is the last field: no other value follows it to be confused with.
-fn root_aad(repo_id: &str) -> Vec<u8> {
+///
+/// **Which is why an empty one is refused here rather than at a caller.** An
+/// empty `repo_id` degenerates this to the bare literal — the pre-F-3 global
+/// constant, and the scoping silently gone. The check lives in the shared
+/// function both [`Keys::seal_root`] and [`Keys::open_root`] route through, so
+/// there is no path that forgets it; refusing symmetrically costs no reader
+/// anything, because no build has ever been able to *write* such a root.
+fn root_aad(repo_id: &str) -> Result<Vec<u8>> {
+    if repo_id.is_empty() {
+        return Err(AppError::Other(
+            "a snapshot root needs a non-empty bundle identifier: an empty one \
+             scopes its associated data to nothing, and two bundles sharing a \
+             master key would open each other's roots"
+                .into(),
+        ));
+    }
     let mut aad = ROOT_AAD.to_vec();
     aad.extend_from_slice(repo_id.as_bytes());
-    aad
+    Ok(aad)
 }
 
 /// The format-scoping half of [`root_aad`].
@@ -691,8 +777,8 @@ pub fn content_address(bytes: &[u8]) -> ChunkId {
 ///
 /// This is the *pre-flight*, for a surface that knows how much memory it has and
 /// can print something a user can act on. It is not the safety net:
-/// `check_kdf_ceiling` is, it runs inside [`Keyfile::open`] with no dependency
-/// on a caller remembering anything, and it does not read the machine.
+/// `check_kdf_ceiling` is, it runs inside [`derive_kek`] with no dependency on a
+/// caller remembering anything, and it does not read the machine.
 pub fn check_memory_budget(m_kib: u32, available_kib: u64) -> Result<()> {
     if u64::from(m_kib) <= available_kib {
         return Ok(());
@@ -938,6 +1024,30 @@ mod tests {
         assert_eq!(&*keys.open_root(&sealed, "bundle-a").unwrap(), b"counter=7");
     }
 
+    /// An empty `repo_id` is refused on both sides, because it is the scoping
+    /// silently switching itself off.
+    ///
+    /// `root_aad("")` is the bare literal — the same global constant in every
+    /// bundle in the world, which is exactly what F-3 replaced. Nothing else
+    /// required the identifier to be non-empty, so two bundles that both left it
+    /// blank and shared a master key opened each other's roots again.
+    #[test]
+    fn an_empty_bundle_identifier_is_refused_rather_than_scoping_the_root_to_nothing() {
+        let keys = keys();
+
+        let err = keys
+            .seal_root(b"counter=7", "")
+            .expect_err("an empty bundle identifier must not seal")
+            .to_string();
+        assert!(err.contains("non-empty bundle identifier"), "{err}");
+
+        // …and on the read side too, so a root written by some other tool with
+        // an empty identifier cannot be opened into the degenerate AAD either.
+        let sealed = keys.seal_root(b"counter=7", REPO_ID).unwrap();
+        assert!(keys.open_root(&sealed, "").is_err());
+        assert!(keys.open_root(&sealed, REPO_ID).is_ok());
+    }
+
     #[test]
     fn a_root_shorter_than_a_nonce_and_a_tag_errors_instead_of_panicking() {
         let keys = keys();
@@ -1121,6 +1231,33 @@ mod tests {
         // Untouched, it still opens, so the refusal above is the gate rather
         // than a keyfile that never worked.
         assert!(keyfile.open(b"a hostile remote").is_ok());
+    }
+
+    /// The ceiling belongs to `derive_kek`, not to the two paths that used to
+    /// remember it.
+    ///
+    /// `KdfDoc::params` is public and its own doc tells callers to use the
+    /// keyfile's stored parameters, so this is the *recommended* idiom written
+    /// out — with the `m_kib` a hostile remote chose. Guarding `wrap` and
+    /// `unwrap_master_key` instead left exactly this line reaching argon2
+    /// 0.5.3's infallible `vec![]`, which aborts rather than errors.
+    #[test]
+    fn derive_kek_refuses_the_ceiling_itself_rather_than_trusting_its_callers() {
+        let (keyfile, _) =
+            Keyfile::create_with_floor(b"a hostile remote", CHEAP, CHEAP.m_kib).unwrap();
+        let mut absurd = keyfile.clone();
+        absurd.kdf.m_kib = u32::MAX;
+
+        let err = derive_kek(b"a hostile remote", &[0u8; 16], absurd.kdf.params())
+            .expect_err("the documented idiom must not reach a 4 TiB allocation")
+            .to_string();
+        assert!(err.contains("ceiling this build will allocate"), "{err}");
+        // …and the message names no secret: the parameters are cleartext in the
+        // keyfile, the password is not in it.
+        assert!(!err.contains("a hostile remote"), "{err}");
+
+        // The honest parameters still derive, so the refusal is the gate.
+        assert!(derive_kek(b"a hostile remote", &[0u8; 16], keyfile.kdf.params()).is_ok());
     }
 
     #[test]

@@ -83,10 +83,13 @@ openable; one initialised higher stays strong.
   smallest input the algorithm is defined for rather than a security parameter,
   and the 12-character password rule in §9 is arithmetic against the guess rate
   the *shipped* parameters buy. The two are also coupled directly: below the
-  default memory cost, a user-supplied password is refused unless it is of
-  generated strength (20 characters, 100 bits), which is uncrackable at any KDF
-  cost. Lowering the cost therefore trades against password strength instead of
-  against security.
+  default memory cost a user-supplied password must be at least **20
+  characters** rather than 12 — the length a generated passphrase has. Lowering
+  the cost therefore trades against password length instead of against security.
+  It is a length rule and not an entropy one, and §9 says what that is worth: 20
+  characters from the generator are 100 uniform bits, 20 characters somebody
+  chose may be worth half that, and an implementation holding only the string
+  cannot tell which it has.
 - **Reading** is refused above **4 GiB**, and is deliberately unbounded below.
   `m_kib` reaches a reader from a keyfile a hostile remote may have edited, and
   an implementation whose Argon2 allocates infallibly turns one edited integer
@@ -234,6 +237,19 @@ which derive the same nonce, which yield byte-identical output. That is what
 makes dedup work and what stops a re-sync of unchanged data from creating new
 remote objects forever.
 
+**Known gap — the AAD carries no object type.** Data chunks, manifest chunks,
+index chunks and pack headers are all sealed under `chunk_key` with `aad = id`
+and nothing saying which kind of object they are, so the AEAD layer cannot tell
+one kind served in another's place from the genuine article. It dead-ends
+rather than opening anything: the id is bound, the `chunk_id(plaintext) == id`
+recheck still runs, and the entry bounds checks of §4 plus the per-blob tags
+refuse a confused header — the outcome is an error, not a recovery. It is
+recorded here because a re-implementer should know it is a gap and not a
+decision: the fix is a type byte in the AAD, which changes every sealed byte in
+the format and so is a versioned format change rather than an edit. **An
+implementation adding a new kind of object under `chunk_key` should introduce
+the domain separator at the same time.**
+
 Binding the id as associated data means a chunk served under the wrong name
 fails its tag.
 
@@ -363,6 +379,12 @@ other's roots, and a cross-bundle replay would rest entirely on local anchor
 state to notice. Binding the expected `repo_id` makes a repository swap fail the
 Poly1305 tag instead. `repo_id` is not length-prefixed because it is the last
 field: nothing follows it to be confused with.
+
+**`repo_id` must be non-empty, on write and on read.** An empty one leaves the
+AAD equal to the bare literal — the global constant this binding exists to
+replace — so the scoping switches itself off with no error anywhere and two
+bundles sharing a master key open each other's roots again. An implementation
+must refuse to seal or open a root under an empty identifier.
 
 This is the one place the deterministic-nonce rule is inverted, and deliberately:
 every other object's nonce is derived from its content address because identical
@@ -624,8 +646,20 @@ is refused outright.
 
 That 12 is not a round number: it is arithmetic against the guess rate the
 shipped Argon2id parameters buy, so it means nothing unless those parameters are
-held to. **Below the default memory cost, a user-supplied password is refused
-unless it is of generated strength** — see §1. The two controls are one control.
+held to. **Below the default memory cost the floor rises from 12 characters to
+20**, the length of a generated passphrase — see §1. The two controls are one
+control.
+
+**That floor is a length, and length is a weak proxy for entropy.** Nothing in
+this format measures entropy, and nothing can from the string alone: 20
+characters out of the generator are 100 uniform bits, while 20 characters
+somebody remembered may be worth 40, and the two arrive identically. So do not
+read §1's raised floor as "only a generated passphrase is accepted" — earlier
+drafts of this document said exactly that, no implementation has ever done it,
+and a 20-character typed password is accepted. An implementation that refuses
+one is not following this document. What the floor does is price the cheapest
+mistakes out; what makes the offline attack hopeless is taking the generated
+passphrase.
 
 **Changing the password is not revocation.** A rewrap unwraps the master key
 under the old password and rewraps *the same* master key under the new one — 48

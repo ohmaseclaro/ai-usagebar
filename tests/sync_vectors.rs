@@ -48,11 +48,13 @@
 //! genuinely guards the crate. Each literal names its source above it, in the
 //! style of `safe_storage.rs`'s "Independently reproduced with OpenSSL's
 //! PBKDF2-HMAC-SHA1 implementation". This is the only file outside
-//! `src/sync/crypto.rs` that reaches for `argon2` or `chacha20poly1305`
-//! directly, and it does so deliberately: calling the primitive itself is what
-//! makes it a guard on the crate rather than on our wrapper. (The containment
-//! invariant `only_the_crypto_module_imports_the_cryptographic_crates` walks
-//! `src/sync/`, so it is unaffected.)
+//! `src/sync/crypto.rs` that reaches for `argon2` directly, and it does so
+//! deliberately: calling the primitive itself is what makes it a guard on the
+//! crate rather than on our wrapper. (The containment invariant
+//! `only_the_crypto_module_imports_the_cryptographic_crates` walks `src/sync/`,
+//! so it is unaffected.) `tests/sync_adversarial.rs` reaches for
+//! `chacha20poly1305` for a different reason — it has to wrap its own keyfile
+//! now that the cheap-floor seam is `pub(crate)`.
 //!
 //! Part 2's pins are **regression pins of current behaviour**. Nobody publishes
 //! a vector for this format; their value is that they change loudly, not that
