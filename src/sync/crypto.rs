@@ -78,6 +78,39 @@ impl Default for KdfParams {
     }
 }
 
+/// The largest Argon2id working set this build will ever ask for: 4 GiB.
+///
+/// `m_kib` arrives from the keyfile, which arrives from a remote the format
+/// treats as hostile. `argon2` 0.5.3 sets `MAX_M_COST = u32::MAX` and allocates
+/// its blocks with an **infallible** `vec![]`, so one edited integer is a
+/// `handle_alloc_error` abort or an OOM kill — reached *before* the AAD binding
+/// gets its chance to make the unwrap fail, and in flat violation of the
+/// project's hard invariant that the widget always exits 0.
+///
+/// Four gibibytes is four times the shipped default and far past any parameter
+/// set a human would choose, so it costs a legitimate bundle nothing. This is a
+/// hard ceiling, not a fit-in-RAM check; [`check_memory_budget`] is the separate,
+/// actionable pre-flight a surface runs against the machine it is on.
+pub const MAX_KDF_MEMORY_KIB: u32 = 4 * 1024 * 1024;
+
+/// Refuse an Argon2id memory parameter above [`MAX_KDF_MEMORY_KIB`], before
+/// anything allocates it.
+///
+/// Pure and clock-free, like everything else here. The parameters are public —
+/// they live in cleartext in the keyfile — so naming them is safe.
+fn check_kdf_ceiling(m_kib: u32) -> Result<()> {
+    if m_kib <= MAX_KDF_MEMORY_KIB {
+        return Ok(());
+    }
+    Err(AppError::Other(format!(
+        "this keyfile asks for {} MiB of key-derivation memory, above the \
+         {} MiB ceiling this build will allocate — refusing before the \
+         allocation rather than aborting inside it",
+        m_kib / 1024,
+        MAX_KDF_MEMORY_KIB / 1024
+    )))
+}
+
 /// Password + salt -> key-encryption key.
 pub fn derive_kek(pw: &[u8], salt: &[u8; 16], k: KdfParams) -> Result<Zeroizing<[u8; 32]>> {
     let params = Params::new(k.m_kib, k.t, k.p, Some(32)).map_err(|_| {
@@ -307,9 +340,11 @@ impl Keyfile {
     }
 
     fn unwrap_master_key(&self, pw: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
-        // Version gate *before* any cryptographic work: refusing a too-new
-        // bundle must not cost 1.5 s and a gibibyte first.
+        // Both gates run *before* any cryptographic work: refusing a too-new
+        // bundle must not cost 1.5 s and a gibibyte first, and refusing an
+        // absurd working set must not cost the allocation it is refusing.
         check_version(self.format, MAX_SUPPORTED_KEYFILE, "keyfile")?;
+        check_kdf_ceiling(self.kdf.m_kib)?;
 
         let salt = self.kdf.salt_bytes()?;
         let nonce = self.nonce_bytes()?;
@@ -573,11 +608,17 @@ pub fn content_address(bytes: &[u8]) -> ChunkId {
     ChunkId(*blake3::hash(bytes).as_bytes())
 }
 
-/// Refuse an Argon2 working set that does not fit, before allocating it.
+/// Refuse an Argon2 working set that does not fit *this machine*, before
+/// allocating it.
 ///
 /// Pure, and takes `available_kib` by argument: that is the seam, exactly as
 /// `Cache::at` exists so no test calls `Cache::for_vendor`. A 1 GB box must get
 /// an actionable refusal naming `--kdf-memory`, never an OOM abort.
+///
+/// This is the *pre-flight*, for a surface that knows how much memory it has and
+/// can print something a user can act on. It is not the safety net:
+/// [`check_kdf_ceiling`] is, it runs inside [`Keyfile::open`] with no dependency
+/// on a caller remembering anything, and it does not read the machine.
 pub fn check_memory_budget(m_kib: u32, available_kib: u64) -> Result<()> {
     if u64::from(m_kib) <= available_kib {
         return Ok(());
@@ -919,6 +960,36 @@ mod tests {
             .expect_err("a newer format must be refused")
             .to_string();
         assert!(err.contains("upgrade ai-usagebar"));
+    }
+
+    /// The ceiling is checked inside the unwrap, not left to a caller.
+    ///
+    /// `m_kib` comes from a keyfile a hostile remote may have edited, and
+    /// `argon2` 0.5.3 allows up to `u32::MAX` and allocates with an infallible
+    /// `vec![]` — so without this the attack is an abort, not an error, and the
+    /// widget stops exiting 0.
+    #[test]
+    fn a_keyfile_demanding_more_memory_than_the_ceiling_is_refused_before_allocating() {
+        let (keyfile, _) = Keyfile::create(b"a hostile remote", CHEAP).unwrap();
+
+        let mut absurd = keyfile.clone();
+        absurd.kdf.m_kib = u32::MAX;
+        let err = absurd
+            .open(b"a hostile remote")
+            .expect_err("u32::MAX KiB is 4 TiB and must never be attempted")
+            .to_string();
+        assert!(err.contains("ceiling this build will allocate"), "{err}");
+        assert!(err.contains("4096 MiB"), "{err}");
+
+        // Exactly at the ceiling is allowed through; one KiB past it is not.
+        // Asserted on the gate itself, because letting `open` actually reach
+        // `derive_kek` at 4 GiB is precisely what a unit test must not do.
+        assert!(check_kdf_ceiling(MAX_KDF_MEMORY_KIB).is_ok());
+        assert!(check_kdf_ceiling(MAX_KDF_MEMORY_KIB + 1).is_err());
+
+        // Untouched, it still opens, so the refusal above is the gate rather
+        // than a keyfile that never worked.
+        assert!(keyfile.open(b"a hostile remote").is_ok());
     }
 
     #[test]
