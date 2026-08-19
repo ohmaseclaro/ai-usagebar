@@ -279,10 +279,15 @@ const MASTER: [u8; 32] = [
 /// the two can be compared against each other directly.
 const SHORT_PLAINTEXT: &[u8] = b"ai-usagebar sync vector";
 
-/// The literal associated data the snapshot root is sealed under, spelled out
+/// The format-scoping half of the snapshot root's associated data, spelled out
 /// rather than imported: a reader implemented from `docs/sync-format.md` §5 has
-/// only this string, and pinning it here catches a change to the constant.
+/// only this string, and pinning it here catches a change to the constant. The
+/// other half is the bundle's [`REPO_ID`], appended.
 const ROOT_AAD: &[u8] = b"ai-usagebar.sync.v1 root";
+
+/// The bundle identity a caller reads from its own configuration and hands to
+/// `open_root` — never a value taken from the remote.
+const REPO_ID: &str = "usagebar-sync-vector";
 
 /// A keyfile wrapping [`MASTER`], built **by hand from the documented format**
 /// rather than by `Keyfile::create`, which draws a random master key and so can
@@ -501,15 +506,17 @@ fn the_root_subkey_is_pinned_and_is_the_key_the_snapshot_root_uses() {
         "root_key moved: no existing snapshot root opens"
     );
 
-    // `nonce ‖ ciphertext ‖ tag`, with the fixed literal as associated data —
+    // `nonce ‖ ciphertext ‖ tag`, with `ROOT_AAD ‖ repo_id` as associated data —
     // docs/sync-format.md §5, reconstructed here rather than imported.
     let nonce = [0x37u8; 24];
+    let mut aad = ROOT_AAD.to_vec();
+    aad.extend_from_slice(REPO_ID.as_bytes());
     let sealed = XChaCha20Poly1305::new((&root_key).into())
         .encrypt(
             &nonce.into(),
             Payload {
                 msg: b"counter=7".as_slice(),
-                aad: ROOT_AAD,
+                aad: &aad,
             },
         )
         .expect("sealing a root by hand");
@@ -517,11 +524,20 @@ fn the_root_subkey_is_pinned_and_is_the_key_the_snapshot_root_uses() {
     framed.extend_from_slice(&sealed);
 
     assert_eq!(
-        &*fixed_keys().open_root(&framed).expect(
+        &*fixed_keys().open_root(&framed, REPO_ID).expect(
             "open_root rejected a root framed by hand under root_key — either \
              the subkey wiring or the root's associated data changed"
         ),
         b"counter=7"
+    );
+
+    // The `repo_id` half of the AAD is load-bearing, not decorative: the same
+    // bytes offered as another bundle's root must fail the tag.
+    assert!(
+        fixed_keys()
+            .open_root(&framed, "some-other-bundle")
+            .is_err(),
+        "the root's associated data is no longer scoped to the repository"
     );
 }
 

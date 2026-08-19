@@ -494,7 +494,7 @@ impl Keys {
     /// `repo_id` is bound into the associated data, so a root belonging to
     /// another bundle fails the tag here rather than depending on local state to
     /// notice — see [`Keys::open_root`].
-    pub fn seal_root(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+    pub fn seal_root(&self, plaintext: &[u8], repo_id: &str) -> Result<Vec<u8>> {
         let mut nonce = [0u8; NONCE_LEN];
         fill(&mut nonce)?;
         let sealed = XChaCha20Poly1305::new((&*self.root).into())
@@ -502,7 +502,7 @@ impl Keys {
                 &nonce.into(),
                 Payload {
                     msg: plaintext,
-                    aad: ROOT_AAD,
+                    aad: &root_aad(repo_id),
                 },
             )
             .map_err(|_| AppError::Other("snapshot root encryption failed".into()))?;
@@ -513,10 +513,19 @@ impl Keys {
         Ok(framed)
     }
 
-    /// Open a framed snapshot root. Validates the length before slicing: the
-    /// bytes arrive from a remote an attacker may control, and a truncated root
-    /// must be an error, not a panic.
-    pub fn open_root(&self, framed: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    /// Open a framed snapshot root belonging to `repo_id`. Validates the length
+    /// before slicing: the bytes arrive from a remote an attacker may control,
+    /// and a truncated root must be an error, not a panic.
+    ///
+    /// **`repo_id` is the caller's expectation, read from local configuration —
+    /// never the value the remote claims.** It is bound as associated data, so a
+    /// root belonging to a different bundle fails the Poly1305 tag here. That
+    /// matters because the root is the entry point: two bundles sharing a master
+    /// key (a copied keyfile, a second remote for the same machine) would
+    /// otherwise open each other's roots, and a cross-bundle replay would depend
+    /// entirely on local anchor state to notice. Taking the id from the remote
+    /// would make the binding say nothing at all.
+    pub fn open_root(&self, framed: &[u8], repo_id: &str) -> Result<Zeroizing<Vec<u8>>> {
         if framed.len() < NONCE_LEN + TAG_LEN {
             return Err(AppError::Other("snapshot root is truncated".into()));
         }
@@ -527,7 +536,7 @@ impl Keys {
                 &nonce.into(),
                 Payload {
                     msg: sealed,
-                    aad: ROOT_AAD,
+                    aad: &root_aad(repo_id),
                 },
             )
             .map(Zeroizing::new)
@@ -535,8 +544,21 @@ impl Keys {
     }
 }
 
-/// Associated data for the snapshot root. A fixed literal, not the root's own
-/// address: the root is the mutable entry point and has no content address.
+/// Associated data for the snapshot root: a fixed literal scoping the format,
+/// concatenated with the repository this root belongs to.
+///
+/// The literal alone is not enough. The root is the mutable entry point and has
+/// no content address of its own, so without the `repo_id` its AAD is the same
+/// constant in every bundle in the world — and any two bundles sharing a master
+/// key would open each other's roots. `repo_id` is not length-prefixed because
+/// it is the last field: no other value follows it to be confused with.
+fn root_aad(repo_id: &str) -> Vec<u8> {
+    let mut aad = ROOT_AAD.to_vec();
+    aad.extend_from_slice(repo_id.as_bytes());
+    aad
+}
+
+/// The format-scoping half of [`root_aad`].
 const ROOT_AAD: &[u8] = b"ai-usagebar.sync.v1 root";
 
 /// Unkeyed BLAKE3, for naming an object whose bytes are already public
@@ -625,6 +647,10 @@ mod tests {
             .expect("keyfile creation")
             .1
     }
+
+    /// What a caller reads out of its own configuration and hands to
+    /// [`Keys::open_root`] — never a value taken from the remote.
+    const REPO_ID: &str = "usagebar-sync-abc123";
 
     #[test]
     fn password_round_trips_to_a_sealed_and_reopened_buffer() {
@@ -750,14 +776,14 @@ mod tests {
     fn a_root_sealed_twice_differs_but_both_copies_reopen() {
         let keys = keys();
         let plaintext = b"counter=7".as_slice();
-        let first = keys.seal_root(plaintext).unwrap();
-        let second = keys.seal_root(plaintext).unwrap();
+        let first = keys.seal_root(plaintext, REPO_ID).unwrap();
+        let second = keys.seal_root(plaintext, REPO_ID).unwrap();
 
         // Fresh random nonce per seal: the root's plaintext changes every sync,
         // so deterministic sealing would leak equality between snapshots.
         assert_ne!(first, second);
-        assert_eq!(&*keys.open_root(&first).unwrap(), plaintext);
-        assert_eq!(&*keys.open_root(&second).unwrap(), plaintext);
+        assert_eq!(&*keys.open_root(&first, REPO_ID).unwrap(), plaintext);
+        assert_eq!(&*keys.open_root(&second, REPO_ID).unwrap(), plaintext);
     }
 
     #[test]
@@ -770,9 +796,28 @@ mod tests {
             name: alice.name.clone(),
             root: Zeroizing::new([0x5a; 32]),
         };
-        let sealed = alice.seal_root(b"counter=7").unwrap();
-        assert!(mallory.open_root(&sealed).is_err());
-        assert!(alice.open_root(&sealed).is_ok());
+        let sealed = alice.seal_root(b"counter=7", REPO_ID).unwrap();
+        assert!(mallory.open_root(&sealed, REPO_ID).is_err());
+        assert!(alice.open_root(&sealed, REPO_ID).is_ok());
+    }
+
+    /// The root's AAD is scoped to the bundle, not only to the format.
+    ///
+    /// Two bundles can share a master key — a copied keyfile, or a second remote
+    /// added for the same machine — and with a fixed AAD literal each would open
+    /// the other's root. That makes a cross-bundle replay depend entirely on
+    /// local anchor state to notice, which is exactly the dependency F-3 removes.
+    #[test]
+    fn a_root_from_another_bundle_fails_the_tag_under_the_same_master_key() {
+        let keys = keys();
+        let sealed = keys.seal_root(b"counter=7", "bundle-a").unwrap();
+
+        assert!(
+            keys.open_root(&sealed, "bundle-b").is_err(),
+            "a root sealed for another bundle must fail the tag, not open"
+        );
+        // …and it is the scoping that refuses it, not a broken round trip.
+        assert_eq!(&*keys.open_root(&sealed, "bundle-a").unwrap(), b"counter=7");
     }
 
     #[test]
@@ -780,7 +825,7 @@ mod tests {
         let keys = keys();
         for len in [0, 1, NONCE_LEN, NONCE_LEN + TAG_LEN - 1] {
             assert!(
-                keys.open_root(&vec![0u8; len]).is_err(),
+                keys.open_root(&vec![0u8; len], REPO_ID).is_err(),
                 "a {len}-byte root must be refused, not indexed into"
             );
         }

@@ -216,7 +216,10 @@ fn restore_gated(
     local: Option<&Anchor>,
     allow_rollback: bool,
 ) -> Result<Zeroizing<Vec<u8>>> {
-    let root = Root::open(keys, sealed_root)?;
+    // `REPO_ID` here stands for the caller's *local* configuration, which is the
+    // only place `Root::open`'s expectation may come from: reading it back out
+    // of the root would make the binding say nothing.
+    let root = Root::open(keys, sealed_root, REPO_ID)?;
     anchor::accept(local, &root.repo_id, root.counter, allow_rollback)?;
 
     let header = read_header(keys, pack)?;
@@ -554,7 +557,7 @@ fn attack_6_truncated_pack() -> String {
 fn attack_7_truncated_manifest() -> String {
     let b = honest();
     let header = read_header(&b.keys, &b.pack).expect("the honest pack opens");
-    let named = Root::open(&b.keys, &b.root)
+    let named = Root::open(&b.keys, &b.root, REPO_ID)
         .expect("the honest root opens")
         .manifest_chunks;
     let intact = served(&b.pack, &header, &named).expect("the pack carries the manifest");
@@ -628,7 +631,7 @@ fn attack_8_transposed_manifest_ids() -> String {
     // under the original root ciphertext the order comes back exactly as
     // written. A hostile remote has no edit to make here.
     assert_eq!(
-        Root::open(&b.keys, &sealed_root)
+        Root::open(&b.keys, &sealed_root, REPO_ID)
             .expect("the honest root opens")
             .manifest_chunks,
         ordered
@@ -652,7 +655,7 @@ fn attack_8_transposed_manifest_ids() -> String {
     .seal(&stranger)
     .expect("seal");
     let forged_message = refused(
-        Root::open(&b.keys, &forged).map(|r| r.manifest_chunks.len()),
+        Root::open(&b.keys, &forged, REPO_ID).map(|r| r.manifest_chunks.len()),
         &b.keyfile,
         &b.data,
     );
@@ -708,7 +711,7 @@ fn attack_9_rolled_back_snapshot() -> String {
     // key produced it. Nothing inside the bundle can tell the client that a
     // newer snapshot exists; only local state the attacker cannot reach can.
     assert_eq!(
-        Root::open(&b.keys, &b.root)
+        Root::open(&b.keys, &b.root, REPO_ID)
             .expect("the replayed root opens")
             .counter,
         SNAPSHOT_COUNTER

@@ -21,6 +21,35 @@
 //! resolving the real location belongs to whichever phase owns the config
 //! directory, not here — nothing in this module resolves a path.
 //!
+//! # The anchor path must be keyed to the *remote*, never to its `repo_id`
+//!
+//! This is a precondition on the caller, and it is load-bearing enough to be
+//! stated rather than assumed. Whatever names the anchor file must come from
+//! **local configuration — the remote's URL or account** — and never from the
+//! `repo_id` the remote hands over.
+//!
+//! Sharding as `anchors/<repo_id>.json` is the obvious way to support several
+//! bundles, and it is unavoidable eventually, because one [`Anchor`] holds
+//! exactly one `repo_id`. It also silently nullifies this whole module. A served
+//! root carrying a `repo_id` this machine has never seen would resolve to an
+//! absent file, [`read_from`] would return `Ok(None)`, and [`accept`] returns
+//! `Ok(())` for `None` *before* it compares anything: the `repo_id` guard below
+//! becomes vacuous and every rollback is accepted as first contact. **A
+//! `repo_id` this machine has not seen must read as a mismatch, not as first
+//! contact**, which it does exactly when the path is keyed to the remote.
+//!
+//! The same rule stated the other way: first contact is a property of *this
+//! machine and that remote*, and nothing the remote says may be allowed to
+//! manufacture it. The format document says so in §9, for a re-implementer who
+//! never reads this file.
+//!
+//! Note what this does *not* rest on. Since 1-10 the root's `repo_id` is bound
+//! into its AEAD associated data, with the expected value supplied by the caller
+//! from local configuration, so a root from another bundle fails its tag before
+//! it is ever parsed. That closes the repo-swap leg cryptographically. The rule
+//! above is still required for the *rollback* leg, which by construction cannot
+//! be closed by any amount of authentication.
+//!
 //! [`accept`] is a pure function of the local anchor and the remote's claim, so
 //! the rollback decision is exhaustively testable with no filesystem at all.
 //!
@@ -48,7 +77,9 @@ pub struct Anchor {
 /// Decide whether a remote snapshot may be accepted. Pure: the local anchor
 /// arrives as an argument, so every branch is testable without touching a disk.
 ///
-/// - `local == None` is **first contact**, and is accepted. This is
+/// - `local == None` is **first contact**, and is accepted — which is precisely
+///   why the caller must not let the remote decide whether the local anchor is
+///   found (see the module docs). This is
 ///   trust-on-first-use, and it is an inherent residual gap rather than a bug: a
 ///   brand-new machine has nothing to compare against, so an attacker who
 ///   already controls the remote at the moment of the very first fetch can

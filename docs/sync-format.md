@@ -328,8 +328,22 @@ chunk therefore fails its tag rather than quietly restoring something else.
 ### Root — the one mutable object
 
 Sealed under `root_key` with a **fresh random 24-byte nonce**, stored inline as
-the first 24 bytes of the framed output, and a fixed literal as associated data:
-`ai-usagebar.sync.v1 root`. The framing is `nonce ‖ ciphertext ‖ tag`.
+the first 24 bytes of the framed output. The framing is `nonce ‖ ciphertext ‖
+tag`, and the associated data is a fixed literal scoping the format,
+concatenated with the bundle's identifier:
+
+```text
+aad = "ai-usagebar.sync.v1 root" ‖ repo_id
+```
+
+**The `repo_id` in that AAD is the reader's own, read from local configuration —
+never the one the served root claims.** The literal alone would be the same
+constant in every bundle in the world, so any two bundles sharing a master key —
+a copied keyfile, a second remote added for the same machine — would open each
+other's roots, and a cross-bundle replay would rest entirely on local anchor
+state to notice. Binding the expected `repo_id` makes a repository swap fail the
+Poly1305 tag instead. `repo_id` is not length-prefixed because it is the last
+field: nothing follows it to be confused with.
 
 This is the one place the deterministic-nonce rule is inverted, and deliberately:
 every other object's nonce is derived from its content address because identical
@@ -352,9 +366,10 @@ content address of its own — hence the fixed AAD literal.
 
 - `counter` is the monotonic snapshot counter the rollback anchor compares
   against (§9).
-- `repo_id` pins the repository's identity *inside* the plaintext, so swapping
-  the whole repository for a different one is detectable on top of the wrong
-  keyfile simply failing to unwrap.
+- `repo_id` pins the repository's identity *inside* the plaintext as well as in
+  the associated data above, and a reader must check the two agree. The AAD
+  proves the writer meant this bundle; the recheck proves the two copies were
+  not written to disagree.
 - `chunker` and `kdf` are **informational duplicates**. The authoritative copy of
   the KDF parameters is the keyfile's, where they are bound as associated data
   and cannot be edited in transit. They are repeated here because the root is
@@ -620,8 +635,20 @@ the moment of the very first fetch can serve an old snapshot and it will be
 taken. Every fetch afterwards is protected. Closing it would require carrying a
 counter out of band, which is a different trade than this design makes.
 
-Two consequences a caller must respect:
+Three consequences a caller must respect:
 
+- **The anchor file must be named after the remote, never after the remote's
+  `repo_id`.** Whatever locates the anchor comes from local configuration — the
+  remote's URL or account — because sharding it as `anchors/<repo_id>.json` is
+  the obvious way to hold several bundles and it silently nullifies the whole
+  mechanism. A root carrying a `repo_id` this machine has never seen would
+  resolve to an absent file, which reads as first contact, which is accepted
+  before any `repo_id` comparison happens. **An unrecognised `repo_id` must read
+  as a mismatch, not as first contact.** First contact is a property of this
+  machine and that remote; nothing the remote says may manufacture it. (The
+  *repo-swap* half of this is closed independently, and cryptographically, by
+  binding the expected `repo_id` into the root's associated data — §5. The
+  rollback half cannot be, which is why this rule exists.)
 - **The anchor lives in the config directory, never the cache.** The cache is
   documented as wipeable and users, packagers, and `rm -rf ~/.cache/*` treat it
   that way. A wiped anchor is a free rollback: it silently downgrades the next

@@ -337,20 +337,30 @@ impl Root {
             serde_json::to_vec(self)
                 .map_err(|_| AppError::Other("snapshot root serialization failed".into()))?,
         );
-        keys.seal_root(&json)
+        keys.seal_root(&json, &self.repo_id)
     }
 
     /// Open a framed root, refusing a version above this build's ceiling and a
     /// chunker it does not know.
     ///
-    /// `repo_id` pins the repository's identity inside the plaintext, so
-    /// swapping the whole repository for a different one is detectable on top of
-    /// the wrong keyfile simply failing to unwrap.
-    pub fn open(keys: &Keys, framed: &[u8]) -> Result<Root> {
-        let json = keys.open_root(framed)?;
+    /// **`expect_repo_id` comes from local configuration, never from the remote.**
+    /// It is bound as associated data, so a root belonging to another bundle
+    /// fails the tag before anything is parsed — a repo swap is caught
+    /// cryptographically rather than by comparing the remote's own claim against
+    /// itself. The `repo_id` *inside* the plaintext is rechecked against it
+    /// afterwards, the same belt and braces
+    /// [`crate::sync::chunk::open_chunk`] applies to a chunk id: the AAD proves
+    /// the writer meant this bundle, the recheck proves the two copies agree.
+    pub fn open(keys: &Keys, framed: &[u8], expect_repo_id: &str) -> Result<Root> {
+        let json = keys.open_root(framed, expect_repo_id)?;
         probe_version(&json, MAX_SUPPORTED_ROOT, "snapshot root")?;
         let root: Root = serde_json::from_slice(&json)
             .map_err(|_| AppError::Other("snapshot root is malformed".into()))?;
+        if root.repo_id != expect_repo_id {
+            return Err(AppError::Other(
+                "the snapshot root names a different bundle than its own associated data".into(),
+            ));
+        }
         check_chunker(&root.chunker)?;
         Ok(root)
     }
@@ -384,6 +394,10 @@ mod tests {
     fn fixed_time() -> DateTime<Utc> {
         "2026-08-19T12:00:00Z".parse().expect("a valid timestamp")
     }
+
+    /// What a caller reads out of its own configuration and passes to
+    /// [`Root::open`] — never a value taken from the remote.
+    const REPO_ID: &str = "usagebar-sync-abc123";
 
     fn id(n: u8) -> ChunkId {
         ChunkId::from_bytes([n; 32])
@@ -575,7 +589,7 @@ mod tests {
         let framed = Root::new(
             7,
             fixed_time(),
-            "usagebar-sync-abc123".into(),
+            REPO_ID.to_string(),
             ordered.clone(),
             KdfParams::default(),
         )
@@ -586,7 +600,9 @@ mod tests {
         // means re-sealing the root, which needs the key. Served under the
         // original root ciphertext, the order comes back exactly as written.
         assert_eq!(
-            Root::open(&keys, &framed).expect("open").manifest_chunks,
+            Root::open(&keys, &framed, REPO_ID)
+                .expect("open")
+                .manifest_chunks,
             ordered
         );
 
@@ -712,7 +728,7 @@ mod tests {
         Root::new(
             7,
             fixed_time(),
-            "usagebar-sync-abc123".into(),
+            REPO_ID.to_string(),
             vec![id(9), id(10), id(11)],
             KdfParams::default(),
         )
@@ -722,7 +738,7 @@ mod tests {
     fn a_root_seals_and_reopens_with_every_field_intact() {
         let keys = keys();
         let root = a_root();
-        let reopened = Root::open(&keys, &root.seal(&keys).expect("seal")).expect("open");
+        let reopened = Root::open(&keys, &root.seal(&keys).expect("seal"), REPO_ID).expect("open");
         assert_eq!(reopened, root);
         assert_eq!(reopened.counter, 7);
         assert_eq!(reopened.manifest_chunks, vec![id(9), id(10), id(11)]);
@@ -742,15 +758,40 @@ mod tests {
             first, second,
             "the root nonce must be random, unlike a chunk's"
         );
-        assert_eq!(Root::open(&keys, &first).expect("open"), root);
-        assert_eq!(Root::open(&keys, &second).expect("open"), root);
+        assert_eq!(Root::open(&keys, &first, REPO_ID).expect("open"), root);
+        assert_eq!(Root::open(&keys, &second, REPO_ID).expect("open"), root);
     }
 
     #[test]
     fn a_root_does_not_open_under_a_different_master_key() {
         let framed = a_root().seal(&keys()).expect("seal");
         let stranger = keys_from(b"a completely different passphrase");
-        assert!(Root::open(&stranger, &framed).is_err());
+        assert!(Root::open(&stranger, &framed, REPO_ID).is_err());
+    }
+
+    /// A whole-repository swap, under a master key the reader really does hold —
+    /// the case a shared or copied keyfile creates. `repo_id` is bound as
+    /// associated data, so the swap fails the tag rather than resting on the
+    /// local anchor having been kept.
+    #[test]
+    fn a_root_from_another_bundle_is_refused_even_under_the_right_key() {
+        let keys = keys();
+        let mut theirs = a_root();
+        theirs.repo_id = "usagebar-sync-someone-else".into();
+        let framed = theirs.seal(&keys).expect("seal");
+
+        assert!(
+            Root::open(&keys, &framed, REPO_ID).is_err(),
+            "a root belonging to another bundle must not open here"
+        );
+        // …and it does open for the bundle it was actually written for, so the
+        // refusal above is the scoping rather than a broken round trip.
+        assert_eq!(
+            Root::open(&keys, &framed, "usagebar-sync-someone-else")
+                .expect("open")
+                .repo_id,
+            "usagebar-sync-someone-else"
+        );
     }
 
     #[test]
@@ -761,7 +802,7 @@ mod tests {
             let mut tampered = framed.clone();
             tampered[byte] ^= 1;
             assert!(
-                Root::open(&keys, &tampered).is_err(),
+                Root::open(&keys, &tampered, REPO_ID).is_err(),
                 "a flipped bit at byte {byte} was accepted"
             );
         }
@@ -772,7 +813,8 @@ mod tests {
         let keys = keys();
         let mut root = a_root();
         root.chunker = "cdc-gear-64k".into();
-        let err = Root::open(&keys, &root.seal(&keys).expect("seal")).expect_err("must refuse");
+        let err =
+            Root::open(&keys, &root.seal(&keys).expect("seal"), REPO_ID).expect_err("must refuse");
         assert!(err.to_string().contains("cdc-gear-64k"));
     }
 
@@ -781,11 +823,12 @@ mod tests {
         let keys = keys();
         let mut older = a_root();
         older.format = MAX_SUPPORTED_ROOT - 1;
-        assert!(Root::open(&keys, &older.seal(&keys).expect("seal")).is_ok());
+        assert!(Root::open(&keys, &older.seal(&keys).expect("seal"), REPO_ID).is_ok());
 
         let mut newer = a_root();
         newer.format = MAX_SUPPORTED_ROOT + 1;
-        let err = Root::open(&keys, &newer.seal(&keys).expect("seal")).expect_err("must refuse");
+        let err =
+            Root::open(&keys, &newer.seal(&keys).expect("seal"), REPO_ID).expect_err("must refuse");
         assert!(err.to_string().contains("upgrade ai-usagebar"));
     }
 
