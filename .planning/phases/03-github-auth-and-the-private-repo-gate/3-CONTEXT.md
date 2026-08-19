@@ -87,3 +87,18 @@ None owed here, but Phase 4 depends on **CAL-1** (do private-repo release assets
 run CAL-1 here as an `#[ignore]`d live test against the user's own repo so Phase 4 starts with
 the answer. *Fallback:* assume no `Range:` support and size packs so a full asset fetch is
 acceptable.
+
+---
+
+## Cross-plan promise recorded during execution (from 3-03)
+
+`http::actionable`'s **401 arm tells the user the stored token "will be cleared"**. That is a
+promise made in one plan and kept in two others: `token::clear` belongs to `3-02`, and the call
+site belongs to `3-07`.
+
+If either slips, the message becomes a lie — the user is told their dead token was removed,
+believes a re-auth will start clean, and hits the same failure again with no idea why.
+
+**`3-07` must wire the clear at the 401 call site**, and a test should assert the pairing rather
+than leaving it to review. This is the fifth instance in this milestone of a statement that
+outran its implementation; the pattern is now well enough established to plan against.
