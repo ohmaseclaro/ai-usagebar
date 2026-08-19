@@ -405,6 +405,18 @@ impl Keys {
     /// The belt-and-braces recheck therefore lives one layer up, in
     /// [`crate::sync::chunk`]'s `open_chunk` after unframing and in
     /// [`crate::sync::pack`]'s `read_header` after deserializing.
+    ///
+    /// **The refusal names the chunk.** Every tampering attack that reaches this
+    /// line — a swapped ciphertext, a flipped bit, a truncated blob, a manifest
+    /// chunk served under the id the root names — is one and the same event to
+    /// Poly1305: the tag did not verify. Without the id in the message they all
+    /// read identically, and an operator cannot tell which object is bad; the
+    /// adversarial suite found exactly that collapse across five of its nine
+    /// attacks. The id is safe to say: it is written in the clear in every pack
+    /// trailer and listed in every index object, and it is a *keyed* hash, so
+    /// nobody without `name_key` can invert it or confirm a guess against it. It
+    /// is an address, not a secret — CRYPTO-07 is about keys, passwords, and
+    /// plaintext, none of which is here.
     pub fn open(&self, id: &ChunkId, ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
         XChaCha20Poly1305::new((&*self.chunk).into())
             .decrypt(
@@ -415,7 +427,7 @@ impl Keys {
                 },
             )
             .map(Zeroizing::new)
-            .map_err(|_| AppError::Other("chunk failed authentication".into()))
+            .map_err(|_| AppError::Other(format!("chunk {id} failed authentication")))
     }
 
     /// Seal the snapshot root under the **root** subkey — the one derived with
