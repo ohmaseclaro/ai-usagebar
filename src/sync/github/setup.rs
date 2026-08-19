@@ -69,6 +69,21 @@ pub trait SetupPrompt {
     fn kdf(&self) -> KdfParams {
         KdfParams::default()
     }
+
+    /// Step 5's persistence. Also a seam, and a mandatory one: on macOS
+    /// [`token::store`] writes the **real** login Keychain item, so a test that
+    /// reached step 5 through the production call would clobber the user's own
+    /// sync token — and the AUR `check()` runs these tests on installers'
+    /// machines. The default *is* production; the double overrides it.
+    fn store_token(&self, token: &str, file: &Path) -> Result<TokenSource> {
+        token::store(token, file)
+    }
+
+    /// The 401 path, for the same reason: [`token::clear`] deletes the real
+    /// Keychain item on macOS.
+    fn clear_token(&self, file: &Path) -> Result<()> {
+        token::clear(file)
+    }
 }
 
 /// The production implementation. Untested by construction — it is the only
@@ -189,7 +204,7 @@ pub async fn run(
 
     let facts = match gate::fetch_facts(&client, &repo, now).await {
         Ok(facts) => facts,
-        Err(e) => return Err(clear_if_dead(e, &token_file, &token::clear)),
+        Err(e) => return Err(clear_if_dead(e, &token_file, &|p| prompt.clear_token(p))),
     };
 
     let pairing_file = pairing::default_path(roots);
@@ -298,7 +313,7 @@ pub async fn run(
     }
 
     // ---- Step 5: ready ---------------------------------------------------
-    let stored_at = token::store(&keep, &token_file).map_err(|e| {
+    let stored_at = prompt.store_token(&keep, &token_file).map_err(|e| {
         AppError::Other(format!(
             "could not save the GitHub sync token: {e}\n\
              The secret being saved here is the *sync token*, not a Claude credential — \
@@ -450,6 +465,10 @@ pub(crate) struct Script {
     /// `None` keeps whatever the config already had.
     pub categories: Option<Vec<SyncCategory>>,
     pub confirm: bool,
+    /// Token-file paths the flow asked to store / clear. Recorded rather than
+    /// acted on — no test may reach a real Keychain.
+    pub stored: Vec<PathBuf>,
+    pub cleared: Vec<PathBuf>,
 }
 
 #[cfg(test)]
@@ -497,6 +516,16 @@ impl SetupPrompt for Double {
             t: 1,
             p: 1,
         }
+    }
+    /// Recorded, never performed. The production default would write the real
+    /// macOS login Keychain.
+    fn store_token(&self, _token: &str, file: &Path) -> Result<TokenSource> {
+        self.0.borrow_mut().stored.push(file.to_path_buf());
+        Ok(TokenSource::File)
+    }
+    fn clear_token(&self, file: &Path) -> Result<()> {
+        self.0.borrow_mut().cleared.push(file.to_path_buf());
+        Ok(())
     }
 }
 
@@ -747,6 +776,28 @@ mod tests {
             .expect_err("401");
         assert!(matches!(err, AppError::Credentials(_)), "{err:?}");
         assert!(err.to_string().contains("will be cleared"), "{err}");
+        // …and the flow actually cleared it, at the injected token path.
+        assert_eq!(
+            script.borrow().cleared.as_slice(),
+            std::slice::from_ref(&token_path(&roots_at(&dir)))
+        );
+        assert!(
+            script.borrow().stored.is_empty(),
+            "a dead token is not stored"
+        );
+    }
+
+    /// A 403 keeps a working token (T-3-16): the message says so, and the flow
+    /// agrees with the message.
+    #[tokio::test]
+    async fn a_403_does_not_clear_the_token_the_message_told_the_user_to_keep() {
+        let dir = TempDir::new().unwrap();
+        let script = Script::new();
+        let err = drive(&cfg_for(Some("o/n")), &dir, "{}", 403, &script)
+            .await
+            .expect_err("403");
+        assert!(err.to_string().contains("keep it"), "{err}");
+        assert!(script.borrow().cleared.is_empty(), "a 403 must not clear");
     }
 
     // ---- step 2 ----------------------------------------------------------
@@ -947,6 +998,11 @@ mod tests {
             "the record persisted"
         );
         assert!(roots.index_file.exists(), "the index is inside too");
+        assert_eq!(
+            script.borrow().stored.as_slice(),
+            std::slice::from_ref(&token_path(&roots)),
+            "the token was stored at the injected path and nowhere else"
+        );
     }
 
     /// D-05: declining the size confirmation leaves the remote untouched, and

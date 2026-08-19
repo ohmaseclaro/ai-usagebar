@@ -195,6 +195,12 @@ async fn repo_section(
         Ok(facts) => facts,
         // Same 401 promise the setup flow keeps: `actionable` says the stored
         // token will be cleared, so whichever command printed that must clear it.
+        //
+        // **`token::clear` deletes the real macOS login Keychain item.** No
+        // test here may mock a 401 against this arm; `sync setup`'s version of
+        // this call goes through `SetupPrompt::clear_token`, which a test double
+        // overrides. If `status` ever needs a 401 test, give it the same seam
+        // first — do not reach for the production function.
         Err(e) => {
             let e =
                 github::setup::clear_if_dead(e, &github::setup::token_path(roots), &token::clear);
