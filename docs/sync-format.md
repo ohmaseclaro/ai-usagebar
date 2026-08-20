@@ -591,26 +591,52 @@ implementation measures 1492–1548 ms on the same class of machine, so the
 estimate was sound. It remains an M3 Max number, and every consumer of it should
 treat it as the fast end of the range.
 
-### CAL-1 — does a private-repo release asset honour `Range:`? Offered in phase 3, declined
+### CAL-1 — does a private-repo release asset honour `Range:`? Still unmeasured after four phases
 
 **Still not measured, and nothing below is a measurement.** Phase 1 could not
 run it: that phase was offline by construction and had no GitHub credential.
 Phase 3 could have — it is the first phase with both an HTTP client and a live
 token — and plan 3-06 offered the probe with its setup written out. It was
-declined rather than run. No status code, no `Content-Range`, no byte count.
+declined rather than run. Phases 4 and 5 did not run it either. No status code,
+no `Content-Range`, no byte count.
 
 **What stands.** The assumption is unchanged: assume ranged reads are **not**
 honoured. `PACK_TARGET` stays at 32 MiB and `PACK_MAX` at 48 MiB.
 
-**It is no longer a blocker, and it never sized a restore into a corner.** Phase
-5 plans a **whole-pack fetch**, which is the correct design whichever way
-`Range:` goes, and `PACK_MAX`'s 48 MiB sits under `download_asset`'s 64 MiB body
-cap — so no streaming verb and no `reqwest` `stream` feature is needed either
-way. What CAL-1 could still buy is an *optimisation*: if ranged reads are
-honoured, a restore could fetch only the chunks it needs out of a pack rather
-than the whole pack, and packs could then grow past 32 MiB without making that
-waste worse. That is a performance question for whoever wants partial restore,
-not a gate on any shipped behaviour, and it can be asked at any time.
+**Phase 5 did not run it either, and shipped the restore path without it.** That
+is now four phases with the question open. It was never a blocker and it never
+sized a restore into a corner: Phase 5's reader performs a **whole-pack fetch**,
+which is the correct design whichever way `Range:` goes, and `PACK_MAX`'s 48 MiB
+sits under `download_asset`'s 64 MiB body cap — so no streaming verb and no
+`reqwest` `stream` feature is needed either way. What CAL-1 could still buy is an
+*optimisation*: if ranged reads are honoured, a restore could fetch only the
+chunks it needs out of a pack rather than the whole pack, and packs could then
+grow past 32 MiB without making that waste worse. That is a performance question
+for whoever wants partial restore, not a gate on any shipped behaviour, and it
+can be asked at any time.
+
+**If it ever comes back positive, exactly one thing changes.** §11's `PackSource`
+gains a byte-range fetch keyed on the `offset` and `clen` a reader already has
+out of each pack's own sealed header. The read ceilings, the content-address
+check, and the three download rounds all survive it unchanged, and the pointer's
+unauthenticated `offset`/`clen`/`true_len` stay unread. It is a substitution
+inside one function, not a redesign.
+
+### CAL-5 — a torn upload's `state`, and whether `digest` is populated: also unmeasured
+
+**Not measured either, at the end of Phase 5, and for the same reason as CAL-1:
+it needs a real private repository and a real token, and it additionally *writes
+and deletes* release assets.** The probe is `cal5_release_asset_state_and_digest`
+in `tests/live.rs`, `#[ignore]`d and credential-gated.
+
+Both halves of the shipped behaviour are already the conservative branch, so the
+code is correct while the question is open — what is unmeasured is only how much
+it could be relaxed. A release asset whose `state` is anything other than the
+`"uploaded"` literal is deleted and re-uploaded by the resume scan, and the size
+check runs regardless because `state` is host-supplied and not authoritative; and
+because `digest` is not assumed present, the flip's verifying download happens
+unconditionally. Measuring it could remove that download from a first push. It
+cannot be used to drop the size check.
 
 The probe is written and waiting in `tests/live.rs` as
 `cal1_range_on_private_release_asset`. It skips with a printed message when its
@@ -800,6 +826,48 @@ Three consequences a caller must respect:
   Advancing on a *claim* rather than on a verified snapshot means a forged high
   counter locks the user out of their own real bundle — a denial of service
   built out of the very mechanism meant to protect them.
+- **Every operation that publishes a pointer must run the check, not just the
+  one that obviously replays.** There are three — push, garbage collection, and
+  a password change — and each of them carries the arriving snapshot records
+  forward into what it writes, which launders a rollback into a
+  legitimately-written pointer with a fresh valid revision. Guarding only the
+  push leaves garbage collection as the executioner: it computes liveness over
+  the laundered pointer and deletes every pack the rollback orphaned, and those
+  packs are older than the age floor below, so nothing covers them. Reversible
+  tamper becomes irreversible deletion, performed by the victim, exiting zero.
+  The deliberate override belongs on the push alone (`sync push
+  --allow-rollback`): neither of the other two is a command anyone reaches for
+  when they mean to move the bundle backwards.
+
+**On the restore side the same residual applies, unchanged and for the same
+reason.** A second machine restoring a bundle for the first time has no anchor
+either — that is the entire situation a restore exists for — so its very first
+pull believes whichever snapshot the remote serves. It writes the anchor only
+after that snapshot has verified, and every pull afterwards is protected. There
+is no way around it that does not carry a counter out of band, which is a
+different trade than this design makes. It is written here rather than left
+implicit because a reader who is told "the rollback anchor catches replays"
+will otherwise assume the first fetch was covered too.
+
+### Residual: a restore is additive, and never deletes
+
+**A file that was deleted on machine A is not deleted on machine B by pulling.**
+A snapshot is a record of what one machine had, not an assertion about what
+every machine should have, and a local file the manifest does not mention is
+left exactly as it is — including under `--force`.
+
+This is a decision, not an omission. Making a restore authoritative means
+telling a deletion from a "never had it", which needs a per-machine baseline of
+what was last synced; the account switcher's `synced.json` is the right
+machinery for that and is where a future *selective* restore would start. Adding
+it here would build a second reconciliation model for a case v1 does not have,
+and the failure mode of getting it wrong is deleting a user's data on a machine
+they only asked to receive a copy.
+
+The practical consequence, stated plainly: pulling onto a machine that already
+has files produces the **union**, with the snapshot winning every collision it
+is allowed to win (§11). To get a machine that is byte-identical to the pushing
+one, restore into an empty tree.
 
 ---
 
@@ -1000,3 +1068,250 @@ release assets were chosen for.
 The keyfile asset named by `pointer.keyfile` is referenced by no snapshot's
 `packs` and is never a deletion candidate. Deleting it makes the entire bundle
 permanently unreadable.
+
+---
+
+## 11. Reading a bundle back
+
+§10 says where the objects live. This says what a reader does with them, and it
+is written so that someone holding §5, §10 and this section can implement a
+restore that is safe against a remote assumed hostile.
+
+Every path in a manifest is attacker-controllable — anyone with write access to
+the paired repository can put an arbitrary one there, and each entry becomes a
+local write on whichever machine runs `sync pull`. So the whole of this section
+is biased toward refusing and explaining rather than helpfully overwriting: a
+wrong push costs a re-push, a wrong restore costs the credentials and history on
+the machine in front of you.
+
+### The order is a security property
+
+A restore is seven steps, and two of them are only correct in this order.
+
+1. **Read the local rollback anchor.** From a path derived from *local*
+   configuration, never from the remote's claimed `repo_id` (§9). A parse
+   failure is an error, never "no anchor": softening it turns a damaged anchor
+   into a free rollback.
+2. **Resolve the chain** — pointer → keyfile → snapshot root → index object →
+   manifest → packs, exactly as §10's bootstrap describes. The rollback decision
+   is made *here*, against the **root's own sealed** `counter` and `repo_id`, and
+   never against the plaintext pointer's copies of them.
+3. **Plan.** Every manifest entry becomes exactly one decision, below.
+4. **If this is a dry run, stop.** Dry run is the *absence* of the write flag,
+   not a flag anything checks — the write half sits behind an early return, so
+   there is no "did I remember?" below this line. It is also why step 2 fetches
+   packs in three rounds: the packs holding the index object, then the packs
+   holding the manifest, and only under the write flag the packs holding file
+   data. A dry run downloads a bundle's metadata and not one byte of its
+   content.
+5. **Archive**, before the first byte, over exactly the destinations that will
+   be written. Even under a force flag. Even for a partial restore.
+6. **Write.**
+7. **Advance the anchor** — only now, only from the **root's** sealed counter,
+   and only if 2 through 6 all succeeded and nothing failed part way.
+
+Step 7 after step 2 is the one that matters. Advancing on a *claim* would let
+anyone with repo write access serve a forged high counter once and lock the user
+out of their own real bundle permanently — a denial of service built out of the
+rollback defence itself.
+
+A partial restore is **reported, not rolled back**: undoing the writes that
+succeeded means writing again, from an archive, on a machine that has just
+demonstrated it cannot complete a write. The anchor is not advanced, so the
+machine has not claimed to have seen that snapshot whole, and re-running finishes
+it (below).
+
+### The manifest path encoding
+
+Manifest paths are **root-prefixed and relative**. There are exactly four
+prefixes, one `/` separator on every platform including Windows, and the
+remainder is the path beneath that root:
+
+| prefix | root on the restoring machine |
+|---|---|
+| `config` | the directory holding `config.toml` |
+| `desktop-data` | Claude Desktop's data directory |
+| `desktop-profiles` | the claude-acc profile store |
+| `claude-home` | `~/.claude` |
+
+`config/accounts/work/.credentials.json` is a real example. `config.toml` itself
+needs no fifth prefix — it is `config`'s own child. On the writing side the
+**longest matching root wins**, so a root nested inside another still gets its
+own prefix.
+
+**Never an absolute path, and never a username.** An absolute path is
+unresolvable on a second machine, leaks the pushing user's home directory to
+anyone who obtains the repository, and is exactly what the reader below refuses —
+so a bundle carrying one could be restored only by disabling its own traversal
+defence.
+
+Resolving one is the hostile-input boundary, and it refuses **before** touching
+the filesystem. An entry is rejected if it is empty, contains a NUL, starts with
+`/`, contains a backslash, begins with a Windows drive letter, names no root,
+names a root this build does not know, names a root with nothing beneath it, or
+has any component that is empty, `.`, `..`, or anything other than a plain file
+name. The result is then built **one component at a time** onto the root — never
+by joining an untrusted remainder, because a single absolute component handed to
+a path join replaces the root wholesale, which is the classic shape of this bug.
+
+`canonicalize` is deliberately never called. The destination usually does not
+exist yet on a fresh machine, and resolving symlinks the bundle can influence is
+how an escape sneaks back in after the textual checks have passed.
+
+A rejected entry stays **in the report**, with its path and the reason it was
+refused. Dropping it silently is how a user concludes a restore was complete
+when it was not.
+
+### The read ceilings, and what each bounds
+
+Each is checked before the fetch it governs, and each refusal names both the
+observed value and the ceiling, so a user who legitimately outgrows one gets a
+number to raise instead of a mystery.
+
+| Ceiling | Value | Bounds | Derived from |
+|---|---|---|---|
+| snapshots walked in one pointer | 256 | how many sealed roots a reader opens | `keep_snapshots` is what bounds the list a writer publishes, and it defaults to 10; a legitimate pointer is *tens* of records at most |
+| manifest chunks named by a root | 128 | how many fetches the manifest costs | §5's measured sizing — 1,600 files is 2 chunks, 5,700 files is 5, at ~229 bytes per entry. 128 is ≈146,000 files |
+| index-object chunks named by the pointer | 256 | the plaintext bootstrap | the byte ceiling caps a bundle at 49,152 chunks, whose ~180-byte-per-entry index is ~8.4 MiB ⇒ ~34 chunks |
+| packs downloaded in one restore | 512 | **requests** | at `PACK_TARGET`, 512 packs is 16 GiB of stored data |
+| bytes downloaded in one restore | 256 × `PACK_MAX` (12 GiB) | **transfer** | written as the arithmetic |
+
+The last two are deliberately not one ceiling. A count bound does not bound
+transfer — 512 one-byte packs cost 512 round trips and no bytes — and a byte
+bound does not bound requests: 512 packs at `PACK_MAX` is 24 GiB, twice the byte
+ceiling. Whichever binds first, binds.
+
+The manifest-chunk ceiling is the one that matters most, and not because of the
+list's size. That list is safe *inside* the root's authenticated plaintext — but
+a reader consumes it to decide **how many fetches to issue**, which is a decision
+made from a list before the objects it names have authenticated anything.
+
+### What is believed, and what is not
+
+- **Nothing about a snapshot's position.** The newest snapshot is selected by the
+  `counter` **inside** each opened root. Two snapshots at one counter are no
+  longer something a correct writer produces — a writer derives the counter from
+  the pointer its compare-and-swap actually lands against, so the loser of a race
+  re-seals one above the winner rather than reusing its own — but a hostile
+  remote can still hand-write a tie, so a reader must break it deterministically
+  rather than take the first match. It breaks on the root's own sealed
+  `created_at` and then on the sealed root bytes: both authenticated, so the
+  plaintext list's order still decides nothing.
+- **Nothing about where a chunk sits.** The pointer's `offset`, `clen` and
+  `true_len` are unauthenticated and are never used to slice. A reader believes
+  the pointer only about *which pack asset* holds a chunk; the offsets come from
+  each pack's own **sealed** header, whose every field is bounded against the
+  pack's real length before use.
+- **Nothing about a pack's identity.** A pack's asset name is a content address,
+  so a substituted pack is refused when its bytes do not hash to the name it was
+  served under — before its header is opened.
+- **A root this build cannot open is skipped, not fatal.** A pointer may carry a
+  record written by a newer format, and one such record must not make every older
+  snapshot unrestorable.
+- **A restore can never change the remote.** Four read verbs and no write verb: a
+  missing release is "nothing has been pushed yet", never a reason to create one.
+
+### The per-item decision
+
+One decision per manifest entry, first matching row wins.
+
+| Local file | Digest | Local mtime vs the snapshot's `created_at` | force | credential | force-credentials | Outcome |
+|---|---|---|---|---|---|---|
+| absent | — | — | any | any | any | **create** |
+| present | equal | any | any | any | any | **skip, identical** |
+| present | differs | `<=` (equal is *not* newer) | any | any | any | **update** |
+| present | differs | `>` | no | any | any | **skip, local is newer** |
+| present | differs | `>` | yes | no | any | **overwrite**, named in the summary |
+| present | differs | `>` | yes | yes | no | **needs a second confirmation** |
+| present | differs | `>` | yes | yes | yes | **overwrite**, named in the summary |
+
+And three decided before that table is reached, none of which writes and none of
+which any consent flag promotes:
+
+- the manifest path names machine-bound or volatile state (`bridge-state.json`,
+  `ant-device-registry.json`, `local-agent-mode-sessions/**`, caches, lock files)
+  — **excluded by policy**, enforced on the write side rather than trusted from
+  the bundle, so a future or modified client cannot talk this side into writing
+  them;
+- the manifest path does not resolve — **rejected**, with its reason;
+- the destination exists and is **not a regular file** — a symlink, a directory,
+  a socket, a device node — or cannot be stat'd — **rejected**, with its reason.
+
+**Digest before timestamp, always.** Identity short-circuits both clocks and both
+consents, which is what makes re-running an interrupted restore a no-op instead
+of two hundred phantom conflicts. Identity is hashed off the disk with the push
+side's own chunk addressing; the local change-detection index is **never**
+consulted, because it is a cache keyed on the *push* side's stat tuple and one
+stale row would declare a file the user has since edited identical and skip it.
+
+**The conflict default is a skip with a report, not an overwrite.** Both
+timestamps travel with the decision so the report can say which is which.
+
+**A credential is the one class with a second consent.** An entry is
+credential-bearing if it is in the profile store at all, or if its file name is
+`.credentials.json` under any root. The general force flag never grants that
+consent, and the credential flag alone — without the general one — grants
+nothing. The failure mode is writing a snapshot's older OAuth token over the live
+one: if it has since rotated, the live one is gone and everything authenticated
+with it stops working until the user logs in again. The check applies only when
+the item is *both* locally newer and already under force, because demanding a
+confirmation for every credential in a fresh restore is how a gate gets
+reflexively passed.
+
+The remote side of every timestamp comparison is the snapshot root's
+`created_at` — one value for the whole snapshot, because the manifest carries no
+per-file mtime. The named upgrade path is a per-file `mtime_ns` under manifest
+version 3, read in preference to `created_at` when present. The comparison
+therefore assumes only that two machines' clocks agree to within a snapshot's
+age, and it is made exact rather than merely conservative by stamping every
+restored file with the snapshot's `created_at`: a restored-then-untouched file
+then compares *equal* on the next pull instead of reporting a phantom conflict.
+
+### Writing
+
+- Every write is a tempfile created **in the destination's own directory**,
+  chmodded before its first byte, then renamed into place. There is no staging
+  path outside the destination directory, so decrypted plaintext never sits
+  somewhere that outlives the operation, and the real name is only ever reached
+  by the rename — a half-written credential cannot exist at its real name.
+- **Restored files are mode 0600 and directories the restore creates are 0700**,
+  unconditionally. The manifest's recorded mode is not consulted. Directories
+  that already existed keep whatever their owner gave them.
+- The reassembled length must equal the manifest's recorded length, or the item
+  is refused rather than written short.
+- Items are written in manifest order, so a restore that stops stops in the same
+  place twice.
+- The whole plan's paths are re-resolved before the first tempfile exists, so a
+  refusal at item 40 cannot leave items 1–39 written.
+
+What survives a process kill mid-restore: items already renamed stay complete at
+0600; at most one unpersisted temporary file sits inside a destination directory;
+items after the interruption are untouched; the anchor was not advanced; and a
+re-run finishes it, skipping what the first run completed by digest.
+
+### The pre-restore archive
+
+Before the first byte, the destinations that will be written are tarred into
+`sync-restore-<YYYYmmdd-HHMMSS>.tar.gz` inside the account switcher's own backups
+directory (`~/.claude-acc/backups` unless the profile store was moved) — the same
+directory and naming shape it already uses, so there is one place a user looks
+for "undo" rather than two.
+
+The archive holds credentials in the clear by design, so the modes are set in an
+order that leaves no window: the directory is made and chmodded **0700 before
+`tar` creates anything in it**, and the archive itself is chmodded **0600 the
+moment it exists**.
+
+The archive is exactly the reversal set: only the items being written, only the
+ones already on disk. A restore that creates everything and overwrites nothing
+therefore has no archive, and says so rather than promising one.
+
+There is no third outcome. Either nothing existed to preserve and no archive was
+created, or the archive is complete and stat'd by the time the write begins.
+Every failure in between — a tar that will not run, a non-zero exit, a target
+outside the archive root — aborts the restore *before* the first write. A backup
+that could not be taken is never a warning.
+
+The exact `tar -xzf … -C …` that undoes the whole restore is printed with the
+summary, both on success and — a second time, as the last line — on a partial
+failure, because the bottom of the output is where a user looks after one.
