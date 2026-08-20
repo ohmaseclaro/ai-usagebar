@@ -1134,6 +1134,34 @@ mod tests {
         push_with_parts(cfg, roots, &parts, keyfile, NOW)
     }
 
+    /// Every asset a fixture has accepted, in upload order: id `n` is index
+    /// `n - 1`. Keyed by name because a push uploads several packs.
+    type Sent = std::sync::Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
+    /// `…/releases/9/assets?name=pack-<hex>.bin` — the name GitHub assigns is
+    /// the one the caller asked for, so the fixture echoes it rather than
+    /// inventing one.
+    fn asset_name_in(path_and_query: &str) -> String {
+        path_and_query
+            .split_once("name=")
+            .map(|(_, rest)| rest.split('&').next().unwrap_or(rest).to_string())
+            .unwrap_or_else(|| panic!("an upload names its asset: {path_and_query}"))
+    }
+
+    fn asset_id_in(path: &str) -> usize {
+        path.rsplit('/')
+            .next()
+            .and_then(|id| id.parse().ok())
+            .unwrap_or_else(|| panic!("an asset path ends in its id: {path}"))
+    }
+
+    fn asset_json_sized(id: u64, name: &str, size: usize) -> String {
+        format!(
+            r#"{{"id":{id},"name":"{name}","size":{size},"state":"uploaded",
+                "created_at":"2023-11-14T22:13:20Z"}}"#
+        )
+    }
+
     fn asset_json(id: u64, name: &str) -> String {
         format!(
             r#"{{"id":{id},"name":"{name}","size":1,"state":"uploaded",
@@ -1141,14 +1169,21 @@ mod tests {
         )
     }
 
-    /// The release read, the pointer read, the upload and the verifying download.
+    /// Everything the outbound path touches: the release read, the pointer
+    /// read, the resume listing, the uploads and the verifying downloads.
     ///
-    /// The verification hop (D3) compares what comes back against the pack that
-    /// was sent, so the mock has to serve the very bytes it was handed — hence
-    /// the recorder, which is per-test rather than a shared static because these
-    /// tests run in parallel.
-    fn mock_upload_path(server: &mut mockito::ServerGuard) -> std::sync::Arc<Mutex<Vec<u8>>> {
-        let sent: std::sync::Arc<Mutex<Vec<u8>>> = std::sync::Arc::default();
+    /// **A push uploads more than one asset.** Plan 4-02 packs the manifest and
+    /// the index object alongside the data chunks, so even a one-file bundle
+    /// produces several packs. The fixture therefore keys everything by asset
+    /// name and hands out ids in upload order, rather than assuming a single
+    /// `pack-x.bin` with id 1 — an assumption that silently made the verifying
+    /// download (D3) compare one pack's bytes against another's.
+    ///
+    /// The verification hop serves back the very bytes it was handed, so the
+    /// recorder is per-test rather than a shared static: these tests run in
+    /// parallel.
+    fn mock_upload_path(server: &mut mockito::ServerGuard) -> Sent {
+        let sent: Sent = std::sync::Arc::default();
 
         server
             .mock("GET", "/repos/o/n/releases/tags/ai-usagebar-sync-v1")
@@ -1175,23 +1210,38 @@ mod tests {
             .expect(1)
             .create();
 
+        // The body is recorded from `with_body_from_request`, not from
+        // `match_request`: mockito evaluates every mock's matcher against every
+        // request clearing method and path, so recording in a matcher counts
+        // requests this mock never answers.
         let recorder = std::sync::Arc::clone(&sent);
         server
             .mock("POST", mockito::Matcher::Regex("/releases/9/assets".into()))
-            .match_request(move |req| {
-                *recorder.lock().unwrap() = req.body().unwrap().clone();
-                true
-            })
             .with_status(201)
-            .with_body(asset_json(1, "pack-x.bin"))
-            .expect(1)
+            .with_body_from_request(move |req| {
+                let name = asset_name_in(req.path_and_query().as_ref());
+                let mut held = recorder.lock().unwrap();
+                held.push((name.clone(), req.body().unwrap().clone()));
+                asset_json_sized(held.len() as u64, &name, held.last().unwrap().1.len())
+                    .into_bytes()
+            })
             .create();
 
         let echo = std::sync::Arc::clone(&sent);
         server
-            .mock("GET", "/repos/o/n/releases/assets/1")
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/releases/assets/\d+$".into()),
+            )
             .with_status(200)
-            .with_body_from_request(move |_| echo.lock().unwrap().clone())
+            .with_body_from_request(move |req| {
+                let id = asset_id_in(req.path().as_ref());
+                echo.lock()
+                    .unwrap()
+                    .get(id - 1)
+                    .map(|(_, bytes)| bytes.clone())
+                    .unwrap_or_default()
+            })
             .create();
 
         sent
@@ -1261,20 +1311,39 @@ mod tests {
             .create();
 
         // The incident path lists, then deletes only what this run uploaded.
+        // The listing echoes every asset the fixture accepted — a push packs the
+        // manifest and index object as well as the data, so "what this run
+        // uploaded" is several assets, not one.
         let named = std::sync::Arc::clone(&sent);
         let listing = server
             .mock("GET", mockito::Matcher::Regex("per_page=100".into()))
             .with_status(200)
             .with_body_from_request(move |_| {
-                let name = push::pack_asset_name(&content_address(&named.lock().unwrap()));
-                format!("[{}]", asset_json(1, &name)).into_bytes()
+                let held = named.lock().unwrap();
+                let rows: Vec<String> = held
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (name, bytes))| asset_json_sized(i as u64 + 1, name, bytes.len()))
+                    .collect();
+                format!("[{}]", rows.join(",")).into_bytes()
             })
             .expect(1)
             .create();
-        let delete = server
-            .mock("DELETE", "/repos/o/n/releases/assets/1")
+        // Asserted as a *set equal to what was uploaded*, not as a count: the
+        // number of packs is 4-02's business, and a fixture that pins it would
+        // fail on any future packing change while proving nothing extra.
+        let deleted: std::sync::Arc<Mutex<Vec<usize>>> = std::sync::Arc::default();
+        let recorder = std::sync::Arc::clone(&deleted);
+        server
+            .mock(
+                "DELETE",
+                mockito::Matcher::Regex(r"/releases/assets/\d+$".into()),
+            )
             .with_status(204)
-            .expect(1)
+            .with_body_from_request(move |req| {
+                recorder.lock().unwrap().push(asset_id_in(req.path().as_ref()));
+                Vec::new()
+            })
             .create();
         let flip = server
             .mock("PUT", "/repos/o/n/contents/sync/pointer.json")
@@ -1288,8 +1357,16 @@ mod tests {
         );
         public.assert();
         listing.assert();
-        delete.assert();
         flip.assert();
+
+        let mut destroyed = deleted.lock().unwrap().clone();
+        destroyed.sort_unstable();
+        let uploaded: Vec<usize> = (1..=sent.lock().unwrap().len()).collect();
+        assert!(!uploaded.is_empty(), "the run uploaded before it re-gated");
+        assert_eq!(
+            destroyed, uploaded,
+            "every asset this run uploaded is destroyed, and nothing else is"
+        );
     }
 
     /// A failed flip is a failed push. `with_retry` still never retries a
@@ -1360,11 +1437,19 @@ mod tests {
             .with_body(asset_json(1, "pack-x.bin"))
             .create();
         // Serves something other than what was uploaded.
+        //
+        // `expect_at_least`, not `expect(1)`: uploads run in a bounded window,
+        // so when the first verification fails the ones already in flight have
+        // also been read back. Pinning the count would pin 4-03's concurrency
+        // cap into an unrelated test. What this test asserts is the flip.
         let verify = server
-            .mock("GET", "/repos/o/n/releases/assets/1")
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/releases/assets/\d+$".into()),
+            )
             .with_status(200)
             .with_body("not the bytes that were sent")
-            .expect(1)
+            .expect_at_least(1)
             .create();
         let flip = server
             .mock("PUT", "/repos/o/n/contents/sync/pointer.json")
