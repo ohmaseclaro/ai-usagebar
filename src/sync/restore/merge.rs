@@ -74,6 +74,25 @@
 //! family is not being built. A credential that is *not* locally newer is an
 //! ordinary `Update`: the second consent guards the loss, not the category.
 //!
+//! # A Claude Desktop token cache is only restorable where its key lives
+//!
+//! `desktop-profiles/*/config-tokenCache{,V2}` are Chromium **safeStorage**
+//! values: `v10` followed by AES-128-CBC ciphertext under a random secret that
+//! lives in the login Keychain of *the machine that wrote them*. Carried to a
+//! second Mac they are inert — and restoring one over a live token cache
+//! replaces a working Desktop login with bytes Desktop cannot read.
+//!
+//! The decision is made by **attempting the decryption**, never by recording
+//! where a blob came from: the local key either opens it or it does not, and
+//! that is exactly the question. A provenance field would be one more thing to
+//! keep in sync, one more thing a bundle could lie about, and still would not
+//! answer it. See [`foreign_safe_storage`]; the refusal is
+//! [`Disposition::ForeignSafeStorage`] and it never writes.
+//!
+//! `.credentials.json` is deliberately untouched by all of this. It is plain
+//! JSON, it is Claude Code'"'"'s own OAuth credential, and it is what makes the CLI
+//! work on the second machine — the portable half of the bundle.
+//!
 //! # Restore never plans a deletion
 //!
 //! A local file the manifest does not mention is left exactly as it is. That is
@@ -96,12 +115,15 @@ use zeroize::Zeroizing;
 
 use crate::config::SyncCategory;
 use crate::error::Result;
+use crate::safe_storage;
 use crate::sync::CHUNK_SIZE;
 use crate::sync::crypto::{ChunkId, Keys};
 use crate::sync::model::{FileEntry, IndexObject};
 use crate::sync::scope::CREDENTIAL_FILE;
 
-use super::{Disposition, ItemPlan, Resolved, RestoreCtx, RestoreOptions, RestorePlan, layout};
+use super::{
+    Disposition, ItemPlan, PackSource, Resolved, RestoreCtx, RestoreOptions, RestorePlan, layout,
+};
 
 /// What this machine has at a destination.
 struct LocalFacts {
@@ -137,6 +159,30 @@ enum Local {
 /// Manifest order is preserved and the count is exact: N entries in, N
 /// [`ItemPlan`]s out.
 pub fn plan(ctx: &RestoreCtx<'_>, resolved: &Resolved) -> Result<RestorePlan> {
+    plan_with_safe_key(ctx, resolved, local_safe_key())
+}
+
+/// This machine'"'"'s Claude Safe Storage key, or `None` where there is none to
+/// read — no Keychain item, no Claude Desktop, or not macOS at all.
+///
+/// The seam: [`plan`] reads the login Keychain, [`plan_with_safe_key`] never
+/// does, and every test goes through the latter with a key derived from a fixed
+/// fake secret. Nothing in the suite can reach a real Keychain.
+#[cfg(target_os = "macos")]
+fn local_safe_key() -> Option<safe_storage::Key> {
+    safe_storage::macos_key().ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn local_safe_key() -> Option<safe_storage::Key> {
+    None
+}
+
+fn plan_with_safe_key(
+    ctx: &RestoreCtx<'_>,
+    resolved: &Resolved,
+    safe_key: Option<safe_storage::Key>,
+) -> Result<RestorePlan> {
     let keys = resolved.packs.keys();
     let created_at = resolved.root.created_at;
 
@@ -146,7 +192,15 @@ pub fn plan(ctx: &RestoreCtx<'_>, resolved: &Resolved) -> Result<RestorePlan> {
         .iter()
         .map(|file| {
             let category = category_of(&file.path);
-            let (dest, disposition) = decide_entry(ctx, keys, file, category, created_at);
+            let (dest, disposition) = decide_entry(
+                ctx,
+                keys,
+                file,
+                category,
+                created_at,
+                safe_key.as_ref(),
+                &resolved.packs,
+            );
             ItemPlan {
                 manifest_path: file.path.clone(),
                 dest,
@@ -181,6 +235,8 @@ fn decide_entry(
     file: &FileEntry,
     category: SyncCategory,
     created_at: DateTime<Utc>,
+    safe_key: Option<&safe_storage::Key>,
+    packs: &PackSource,
 ) -> (Option<PathBuf>, Disposition) {
     if !layout::accept_for_write(Path::new(&file.path)) {
         return (None, Disposition::ExcludedByPolicy);
@@ -189,6 +245,14 @@ fn decide_entry(
         Ok(dest) => dest,
         Err(why) => return (None, Disposition::RejectedPath(why.to_string())),
     };
+
+    // Before the destination is even stat'"'"'ed: the refusal holds whether or not
+    // a local token cache is there to lose, and no consent promotes it. `dest`
+    // stays `None` for the same reason the other two refusals keep it — an
+    // entry that will never be written has structurally nowhere to be written.
+    if foreign_safe_storage(safe_key, packs, file) {
+        return (None, Disposition::ForeignSafeStorage);
+    }
 
     let local = match local_at(&dest, file, keys) {
         Local::Absent => None,
@@ -253,6 +317,67 @@ fn decide(
         local_mtime,
         remote_mtime,
     }
+}
+
+/// Is this incoming file a safeStorage blob that this machine cannot open?
+///
+/// Answered by attempting the decryption. **Only the boolean escapes**: the
+/// plaintext is dropped through [`Zeroizing`] and neither it, the key, nor any
+/// fragment of either reaches a return value, a log line or an error message.
+///
+/// `false` whenever the answer cannot be established, which is the honest
+/// reading of "this is not known to be foreign". In particular a dry run has no
+/// data packs to read — [`super::fetch::resolve`] downloads file content only
+/// under `apply` — so a dry run reports a token cache'"'"'s ordinary disposition
+/// and the run that would actually write is the run that refuses. The gate
+/// guards the write, and the write is where the loss would happen.
+#[cfg(target_os = "macos")]
+fn foreign_safe_storage(
+    safe_key: Option<&safe_storage::Key>,
+    packs: &PackSource,
+    entry: &FileEntry,
+) -> bool {
+    /// A token cache is a few hundred bytes of base64. The ceiling is what
+    /// keeps a 50 MB transcript from being decrypted into memory to answer a
+    /// question its size has already answered — and, being under
+    /// [`CHUNK_SIZE`], it also makes "one chunk" true rather than assumed.
+    const MAX_LEN: u64 = 64 * 1024;
+
+    if entry.true_len == 0 || entry.true_len > MAX_LEN {
+        return false;
+    }
+    let [id] = entry.chunks[..] else {
+        return false;
+    };
+    let Ok(bytes) = packs.chunk(&id) else {
+        return false; // a dry run: the data packs were never downloaded
+    };
+    let Ok(value) = std::str::from_utf8(&bytes) else {
+        return false;
+    };
+    if !safe_storage::looks_like_value(value) {
+        return false;
+    }
+    // No local key at all is the same answer, and for the same reason: nothing
+    // on this machine can read the blob, so writing it leaves Claude Desktop a
+    // token cache it cannot decrypt — worse than leaving it none.
+    safe_key.is_none_or(|key| {
+        safe_storage::decrypt(key, value)
+            .map(Zeroizing::new)
+            .is_err()
+    })
+}
+
+/// Not macOS: Chromium'"'"'s safeStorage is a different scheme backed by a
+/// different key store here, [`safe_storage::macos_key`] does not exist, and
+/// restore behaves exactly as it always has.
+#[cfg(not(target_os = "macos"))]
+fn foreign_safe_storage(
+    _safe_key: Option<&safe_storage::Key>,
+    _packs: &PackSource,
+    _entry: &FileEntry,
+) -> bool {
+    false
 }
 
 /// Would overwriting this entry cost a live secret?
@@ -1185,6 +1310,240 @@ mod tests {
                 forced.items[0].disposition,
                 Disposition::Overwrite { .. }
             ));
+        }
+    }
+
+    // ------------------------------------------- Claude Desktop token caches
+
+    /// A Claude Desktop token cache travels, and is only *restorable* where the
+    /// key that sealed it lives.
+    ///
+    /// macOS-only, because the whole mechanism is. Every test here injects a
+    /// key derived from a fixed fake secret through `plan_with_safe_key`'s
+    /// seam: nothing in this module may read the real login Keychain, which is
+    /// the reason the seam exists at all.
+    #[cfg(target_os = "macos")]
+    mod desktop_token_caches {
+        use super::*;
+        use crate::safe_storage;
+        use crate::sync::chunk;
+        use crate::sync::pack::PackWriter;
+        use crate::sync::restore::{report, write};
+
+        /// `desktop-profiles/…` is the profile store `scope` files under
+        /// `SyncCategory::Credentials` — the one the hazard lives in.
+        const CACHE: &str = "desktop-profiles/work/config-tokenCacheV2";
+        /// The portable half of the bundle, in the same run every time.
+        const PORTABLE: &str = "config/accounts/work/.credentials.json";
+
+        fn this_mac() -> safe_storage::Key {
+            safe_storage::derive_key(b"the-key-in-this-machines-keychain")
+        }
+
+        fn another_mac() -> safe_storage::Key {
+            safe_storage::derive_key(b"the-key-in-some-other-machines-keychain")
+        }
+
+        /// [`snapshot`], but with the data packs really present — the state
+        /// `plan` is in under `--apply`, and the only one in which the incoming
+        /// bytes can be read at all.
+        fn snapshot_with_packs(entries: &[(&str, &[u8])]) -> Resolved {
+            let k = keys();
+            let mut writer = PackWriter::new();
+            let mut files = Vec::new();
+            for (path, body) in entries {
+                let chunks: Vec<ChunkId> = chunk::split(body)
+                    .map(|block| {
+                        let blob = chunk::seal_chunk(&k, block).unwrap();
+                        let id = blob.id;
+                        writer.push(blob);
+                        id
+                    })
+                    .collect();
+                files.push(FileEntry {
+                    path: (*path).to_string(),
+                    mode: 0o600,
+                    true_len: body.len() as u64,
+                    chunks,
+                });
+            }
+            let (pack_id, bytes) = writer.finish(&k).unwrap();
+            let mut packs = PackSource::empty(k);
+            packs.add(pack_id, bytes).unwrap();
+            Resolved {
+                root: Root::new(
+                    7,
+                    SNAPSHOT,
+                    "github:1".into(),
+                    Vec::new(),
+                    KdfParams::default(),
+                ),
+                manifest: Manifest::new(files),
+                index: IndexObject::new(Vec::new(), Vec::new()),
+                packs,
+            }
+        }
+
+        fn applying() -> RestoreOptions {
+            RestoreOptions {
+                apply: true,
+                ..Default::default()
+            }
+        }
+
+        fn planned(
+            m: &Machine,
+            resolved: &Resolved,
+            key: Option<safe_storage::Key>,
+        ) -> RestorePlan {
+            let client = m.client();
+            plan_with_safe_key(&m.ctx(&client, applying()), resolved, key)
+                .expect("planning is infallible here")
+        }
+
+        fn disposition_of<'a>(plan: &'a RestorePlan, path: &str) -> &'a Disposition {
+            &plan
+                .items
+                .iter()
+                .find(|i| i.manifest_path == path)
+                .unwrap_or_else(|| panic!("{path} is missing from the plan"))
+                .disposition
+        }
+
+        /// Same key, same answer as before this gate existed: a snapshot of
+        /// *this* machine restores onto it, which is what makes the disk-loss
+        /// recovery the blobs are carried for actually work.
+        #[test]
+        fn a_blob_this_machines_key_opens_is_restored() {
+            let m = Machine::new();
+            let mine = safe_storage::encrypt(&this_mac(), br#"{"accessToken":"live"}"#);
+            let resolved = snapshot_with_packs(&[(CACHE, mine.as_bytes())]);
+
+            let plan = planned(&m, &resolved, Some(this_mac()));
+            assert_eq!(disposition_of(&plan, CACHE), &Disposition::Create);
+
+            let client = m.client();
+            write::apply(&m.ctx(&client, applying()), &plan, &resolved.packs).unwrap();
+            let dest = layout::from_manifest_path(&m.roots, CACHE).unwrap();
+            assert_eq!(fs::read_to_string(&dest).unwrap(), mine);
+        }
+
+        /// The whole point. A blob from another Mac is refused, it is named in
+        /// the report, and the live local session is still there — byte for
+        /// byte — after a full `--apply` run.
+        #[test]
+        fn a_blob_from_another_machine_is_refused_and_the_live_session_survives() {
+            let m = Machine::new();
+            let live = safe_storage::encrypt(&this_mac(), br#"{"accessToken":"the-live-one"}"#);
+            let dest = m.seed(CACHE, live.as_bytes(), SNAPSHOT - Duration::from_secs(3600));
+
+            // Older than the snapshot, so without the gate this is a plain
+            // `Update` and the login is gone.
+            let theirs = safe_storage::encrypt(&another_mac(), br#"{"accessToken":"theirs"}"#);
+            let resolved = snapshot_with_packs(&[(CACHE, theirs.as_bytes())]);
+
+            let plan = planned(&m, &resolved, Some(this_mac()));
+            let item = &plan.items[0];
+            assert_eq!(item.disposition, Disposition::ForeignSafeStorage);
+            assert!(!item.disposition.writes());
+            assert!(item.dest.is_none(), "a refusal keeps no destination");
+
+            let rendered = report::render_plan(&plan);
+            assert!(
+                rendered.contains(CACHE),
+                "the refusal is not named:\n{rendered}"
+            );
+            assert!(
+                rendered.contains("sign in to Claude Desktop on this Mac"),
+                "the report does not say what to do about it:\n{rendered}"
+            );
+
+            let client = m.client();
+            write::apply(&m.ctx(&client, applying()), &plan, &resolved.packs).unwrap();
+            assert_eq!(
+                fs::read_to_string(&dest).unwrap(),
+                live,
+                "the working login was overwritten by a blob nothing here can decrypt"
+            );
+        }
+
+        /// No `Claude Safe Storage` key on this machine is the same answer: a
+        /// token cache it cannot read is still a token cache it must not write,
+        /// absent local file or not.
+        #[test]
+        fn a_blob_is_refused_when_this_machine_has_no_key_at_all() {
+            let m = Machine::new();
+            let theirs = safe_storage::encrypt(&another_mac(), br#"{"accessToken":"theirs"}"#);
+            let resolved = snapshot_with_packs(&[(CACHE, theirs.as_bytes())]);
+
+            let plan = planned(&m, &resolved, None);
+            assert_eq!(plan.items[0].disposition, Disposition::ForeignSafeStorage);
+
+            let client = m.client();
+            write::apply(&m.ctx(&client, applying()), &plan, &resolved.packs).unwrap();
+            assert!(
+                !layout::from_manifest_path(&m.roots, CACHE)
+                    .unwrap()
+                    .exists(),
+                "an unreadable token cache is worse for Desktop to find than none"
+            );
+        }
+
+        /// The carve-out is narrow, and this is the assertion that says so:
+        /// `.credentials.json` is plain JSON, it is Claude Code's own OAuth
+        /// credential, it is what makes the CLI work on the second machine, and
+        /// it restores in the very same run that refuses the token cache.
+        #[test]
+        fn a_dot_credentials_json_restores_in_the_same_run_that_refuses_a_token_cache() {
+            let m = Machine::new();
+            let theirs = safe_storage::encrypt(&another_mac(), b"{}");
+            let portable = br#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-portable"}}"#;
+            let resolved = snapshot_with_packs(&[(CACHE, theirs.as_bytes()), (PORTABLE, portable)]);
+
+            let plan = planned(&m, &resolved, Some(this_mac()));
+            assert_eq!(
+                disposition_of(&plan, CACHE),
+                &Disposition::ForeignSafeStorage
+            );
+            assert_eq!(disposition_of(&plan, PORTABLE), &Disposition::Create);
+
+            let client = m.client();
+            write::apply(&m.ctx(&client, applying()), &plan, &resolved.packs).unwrap();
+            let dest = layout::from_manifest_path(&m.roots, PORTABLE).unwrap();
+            assert_eq!(fs::read(&dest).unwrap(), portable);
+        }
+
+        /// The marker decides, not the path: an ordinary file sitting at the
+        /// same shape of path is planned exactly as it always was.
+        #[test]
+        fn a_file_at_the_same_path_shape_that_is_not_a_safe_storage_value_is_untouched_by_the_gate()
+        {
+            let m = Machine::new();
+            let plain = br#"{"not":"a safeStorage value"}"#;
+            let resolved = snapshot_with_packs(&[(CACHE, plain)]);
+
+            let plan = planned(&m, &resolved, Some(this_mac()));
+            assert_eq!(plan.items[0].disposition, Disposition::Create);
+
+            let client = m.client();
+            write::apply(&m.ctx(&client, applying()), &plan, &resolved.packs).unwrap();
+            assert_eq!(
+                fs::read(layout::from_manifest_path(&m.roots, CACHE).unwrap()).unwrap(),
+                plain
+            );
+        }
+
+        /// A dry run has no data packs — `fetch::resolve` downloads file content
+        /// only under `apply` — so it cannot answer the question and says so by
+        /// not refusing. The run that writes is the run that refuses, which is
+        /// where the loss would have happened.
+        #[test]
+        fn without_the_data_packs_the_gate_stays_out_of_the_way() {
+            let m = Machine::new();
+            let theirs = safe_storage::encrypt(&another_mac(), b"{}");
+            let resolved = snapshot(&[(CACHE, theirs.as_bytes())]);
+            let plan = planned(&m, &resolved, Some(this_mac()));
+            assert_eq!(plan.items[0].disposition, Disposition::Create);
         }
     }
 
