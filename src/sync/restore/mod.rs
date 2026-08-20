@@ -419,6 +419,37 @@ pub async fn run(ctx: RestoreCtx<'_>) -> Result<RestoreOutcome> {
 }
 
 #[cfg(test)]
+mod ordering_guard {
+    /// SAFE-04 is an *order*, and until now only one integration test held it.
+    ///
+    /// Phase 5's verification swapped [`backup::take`] and [`write::apply`] in
+    /// [`run`] and watched the entire 1520-test lib suite stay green — a
+    /// safety property whose whole net was a single test in another file. This
+    /// reads `run`'s own shipped source, so the swap fails here too, and it
+    /// fails without constructing a remote, a keyfile or a passphrase.
+    ///
+    /// It asserts an order, not a presence: two calls in the wrong sequence
+    /// still satisfies "both are called".
+    #[test]
+    fn the_archive_is_taken_before_the_first_byte_is_written() {
+        let source = include_str!("mod.rs");
+        let body = source
+            .split_once("pub async fn run(")
+            .expect("`run` is the entry point this guard is about")
+            .1;
+        let take = body
+            .find("backup::take(")
+            .expect("`run` archives before it writes");
+        let apply = body.find("write::apply(").expect("`run` writes");
+        assert!(
+            take < apply,
+            "backup::take must precede write::apply in `run`: an archive taken \
+             afterwards restores what the run had already overwritten"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::SyncConfig;

@@ -1142,7 +1142,7 @@ async fn criterion_1_a_pushed_tree_restores_byte_for_byte_under_a_second_machine
 // Criterion 2 — idempotence (D7)
 // ---------------------------------------------------------------------------
 
-/// **ROADMAP §Phase 5 criterion 2** — a second apply writes nothing and reports
+/// **D7 idempotence** — a second apply writes nothing and reports
 /// no conflict.
 ///
 /// It re-runs the **whole** restore rather than re-applying the plan in hand:
@@ -1151,7 +1151,7 @@ async fn criterion_1_a_pushed_tree_restores_byte_for_byte_under_a_second_machine
 /// either clock is read, which is what keeps the second run from reporting two
 /// hundred phantom conflicts.
 #[tokio::test]
-async fn criterion_2_a_second_apply_of_the_same_snapshot_writes_nothing_and_reports_no_conflict() {
+async fn d7_a_second_apply_of_the_same_snapshot_writes_nothing_and_reports_no_conflict() {
     let a = Machine::alice();
     let b = Machine::bob();
     seed_a_full_tree(&a);
@@ -1197,7 +1197,7 @@ async fn criterion_2_a_second_apply_of_the_same_snapshot_writes_nothing_and_repo
 /// pack of its own. With a single push every pack also carries metadata and the
 /// assertion would be vacuous.
 #[tokio::test]
-async fn a_dry_run_writes_nothing_at_all_and_never_downloads_a_pack_it_only_needs_for_file_data() {
+async fn criterion_2_a_dry_run_writes_nothing_at_all_and_never_downloads_a_pack_for_file_data() {
     let a = Machine::alice();
     let b = Machine::bob();
     seed_a_full_tree(&a);
@@ -1389,7 +1389,7 @@ async fn criterion_4_the_backup_precedes_the_first_write_and_its_printed_command
 /// overwrite: a wrong push costs a re-push, a wrong restore costs the work on
 /// the machine in front of you.
 #[tokio::test]
-async fn sync_06_a_newer_local_file_is_skipped_and_named_and_force_overwrites_and_names_it() {
+async fn criterion_6_a_newer_local_file_is_skipped_and_named_and_force_overwrites_and_names_it() {
     const ROUTINE: &str = "claude-home/scheduled-tasks/daily routine.json";
     let a = Machine::alice();
     let b = Machine::bob();
@@ -1645,7 +1645,7 @@ async fn two_machines_racing_publish_distinct_counters_and_a_pull_takes_the_newe
 // Criterion 3 — the refusals
 // ---------------------------------------------------------------------------
 
-/// **ROADMAP §Phase 5 criterion 3**, the rollback half — an authentic *older*
+/// **ROADMAP §Phase 5 criterion 5**, the rollback half — an authentic *older*
 /// pointer served in place of the current one is refused, and `prune` does not
 /// then delete the packs it orphaned.
 ///
@@ -1654,7 +1654,7 @@ async fn two_machines_racing_publish_distinct_counters_and_a_pull_takes_the_newe
 /// 4-08 put the check on all three paths that publish a pointer, `prune` among
 /// them, because guarding only `push` left `sync prune` as the executioner.
 #[tokio::test]
-async fn criterion_3_a_rolled_back_pointer_is_refused_and_prune_does_not_collect_its_orphans() {
+async fn criterion_5_a_rolled_back_pointer_is_refused_and_prune_does_not_collect_its_orphans() {
     let a = Machine::alice();
     let b = Machine::bob();
     seed_a_full_tree(&a);
@@ -1732,7 +1732,7 @@ async fn criterion_3_a_rolled_back_pointer_is_refused_and_prune_does_not_collect
 /// really produced and exactly one byte differs, so the only difference between
 /// the passing and failing runs is the tampering.
 #[tokio::test]
-async fn criterion_3_a_tampered_pack_refuses_and_leaves_no_plaintext_under_machine_b() {
+async fn criterion_5_a_tampered_pack_refuses_and_leaves_no_plaintext_under_machine_b() {
     let a = Machine::alice();
     let b = Machine::bob();
     seed_a_full_tree(&a);
@@ -1787,7 +1787,7 @@ async fn criterion_3_a_tampered_pack_refuses_and_leaves_no_plaintext_under_machi
 ///
 /// Restoring a short file quietly is the outcome this refusal exists to prevent.
 #[tokio::test]
-async fn criterion_3_a_snapshot_naming_a_pack_the_release_withholds_refuses_and_writes_nothing() {
+async fn criterion_5_a_snapshot_naming_a_pack_the_release_withholds_refuses_and_writes_nothing() {
     let a = Machine::alice();
     let b = Machine::bob();
     seed_a_full_tree(&a);
@@ -1833,7 +1833,7 @@ async fn criterion_3_a_snapshot_naming_a_pack_the_release_withholds_refuses_and_
 /// from the passing run is the one entry. Silently dropping it is how a user
 /// concludes a restore was complete when it was not.
 #[tokio::test]
-async fn criterion_3_a_manifest_entry_that_escapes_its_root_is_refused_and_named_in_the_report() {
+async fn criterion_5_a_manifest_entry_that_escapes_its_root_is_refused_and_named_in_the_report() {
     let dir = TempDir::new().expect("a temp dir");
     let honest = alice_roots(dir.path());
     // One mutation: the same file, named through its parent.
@@ -2012,7 +2012,7 @@ async fn a_symlink_at_a_destination_is_refused_and_no_flag_promotes_it() {
 /// project has already shipped one bug in that family and should not build a
 /// third path into it.
 #[tokio::test]
-async fn force_alone_never_overwrites_a_live_credential_and_force_credentials_needs_force() {
+async fn criterion_3_force_alone_never_overwrites_a_live_credential() {
     const CRED: &str = "config/accounts/work/.credentials.json";
     let a = Machine::alice();
     let b = Machine::bob();
@@ -2125,7 +2125,7 @@ async fn force_alone_never_overwrites_a_live_credential_and_force_credentials_ne
 // Criterion 6 — the interruption (SAFE-05)
 // ---------------------------------------------------------------------------
 
-/// **ROADMAP §Phase 5 criterion 6** — a restore that fails part way leaves the
+/// **ROADMAP §Phase 5 criterion 7** — a restore that fails part way leaves the
 /// items before it complete, the item at it absent under its real name, no
 /// `.tmp.` file surviving anywhere under machine B, and the anchor unmoved.
 ///
@@ -2141,7 +2141,7 @@ async fn force_alone_never_overwrites_a_live_credential_and_force_credentials_ne
 /// concurrently running test also owns.
 #[tokio::test]
 #[cfg(unix)]
-async fn criterion_6_an_interrupted_restore_leaves_no_half_written_file_and_no_anchor_move() {
+async fn criterion_7_an_interrupted_restore_leaves_no_half_written_file_and_no_anchor_move() {
     use std::os::unix::fs::PermissionsExt;
 
     // The premise, checked rather than assumed: root writes into a 0o500
@@ -2295,7 +2295,7 @@ async fn a_machine_that_missed_a_rekey_is_refused_a_push_and_can_still_pull() {
 // Criterion 5 — the anchor, and what allow_rollback never rescues
 // ---------------------------------------------------------------------------
 
-/// **ROADMAP §Phase 5 criterion 5** — a failed pull leaves the anchor
+/// **ROADMAP §Phase 5 criterion 7**, the anchor half — a failed pull leaves the anchor
 /// byte-identical, whatever the failure was.
 ///
 /// A forged high counter that advanced the anchor on a *claim* rather than on a
@@ -2303,7 +2303,7 @@ async fn a_machine_that_missed_a_rekey_is_refused_a_push_and_can_still_pull() {
 /// of service anyone with repo write access could trigger at will, built out of
 /// the very mechanism meant to protect them.
 #[tokio::test]
-async fn criterion_5_a_failed_pull_never_advances_the_anchor() {
+async fn criterion_7_a_failed_pull_never_advances_the_anchor() {
     let a = Machine::alice();
     let b = Machine::bob();
     seed_a_full_tree(&a);
