@@ -1160,6 +1160,20 @@ mod tests {
             .with_status(404)
             .with_body(r#"{"message":"Not Found"}"#)
             .create();
+        // 4-03's resume scan lists the release's assets before the first
+        // upload. Empty, because this fixture is a first push and nothing has
+        // landed yet. `expect(1)` deliberately: the incident path in
+        // `a_repository_that_turns_public_mid_push_deletes_and_does_not_flip`
+        // lists a *second* time, and mockito prefers a matching mock that is
+        // still missing hits — so that test's own listing answers the second
+        // call without this one having to know about it.
+        server
+            .mock("GET", "/repos/o/n/releases/9/assets")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body("[]")
+            .expect(1)
+            .create();
 
         let recorder = std::sync::Arc::clone(&sent);
         server
@@ -1330,6 +1344,13 @@ mod tests {
             .mock("GET", "/repos/o/n/contents/sync/pointer.json")
             .with_status(404)
             .with_body(r#"{"message":"Not Found"}"#)
+            .create();
+        // 4-03's resume scan, with nothing landed: every pack uploads.
+        server
+            .mock("GET", "/repos/o/n/releases/9/assets")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body("[]")
             .create();
         server
             .mock("POST", mockito::Matcher::Regex("/releases/9/assets".into()))
