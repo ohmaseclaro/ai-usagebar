@@ -481,13 +481,14 @@ impl Index {
     /// `sync setup` does whenever it is re-run — and every cached id becomes an
     /// address that nothing will ever seal again.
     ///
-    /// That is not a slow path, it is a corrupt one. `plan::build` reuses a
-    /// cached file's ids without reopening the file, and `packer::pack_file`
-    /// seals a block only when the id it computes is one the plan asked for. So
-    /// after a key change the plan names the old ids, the packer computes new
-    /// ones, nothing matches, nothing is sealed — and the manifest ships
-    /// referencing chunks that were never uploaded. The push reports success
-    /// and the bundle cannot be restored.
+    /// That used to be a corrupt path and is now merely a slow one.
+    /// `plan::build` reuses a cached file's ids without reopening the file, and
+    /// the manifest was built from that list, so after a key change the plan
+    /// named the old ids, the packer computed new ones, nothing matched,
+    /// nothing was sealed — and the manifest shipped referencing chunks that
+    /// were never uploaded. `packer::build` now names only what it actually
+    /// read and sealed (6-08), so the worst a stale binding costs is re-reading
+    /// every file. Which is exactly what this binding exists to avoid.
     ///
     /// The stored value is `chunk_id` over a fixed label: a keyed hash, so it
     /// identifies the key without being invertible to it, and it reuses the

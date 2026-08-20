@@ -1018,7 +1018,7 @@ fn pull_with_parts(
         let Some(gate) = io.gate.as_deref_mut() else {
             // A dry run is a *success*: it did exactly what it was asked, and
             // the footer names `--apply` (`report::APPLY_COMMAND`).
-            return match write!(io.out, "{}", restore::report::render_plan(&plan)) {
+            return match write!(io.out, "{}", restore::report::render_plan(&plan, false)) {
                 Ok(()) => 0,
                 Err(e) => refuse(&e.to_string()),
             };
@@ -1028,7 +1028,7 @@ fn pull_with_parts(
             Ok(false) => return 0,
             Err(e) => return refuse(&e.to_string()),
         }
-    } else if let Err(e) = write!(io.out, "{}", restore::report::render_plan(&plan)) {
+    } else if let Err(e) = write!(io.out, "{}", restore::report::render_plan(&plan, true)) {
         return refuse(&e.to_string());
     }
 

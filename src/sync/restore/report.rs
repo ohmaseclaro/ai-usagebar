@@ -71,20 +71,26 @@ pub const MAX_ATTENTION_ITEMS: usize = 20;
 /// is worse than one that names none.
 pub const APPLY_COMMAND: &str = "ai-usagebar sync pull --apply";
 
-/// The dry-run report: what a restore would do, having written nothing.
+/// The report: what a restore would do, having written nothing yet.
+///
+/// `applying` is whether `--apply` was given. The plan is always computed with
+/// `apply` off — that is how the report exists at all — so the renderer is the
+/// only place that can know, and a report that calls an apply a dry run and
+/// then tells the user to re-run the command they just ran is a report nobody
+/// can act on.
 ///
 /// Order is a requirement, not a preference. The items whose local copy is
 /// newer and the refusals come *first*, because SAFE-03 is that the user is
 /// told what would change before they are asked, and a warning printed below a
 /// two-hundred-line table satisfies the letter of that and none of it.
-pub fn render_plan(plan: &RestorePlan) -> String {
+pub fn render_plan(plan: &RestorePlan, applying: bool) -> String {
     let mut out = String::new();
-    out.push_str(&headline(plan));
+    out.push_str(&headline(plan, applying));
     out.push_str(&attention_block(plan));
     out.push_str(&refusals_block(plan));
     out.push_str(&category_table(plan));
     out.push_str(&category_detail(plan));
-    out.push_str(&footer(plan));
+    out.push_str(&footer(plan, applying));
     out
 }
 
@@ -96,7 +102,7 @@ pub fn render_plan(plan: &RestorePlan) -> String {
 /// tells nobody anything (T-5-51).
 pub fn render_outcome(outcome: &RestoreOutcome) -> String {
     if !outcome.applied {
-        return render_plan(&outcome.plan);
+        return render_plan(&outcome.plan, false);
     }
 
     let mut out = match &outcome.failed_at {
@@ -192,7 +198,7 @@ pub fn confirm_apply(
     out: &mut dyn Write,
     input: &mut dyn BufRead,
 ) -> Result<bool> {
-    write!(out, "{}", render_plan(plan))?;
+    write!(out, "{}", render_plan(plan, false))?;
 
     if opts.assume_yes {
         writeln!(
@@ -315,10 +321,11 @@ pub fn confirm_credentials(
 // The report, in the order it prints
 // ---------------------------------------------------------------------------
 
-fn headline(plan: &RestorePlan) -> String {
+fn headline(plan: &RestorePlan, applying: bool) -> String {
     let counts = Counts::of(plan.items.iter());
     let mut out = format!(
-        "DRY RUN — snapshot {} of {}, taken {}\n",
+        "{} — snapshot {} of {}, taken {}\n",
+        if applying { "RESTORING" } else { "DRY RUN" },
         plan.counter,
         safe(&plan.repo_id),
         plan.created_at.to_rfc3339()
@@ -329,7 +336,12 @@ fn headline(plan: &RestorePlan) -> String {
         counts.create, counts.update, counts.unchanged, counts.attention, counts.refused
     ));
     out.push_str(&format!(
-        "  would fetch {} in {} pack(s) and write {} item(s)\n",
+        "  {} {} in {} pack(s) and write {} item(s)\n",
+        if applying {
+            "will fetch"
+        } else {
+            "would fetch"
+        },
         human_bytes(plan.bytes_to_fetch),
         plan.packs_needed,
         counts.writes
@@ -515,9 +527,13 @@ fn category_detail(plan: &RestorePlan) -> String {
 /// What happens next, and — the half a dry run most often leaves out — what
 /// gets archived first. `backup::take` is the user's undo and it is worthless
 /// if they do not know it happened.
-fn footer(plan: &RestorePlan) -> String {
+fn footer(plan: &RestorePlan, applying: bool) -> String {
     let counts = Counts::of(plan.items.iter());
-    let mut out = String::from("\n  Nothing has been written. This is a dry run.\n");
+    let mut out = String::from(if applying {
+        "\n  Nothing has been written yet — this is the plan --apply is about to run.\n"
+    } else {
+        "\n  Nothing has been written. This is a dry run.\n"
+    });
     if counts.replacing > 0 {
         out.push_str(&format!(
             "  {} of the {} item(s) to write replace a file that exists here now.\n\
@@ -529,7 +545,9 @@ fn footer(plan: &RestorePlan) -> String {
     } else if counts.writes > 0 {
         out.push_str("  Every item to write is new here, so there is nothing to archive.\n");
     }
-    out.push_str(&format!("  To apply it, run:  {APPLY_COMMAND}\n"));
+    if !applying {
+        out.push_str(&format!("  To apply it, run:  {APPLY_COMMAND}\n"));
+    }
     out
 }
 
@@ -727,6 +745,13 @@ mod tests {
     use super::*;
     use crate::sync::restore::BackupRecord;
     use std::path::PathBuf;
+
+    /// Every test below renders a dry run unless it names the flag itself, so
+    /// this shadows the two-argument one rather than repeating `, false`
+    /// twelve times.
+    fn render_plan(plan: &RestorePlan) -> String {
+        super::render_plan(plan, false)
+    }
 
     /// This file's own text, at compile time. Reading it costs no filesystem
     /// access at run time, so the "no third prompt" and "no wildcard" checks
@@ -1093,6 +1118,27 @@ mod tests {
         let mut src = answer.as_bytes();
         let ok = confirm_apply(&plan, &opts, &mut out, &mut src).unwrap();
         (ok, String::from_utf8(out).unwrap())
+    }
+
+    /// The report under `--apply` describes what is about to happen. The plan
+    /// phase always runs with `apply` off — that is how the report exists at all
+    /// — and printing "DRY RUN", then telling the user to re-run the very
+    /// command they just ran, is the one thing it must not do.
+    #[test]
+    fn an_apply_report_names_neither_a_dry_run_nor_the_command_already_given() {
+        let plan = plan_of(vec![item("config/new.toml", Disposition::Create)]);
+
+        let applying = super::render_plan(&plan, true);
+        assert!(applying.starts_with("RESTORING"), "{applying}");
+        assert!(!applying.contains("DRY RUN"), "{applying}");
+        assert!(!applying.contains("To apply it, run"), "{applying}");
+        assert!(!applying.contains(APPLY_COMMAND), "{applying}");
+        assert!(!applying.contains("dry run"), "{applying}");
+
+        // …and a dry run still says both.
+        let dry = render_plan(&plan);
+        assert!(dry.starts_with("DRY RUN"), "{dry}");
+        assert!(dry.contains(APPLY_COMMAND), "{dry}");
     }
 
     #[test]
