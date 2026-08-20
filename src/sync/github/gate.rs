@@ -97,6 +97,41 @@ struct RawPermissions {
     admin: bool,
 }
 
+/// Why [`fetch_facts`] failed, carrying the one distinction `AppError` cannot
+/// make.
+///
+/// [`AppError::Credentials`] covers **two** unrelated things on this path:
+/// GitHub rejecting the token, and `Client::get_json` finding the token is not a
+/// legal HTTP header value. Only the first means the stored value is dead.
+/// Classifying on the `AppError` arm rather than on the status is what let a
+/// token with one illegal byte silently delete a Keychain item (F-1), so the
+/// answer travels as a field rather than being re-derived from a message.
+#[derive(Debug, thiserror::Error)]
+#[error("{error}")]
+pub struct FetchError {
+    pub error: AppError,
+    /// True **only** for [`http::GithubError::Unauthorized`] — a 401 from
+    /// GitHub, about the value this request actually sent.
+    pub token_rejected: bool,
+}
+
+impl FetchError {
+    /// Everything that is not a 401: transport, a malformed token, a body that
+    /// is not a repository, D-01's 404 text.
+    fn local(error: AppError) -> Self {
+        FetchError {
+            error,
+            token_rejected: false,
+        }
+    }
+}
+
+impl From<FetchError> for AppError {
+    fn from(err: FetchError) -> Self {
+        err.error
+    }
+}
+
 /// `GET /repos/{owner}/{name}` — the only request the gate makes.
 ///
 /// A 404 becomes D-01's message: GitHub returns the same status for "no such
@@ -104,23 +139,36 @@ struct RawPermissions {
 /// and names the command that creates one. This tool never creates a repository
 /// (REPO-03); a 404 that auto-created one would also happily create it for a
 /// name squatter.
-pub async fn fetch_facts(client: &Client, repo: &RepoRef, now: DateTime<Utc>) -> Result<RepoFacts> {
+pub async fn fetch_facts(
+    client: &Client,
+    repo: &RepoRef,
+    now: DateTime<Utc>,
+) -> std::result::Result<RepoFacts, FetchError> {
     let (status, headers, body) = client
         .get_json(&format!("/repos/{}/{}", repo.owner, repo.name))
-        .await?;
+        .await
+        .map_err(FetchError::local)?;
 
     if !status.is_success() {
         let err = http::classify(status, &headers, &body, now);
         return Err(match err {
-            http::GithubError::NotFound { .. } => AppError::Other(missing_repo_message(repo)),
-            other => AppError::from(other),
+            http::GithubError::NotFound { .. } => {
+                FetchError::local(AppError::Other(missing_repo_message(repo)))
+            }
+            // The one status that says *this token* is dead, and the only one
+            // that may clear anything.
+            unauthorized @ http::GithubError::Unauthorized { .. } => FetchError {
+                error: AppError::from(unauthorized),
+                token_rejected: true,
+            },
+            other => FetchError::local(AppError::from(other)),
         });
     }
 
     let raw: RawRepo = serde_json::from_slice(&body).map_err(|e| {
-        AppError::Schema(format!(
+        FetchError::local(AppError::Schema(format!(
             "GitHub's description of {repo} was not the shape this build expects ({e})"
-        ))
+        )))
     })?;
     Ok(RepoFacts {
         id: raw.id,
@@ -430,6 +478,32 @@ mod tests {
         assert!(got.admin_permission);
     }
 
+    /// F-1's trigger, at the source: only a 401 sets `token_rejected`, and it is
+    /// the *only* thing `setup::clear_if_dead` may act on. The 403 next to it is
+    /// the one a wrong predicate would have cleared a working token for.
+    #[tokio::test]
+    async fn only_a_401_marks_the_token_as_rejected() {
+        for (status, rejected) in [(401, true), (403, false), (500, false)] {
+            let mut server = mockito::Server::new_async().await;
+            let _m = server
+                .mock("GET", "/repos/o/n")
+                .with_status(status)
+                .with_body(r#"{"message":"whatever"}"#)
+                .create_async()
+                .await;
+
+            let err = fetch_facts(&client_at(&server.url()), &repo(), now())
+                .await
+                .expect_err("not a repository description");
+            assert_eq!(err.token_rejected, rejected, "HTTP {status}: {err}");
+        }
+        // …and a transport failure, which never got a status at all.
+        let err = fetch_facts(&client_at("http://127.0.0.1:1"), &repo(), now())
+            .await
+            .expect_err("nothing listens there");
+        assert!(!err.token_rejected, "{err}");
+    }
+
     /// D-01: GitHub 404s an unauthorised private repository exactly as it 404s a
     /// missing one, so the message says both and names the fix.
     #[tokio::test]
@@ -464,7 +538,8 @@ mod tests {
         let err = fetch_facts(&client_at(&server.url()), &repo(), now())
             .await
             .expect_err("that is not a repository");
-        assert!(matches!(err, AppError::Schema(_)), "{err}");
+        assert!(matches!(err.error, AppError::Schema(_)), "{err}");
+        assert!(!err.token_rejected, "a bad body is not a rejected token");
     }
 
     #[test]

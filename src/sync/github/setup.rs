@@ -79,10 +79,13 @@ pub trait SetupPrompt {
         token::store(token, file)
     }
 
-    /// The 401 path, for the same reason: [`token::clear`] deletes the real
-    /// Keychain item on macOS.
-    fn clear_token(&self, file: &Path) -> Result<()> {
-        token::clear(file)
+    /// The 401 path, for the same reason: [`token::clear_source`] deletes the
+    /// real Keychain item on macOS.
+    ///
+    /// `source` is not decoration — it is what decides *which* store is touched,
+    /// and passing the wrong one destroys a credential the run never used.
+    fn clear_token(&self, source: TokenSource, file: &Path) -> Result<()> {
+        token::clear_source(source, file)
     }
 }
 
@@ -207,7 +210,11 @@ pub async fn run(
 
     let facts = match gate::fetch_facts(&client, &repo, now).await {
         Ok(facts) => facts,
-        Err(e) => return Err(clear_if_dead(e, &token_file, &|p| prompt.clear_token(p))),
+        Err(e) => {
+            return Err(clear_if_dead(e, source, &token_file, &|src, p| {
+                prompt.clear_token(src, p)
+            }));
+        }
     };
 
     let pairing_file = pairing::default_path(roots);
@@ -350,29 +357,53 @@ pub(crate) fn token_path(roots: &SyncRoots) -> PathBuf {
     roots.config_dir.join("sync-token")
 }
 
-/// Keep the promise `http::actionable`'s 401 arm makes.
+/// Take a rejected token out of circulation — the *right* one, and say which.
 ///
-/// That message tells the user the stored token "will be cleared". This is the
-/// only call site that does it — without this the sentence is a lie, and a user
-/// who re-authenticates believing they start clean walks into the same failure.
+/// Two predicates were wrong here, and they compounded (F-1):
 ///
-/// `clear` is a parameter because [`token::clear`] deletes the **real** login
-/// Keychain item on macOS, which no unit test may touch. Production passes
-/// `token::clear`; the test passes a recorder, which is what makes the pairing
-/// assertable rather than reviewable.
+/// - **The trigger** was `matches!(err, AppError::Credentials(_))`, which also
+///   catches `Client::get_json`'s "this token is not a legal HTTP header value".
+///   A token with one illegal byte silently deleted the Keychain item while
+///   printing a message about header validity. The trigger is now
+///   [`gate::FetchError::token_rejected`] — a 401 from GitHub, nothing else.
+/// - **The action** ignored the [`TokenSource`] it was handed. It is now the
+///   only thing that decides which store is touched; see
+///   [`token::clear_source`] for the sequence that destroyed a working token
+///   with no attacker involved.
+///
+/// The message follows the action rather than preceding it: `http::actionable`'s
+/// 401 arm no longer promises a clear it cannot know about, and
+/// [`token::clear_note`] states what was actually done, per source.
+///
+/// `clear` is a parameter because the production function deletes the **real**
+/// login Keychain item on macOS, which no unit test may touch. Production passes
+/// `token::clear_source`; the test passes a recorder, which is what makes the
+/// pairing assertable rather than reviewable.
 ///
 /// A failure to clear is deliberately swallowed: the original 401 is the thing
 /// the user needs to read, and burying it under a filesystem error would be
 /// worse than a token file that outlived its usefulness.
 pub(crate) fn clear_if_dead(
-    err: AppError,
+    err: gate::FetchError,
+    source: TokenSource,
     token_file: &Path,
-    clear: &dyn Fn(&Path) -> Result<()>,
+    clear: &dyn Fn(TokenSource, &Path) -> Result<()>,
 ) -> AppError {
-    if matches!(err, AppError::Credentials(_)) {
-        let _ = clear(token_file);
+    if !err.token_rejected {
+        return err.error;
     }
-    err
+    // The seam is not even reached for a source this tool has no store for —
+    // belt to `token::clear_source`'s braces, and what makes "the environment's
+    // token 401'd and nothing was deleted" assertable through the test double
+    // rather than only inside the production function.
+    if token::owns_a_store(source) {
+        let _ = clear(source, token_file);
+    }
+    AppError::Credentials(format!(
+        "{}\n{}",
+        err.error,
+        token::clear_note(source, token_file)
+    ))
 }
 
 /// D-01: nothing is guessed, and the failure names the exact fix.
@@ -471,9 +502,11 @@ pub(crate) struct Script {
     pub categories: Option<Vec<SyncCategory>>,
     pub confirm: bool,
     /// Token-file paths the flow asked to store / clear. Recorded rather than
-    /// acted on — no test may reach a real Keychain.
+    /// acted on — no test may reach a real Keychain. `cleared` carries the
+    /// `TokenSource` too: *which* store a 401 reaches is the whole question
+    /// (F-1), and a recorder that dropped it could not tell right from wrong.
     pub stored: Vec<PathBuf>,
-    pub cleared: Vec<PathBuf>,
+    pub cleared: Vec<(TokenSource, PathBuf)>,
 }
 
 #[cfg(test)]
@@ -528,8 +561,11 @@ impl SetupPrompt for Double {
         self.0.borrow_mut().stored.push(file.to_path_buf());
         Ok(TokenSource::File)
     }
-    fn clear_token(&self, file: &Path) -> Result<()> {
-        self.0.borrow_mut().cleared.push(file.to_path_buf());
+    fn clear_token(&self, source: TokenSource, file: &Path) -> Result<()> {
+        self.0
+            .borrow_mut()
+            .cleared
+            .push((source, file.to_path_buf()));
         Ok(())
     }
 }
@@ -730,26 +766,79 @@ mod tests {
 
     // ---- the 401 promise -------------------------------------------------
 
-    /// The cross-plan promise from 3-CONTEXT: `http::actionable`'s 401 arm says
-    /// the stored token "will be cleared", and this is the call site that does
-    /// it. The clear is injected because the real one reaches the macOS login
-    /// Keychain.
+    /// F-1, both halves, on the function that decides them.
+    ///
+    /// The trigger used to be `matches!(err, AppError::Credentials(_))`, which
+    /// also catches `Client::get_json`'s "not a valid HTTP header value" — so a
+    /// malformed token deleted the Keychain item while printing about header
+    /// validity. And the action ignored the `TokenSource` entirely, deleting
+    /// both stores whatever had answered.
     #[test]
-    fn a_401_clears_the_stored_token_and_nothing_else_does() {
+    fn only_a_401_clears_and_it_clears_only_the_store_it_came_from() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("sync-token");
-        let cleared: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
-        let record = |p: &Path| {
-            cleared.borrow_mut().push(p.to_path_buf());
+        let cleared: RefCell<Vec<(TokenSource, PathBuf)>> = RefCell::new(Vec::new());
+        let record = |source: TokenSource, p: &Path| {
+            cleared.borrow_mut().push((source, p.to_path_buf()));
             Ok(())
         };
+        let dead = || gate::FetchError {
+            error: AppError::Credentials("GitHub rejected the sync token (401)".into()),
+            token_rejected: true,
+        };
 
-        let dead = AppError::Credentials("GitHub rejected the sync token (401)".into());
-        let returned = clear_if_dead(dead, &path, &record);
-        assert_eq!(cleared.borrow().as_slice(), std::slice::from_ref(&path));
-        // The 401 still reaches the user; clearing does not swallow it.
-        assert!(returned.to_string().contains("401"), "{returned}");
+        // (a) A `Credentials` error that is not a 401 clears nothing — the
+        // malformed-token path, which produces the same `AppError` arm.
+        let returned = clear_if_dead(
+            gate::FetchError {
+                error: AppError::Credentials(
+                    "the stored sync token is not a valid HTTP header value".into(),
+                ),
+                token_rejected: false,
+            },
+            TokenSource::Keychain,
+            &path,
+            &record,
+        );
+        assert!(
+            cleared.borrow().is_empty(),
+            "a token this build could not send is not a token GitHub rejected"
+        );
+        assert!(returned.to_string().contains("header value"), "{returned}");
 
+        // (b) Neither store belongs to this tool, so neither is touched — and
+        // the message names the thing the user must change instead.
+        for source in [TokenSource::Env, TokenSource::GhCli] {
+            let returned = clear_if_dead(dead(), source, &path, &record);
+            assert!(cleared.borrow().is_empty(), "{source:?} cleared something");
+            let text = returned.to_string();
+            assert!(text.contains("Nothing was cleared"), "{text}");
+            assert!(
+                text.contains("401"),
+                "the 401 still reaches the user: {text}"
+            );
+        }
+        assert!(
+            clear_if_dead(dead(), TokenSource::Env, &path, &record)
+                .to_string()
+                .contains("AI_USAGEBAR_SYNC_TOKEN"),
+            "the env arm names the variable that outranks every stored token"
+        );
+
+        // (c) The store that produced the rejected value, and only it.
+        for source in [TokenSource::Keychain, TokenSource::File] {
+            cleared.borrow_mut().clear();
+            let returned = clear_if_dead(dead(), source, &path, &record);
+            assert_eq!(
+                cleared.borrow().as_slice(),
+                &[(source, path.clone())],
+                "{source:?}"
+            );
+            assert!(returned.to_string().contains("removed"), "{returned}");
+        }
+
+        // Nothing else clears, whatever arm it lands on.
+        cleared.borrow_mut().clear();
         for keep in [
             AppError::Http {
                 status: 403,
@@ -761,35 +850,88 @@ mod tests {
             },
             AppError::Transport("connection reset".into()),
         ] {
-            clear_if_dead(keep, &path, &record);
+            clear_if_dead(
+                gate::FetchError {
+                    error: keep,
+                    token_rejected: false,
+                },
+                TokenSource::Keychain,
+                &path,
+                &record,
+            );
         }
-        assert_eq!(
-            cleared.borrow().len(),
-            1,
+        assert!(
+            cleared.borrow().is_empty(),
             "only a 401 clears — a 403 must keep a working token"
         );
     }
 
-    /// The promise's other half: the message the user actually reads says the
-    /// token will be cleared, so the wiring above is not decoration.
+    /// The documented configuration F-1 destroyed a credential in, end to end:
+    /// the value came from `AI_USAGEBAR_SYNC_TOKEN` (`chain()` sets it), so a
+    /// 401 takes out neither the Keychain item nor the token file — both of
+    /// which this run never sent — and says which variable to change.
     #[tokio::test]
-    async fn the_401_message_promises_the_clear_the_call_site_performs() {
+    async fn a_401_on_an_environment_token_clears_nothing_and_names_the_variable() {
         let dir = TempDir::new().unwrap();
         let script = Script::new();
         let err = drive(&cfg_for(Some("o/n")), &dir, "{}", 401, &script)
             .await
             .expect_err("401");
         assert!(matches!(err, AppError::Credentials(_)), "{err:?}");
-        assert!(err.to_string().contains("will be cleared"), "{err}");
-        // …and the flow actually cleared it, at the injected token path.
-        assert_eq!(
-            script.borrow().cleared.as_slice(),
-            std::slice::from_ref(&token_path(&roots_at(&dir)))
+        let text = err.to_string();
+        assert!(text.contains("That token is dead"), "{text}");
+        assert!(text.contains("Nothing was cleared"), "{text}");
+        assert!(text.contains("AI_USAGEBAR_SYNC_TOKEN"), "{text}");
+        assert!(
+            script.borrow().cleared.is_empty(),
+            "the stored token was never sent and is not this 401's to delete"
         );
         assert!(
             script.borrow().stored.is_empty(),
             "a dead token is not stored"
         );
+    }
+
+    /// …and the other side of the same wiring: a token that *did* come from the
+    /// file is cleared, at the injected path, and nowhere else.
+    #[tokio::test]
+    async fn a_401_on_a_file_token_clears_that_file_and_says_so() {
+        let dir = TempDir::new().unwrap();
+        let roots = roots_at(&dir);
+        let token_file = token_path(&roots);
+        std::fs::create_dir_all(token_file.parent().unwrap()).unwrap();
+        fs::write(&token_file, format!("{FIXTURE}\n")).unwrap();
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/repos/o/n")
+            .with_status(401)
+            .with_body("{}")
+            .create_async()
+            .await;
+
+        let script = Script::new();
+        let err = run(
+            &cfg_for(Some("o/n")),
+            &roots,
+            &endpoints_at(&server.url()),
+            &token::TokenChain {
+                file_path: Some(token_file.clone()),
+                ..token::TokenChain::default()
+            },
+            &mut Double(Rc::clone(&script)),
+            now(),
+        )
+        .await
+        .expect_err("401");
+
+        assert_eq!(
+            script.borrow().cleared.as_slice(),
+            &[(TokenSource::File, token_file.clone())]
+        );
+        let text = err.to_string();
+        assert!(text.contains(&token_file.display().to_string()), "{text}");
+        assert!(text.contains("has been removed"), "{text}");
     }
 
     /// A 403 keeps a working token (T-3-16): the message says so, and the flow

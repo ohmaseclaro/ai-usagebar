@@ -193,17 +193,24 @@ async fn repo_section(
     };
     let facts = match gate::fetch_facts(&client, &repo, now).await {
         Ok(facts) => facts,
-        // Same 401 promise the setup flow keeps: `actionable` says the stored
-        // token will be cleared, so whichever command printed that must clear it.
+        // Same 401 handling the setup flow performs, and `source` is what makes
+        // it safe: a 401 on a token resolved from the environment or from `gh`
+        // must not delete the Keychain item or the token file, neither of which
+        // this run used (F-1).
         //
-        // **`token::clear` deletes the real macOS login Keychain item.** No
-        // test here may mock a 401 against this arm; `sync setup`'s version of
-        // this call goes through `SetupPrompt::clear_token`, which a test double
-        // overrides. If `status` ever needs a 401 test, give it the same seam
-        // first — do not reach for the production function.
+        // **`token::clear_source` deletes the real macOS login Keychain item**
+        // when the source *is* the Keychain. No test here may mock a 401 against
+        // this arm; `sync setup`'s version of this call goes through
+        // `SetupPrompt::clear_token`, which a test double overrides. If `status`
+        // ever needs a 401 test, give it the same seam first — do not reach for
+        // the production function.
         Err(e) => {
-            let e =
-                github::setup::clear_if_dead(e, &github::setup::token_path(roots), &token::clear);
+            let e = github::setup::clear_if_dead(
+                e,
+                source,
+                &github::setup::token_path(roots),
+                &token::clear_source,
+            );
             return section.failed(e.to_string());
         }
     };

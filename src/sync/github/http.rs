@@ -237,13 +237,19 @@ pub fn from_transport(e: &reqwest::Error) -> GithubError {
 /// carries is already sanitized and truncated by [`message_of`].
 pub fn actionable(err: &GithubError) -> String {
     match err {
-        // The one status where the stored token is provably useless.
+        // The one status where the token that was *sent* is provably useless.
+        //
+        // It says nothing about clearing. This function knows the status and not
+        // the `TokenSource`, and "the stored token will be cleared" was false in
+        // both directions: it fired for a token this tool never stored, and it
+        // promised a deletion the env and `gh` paths must not perform (F-1).
+        // `token::clear_note`, at the one call site that knows the source, says
+        // what was actually done.
         GithubError::Unauthorized { message } => format!(
-            "GitHub rejected the sync token (401): {message}. The stored token is dead and will \
-             be cleared. Issue a replacement at {NEW_TOKEN_URL}/new — a fine-grained PAT scoped \
-             to the single sync repository, with {PERMISSIONS} — then supply it in \
-             AI_USAGEBAR_SYNC_TOKEN or ~/.config/ai-usagebar/sync-token and re-run \
-             `ai-usagebar sync setup`."
+            "GitHub rejected the sync token (401): {message}. That token is dead. Issue a \
+             replacement at {NEW_TOKEN_URL}/new — a fine-grained PAT scoped to the single sync \
+             repository, with {PERMISSIONS} — then supply it in AI_USAGEBAR_SYNC_TOKEN or \
+             ~/.config/ai-usagebar/sync-token and re-run `ai-usagebar sync setup`."
         ),
         // Deliberately says nothing about clearing or re-issuing: this token
         // works, it is just missing a grant (T-3-16).
@@ -637,8 +643,15 @@ mod tests {
             missing,
             transport,
         ] = six.each_ref().map(actionable);
-        assert!(unauthorized.contains("will be cleared"), "{unauthorized}");
+        assert!(
+            unauthorized.contains("That token is dead"),
+            "{unauthorized}"
+        );
         assert!(unauthorized.contains(PERMISSIONS), "{unauthorized}");
+        // F-1: this arm knows the status, not the store the value came from, so
+        // it promises nothing about clearing. `setup::clear_if_dead` appends the
+        // sentence that does — after acting.
+        assert!(!unauthorized.contains("cleared"), "{unauthorized}");
         assert!(!forbidden.contains("cleared"), "{forbidden}");
         assert!(forbidden.contains("keep it"), "{forbidden}");
         assert!(forbidden.contains(PERMISSIONS), "{forbidden}");
