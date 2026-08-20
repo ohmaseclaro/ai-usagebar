@@ -689,9 +689,16 @@ mod tests {
             repo_id: REPO_ID.into(),
             keyfile_asset: keyfile_name.clone(),
             previous: None,
+            allow_rollback: false,
             now: NOW,
         };
         let bundle = push::packer::build(&ctx, &plan).unwrap();
+        // 4-08 moved the root out of `PushBundle`: the counter is derived from
+        // the pointer this push is racing against, inside the rebuild closure,
+        // so two machines that both read counter 6 no longer both publish 7.
+        // A fixture builds against no arriving pointer, which is a first push.
+        let (root, _counter) =
+            push::packer::root_for(&ctx, None, &bundle.manifest_chunks).unwrap();
 
         Bundle {
             pointer: Pointer {
@@ -699,7 +706,7 @@ mod tests {
                 repo_id: REPO_ID.into(),
                 keyfile: keyfile_name.clone(),
                 snapshots: vec![crate::sync::push::SnapshotRecord {
-                    root: B64.encode(&bundle.root),
+                    root: B64.encode(&root),
                     index_chunks: bundle.index_chunks.clone(),
                     packs: bundle.referenced_packs.clone(),
                 }],
