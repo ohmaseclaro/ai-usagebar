@@ -99,13 +99,9 @@ use crate::error::Result;
 use crate::sync::CHUNK_SIZE;
 use crate::sync::crypto::{ChunkId, Keys};
 use crate::sync::model::{FileEntry, IndexObject};
+use crate::sync::scope::CREDENTIAL_FILE;
 
 use super::{Disposition, ItemPlan, Resolved, RestoreCtx, RestoreOptions, RestorePlan, layout};
-
-/// The file name that makes an entry credential-bearing whatever category it
-/// was collected under — `~/.claude/.credentials.json` and every
-/// `accounts/<name>/.credentials.json` beside the config.
-const CREDENTIAL_FILE: &str = ".credentials.json";
 
 /// What this machine has at a destination.
 struct LocalFacts {
@@ -266,12 +262,22 @@ fn decide(
 /// `scope` collects under [`SyncCategory::Config`] alongside `config.toml`, and
 /// `claude-home/.credentials.json`, which it would file under `Routines` — a
 /// category-only rule would miss both.
+///
+/// The name is a [`crate::sync::FixedName`], and the comparison it forces is
+/// the whole of F-1's fix. This predicate ran byte-exactly until Phase 5's
+/// audit: a manifest naming `.Credentials.json` classified as *not*
+/// credential-bearing while `local_at`'s `symlink_metadata` — going through the
+/// kernel, which folds case on APFS — found the **live** credential at that
+/// exact path. `decide` then took the `Overwrite` arm, `write::apply`'s
+/// `NeedsCredentialConfirm` tripwire had nothing to fire on, and the CLI's gate
+/// filtered for a variant that no longer existed. `--force` alone reverted a
+/// live OAuth token, which is precisely what D2 exists to prevent.
 fn credential_bearing(manifest_path: &str, category: SyncCategory) -> bool {
     category == SyncCategory::Credentials
         || manifest_path
             .rsplit('/')
             .next()
-            .is_some_and(|name| name == CREDENTIAL_FILE)
+            .is_some_and(|name| CREDENTIAL_FILE.matches(name))
 }
 
 /// Stat the destination and, when it is a plain file, hash it.
@@ -690,6 +696,10 @@ mod tests {
             "desktop-profiles/work/token-cache.json",
             "config/accounts/work/.credentials.json",
             "claude-home/.credentials.json",
+            // F-1: on macOS these name the very same files as the two above.
+            "config/accounts/work/.Credentials.json",
+            "claude-home/.CREDENTIALS.JSON",
+            "config/accounts/work/.cReDeNtIaLs.jSoN",
         ] {
             assert!(
                 credential_bearing(path, category_of(path)),
@@ -1119,6 +1129,63 @@ mod tests {
                 .any(|i| i.dest.as_deref() == Some(untouched.as_path()))
         );
         assert!(untouched.exists());
+    }
+
+    /// **F-1, at the seam the suite could not see.**
+    ///
+    /// Two tests already stood either side of this and both were correct.
+    /// `force_alone_never_overwrites_a_locally_newer_credential` calls `decide`
+    /// with the `credential` bool handed to it as `CREDENTIAL` — it proves the
+    /// arm works when it is reached, never that it is reached.
+    /// `the_credential_arm_covers_the_profile_store_and_every_dot_credentials_json`
+    /// classifies, and every one of its fixtures was spelled one way. Nothing
+    /// crossed from a *manifest string* to a *disposition*, which is the only
+    /// place the defect lived: `.Credentials.json` classified as ordinary, took
+    /// the `Overwrite` arm under `--force` alone, and on the case-insensitive
+    /// volume this project's users run, that path is the live OAuth token.
+    ///
+    /// So this one goes through `plan`, from the spelling in the manifest to
+    /// the disposition, with `force = true` and `force_credentials = false` —
+    /// the exact flags the audit's PoC A3 used to revert a live credential.
+    #[test]
+    fn a_credential_reaches_the_second_consent_however_the_manifest_spells_it() {
+        for spelling in [
+            ".credentials.json",
+            ".Credentials.json",
+            ".CREDENTIALS.JSON",
+            ".cReDeNtIaLs.jSoN",
+        ] {
+            let m = Machine::new();
+            let path = format!("config/accounts/work/{spelling}");
+            // Seeded at the manifest's own spelling, so the premise holds on a
+            // case-sensitive volume too: this test proves the *classification*
+            // crosses the seam, on every platform the suite runs on.
+            m.seed(
+                &path,
+                b"{\"access_token\":\"live\"}",
+                SNAPSHOT + Duration::from_secs(60),
+            );
+            let resolved = snapshot(&[(path.as_str(), b"{\"access_token\":\"stale\"}")]);
+
+            let plan = plan_with(&m, &resolved, opts(true, false));
+            assert!(
+                matches!(
+                    plan.items[0].disposition,
+                    Disposition::NeedsCredentialConfirm { .. }
+                ),
+                "`--force` alone planned {:?} for a live credential the manifest spelled \
+                 {spelling} — the second consent was skipped entirely",
+                plan.items[0].disposition
+            );
+
+            // And the second consent still promotes it, so the fix widened the
+            // gate rather than jamming it shut.
+            let forced = plan_with(&m, &resolved, opts(true, true));
+            assert!(matches!(
+                forced.items[0].disposition,
+                Disposition::Overwrite { .. }
+            ));
+        }
     }
 
     /// The plan's own header comes from the root, never from the pointer.

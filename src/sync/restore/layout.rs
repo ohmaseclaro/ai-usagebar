@@ -76,6 +76,31 @@ const ROOT_PREFIXES: [(&str, RootOf); 4] = [
     ("claude-home", claude_home),
 ];
 
+/// Ceilings on the *size* of a manifest entry, alongside the eight checks on
+/// its shape.
+///
+/// Until Phase 5's audit this module bounded eight shapes and zero sizes. A
+/// manifest is bounded only by `MAX_MANIFEST_CHUNKS × CHUNK_SIZE` = 32 MiB,
+/// which is room for a great many thousand-component paths, and
+/// `write::ensure_dir` is `recursive(true)`. Two things follow, and the second
+/// is why this is a security bound rather than tidiness:
+///
+/// - deep directory chains get created inside the roots — litter the user
+///   consented to, but litter — before the kernel refuses; and
+/// - `ENAMETOOLONG` becomes a trigger an attacker pulls **on demand**, which is
+///   how a hostile manifest reaches a failure path and whatever it prints. That
+///   is the delivery mechanism for F-3, and bounding the input here is the half
+///   of that fix that does not depend on every print site being careful.
+///
+/// The numbers sit far above anything the push side emits — the longest real
+/// entry is a transcript project directory, one dash-encoded component of a
+/// couple of hundred characters at a depth of four — and far below `PATH_MAX`
+/// (1024 on macOS) once a root is prepended. `MAX_COMPONENT_BYTES` is the
+/// `NAME_MAX` every mainstream filesystem enforces anyway.
+const MAX_MANIFEST_PATH_BYTES: usize = 1024;
+const MAX_MANIFEST_COMPONENTS: usize = 32;
+const MAX_COMPONENT_BYTES: usize = 255;
+
 /// Resolve one manifest entry against *this* machine's roots.
 ///
 /// The hostile-input boundary. Every refusal has its own message, because
@@ -84,6 +109,16 @@ const ROOT_PREFIXES: [(&str, RootOf); 4] = [
 pub fn from_manifest_path(roots: &SyncRoots, s: &str) -> Result<PathBuf> {
     let refuse = |why: &str| AppError::Other(format!("refusing the manifest entry {s:?}: {why}"));
 
+    // First, and deliberately: it is the one refusal that does not echo `s`,
+    // which is what makes every message below it bounded. A 32 MiB entry must
+    // not become a 32 MiB error string on its way to a terminal.
+    if s.len() > MAX_MANIFEST_PATH_BYTES {
+        return Err(AppError::Other(format!(
+            "refusing a manifest entry of {} bytes: no path in a bundle is longer than \
+             {MAX_MANIFEST_PATH_BYTES}",
+            s.len()
+        )));
+    }
     if s.is_empty() {
         return Err(refuse("it is empty"));
     }
@@ -119,6 +154,11 @@ pub fn from_manifest_path(roots: &SyncRoots, s: &str) -> Result<PathBuf> {
     if rest.is_empty() {
         return Err(refuse("it names a root with nothing beneath it"));
     }
+    if rest.split('/').count() > MAX_MANIFEST_COMPONENTS {
+        return Err(refuse(
+            "it is nested deeper than any path a bundle can legitimately name",
+        ));
+    }
 
     // One component at a time onto the root. Never `root.join(rest)`: a single
     // absolute or drive-rooted component in `rest` would replace the root.
@@ -129,6 +169,11 @@ pub fn from_manifest_path(roots: &SyncRoots, s: &str) -> Result<PathBuf> {
             "." => return Err(refuse("it contains a `.` component")),
             ".." => return Err(refuse("it contains a `..` component")),
             _ => {}
+        }
+        if part.len() > MAX_COMPONENT_BYTES {
+            return Err(refuse(
+                "it has a single name longer than a filesystem will accept",
+            ));
         }
         let mut components = Path::new(part).components();
         if !matches!(
@@ -284,6 +329,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let roots = machine(dir.path(), "alice");
 
+        // The size bounds need built strings, and a `&format!(…)` inside the
+        // array literal below would be dropped at the end of the `let`.
+        let too_long = format!("config/{}", "x".repeat(MAX_MANIFEST_PATH_BYTES));
+        let too_deep = format!("config/{}", "d/".repeat(MAX_MANIFEST_COMPONENTS));
+        let component_too_long = format!("config/{}", "n".repeat(MAX_COMPONENT_BYTES + 1));
+
         let cases = [
             ("", "empty"),
             ("config/a\0b", "NUL"),
@@ -296,6 +347,10 @@ mod tests {
             ("config/../../etc/shadow", "`..` component"),
             ("config/./x", "`.` component"),
             ("config/a//b", "empty path component"),
+            // The size bounds, which the shape checks never asked about.
+            (too_long.as_str(), "bytes"),
+            (too_deep.as_str(), "nested deeper"),
+            (component_too_long.as_str(), "single name longer"),
         ];
 
         // The reason, with the echoed input stripped off — otherwise every
@@ -373,6 +428,35 @@ mod tests {
             assert!(
                 !accept_for_write(Path::new(refused)),
                 "{refused} would have been written"
+            );
+        }
+    }
+
+    /// **F-2.** D4's whole stated purpose is that "a bundle produced by a
+    /// future or modified client must not be able to talk this side into
+    /// writing them". A modified client only had to hold down Shift: these four
+    /// spellings were `accept_for_write == true`, resolved through this gate
+    /// cleanly, and — on the case-insensitive volume this project's users run —
+    /// landed on the very device-identity files D4 exists to keep off the
+    /// machine. It needed no `--force` and no consent of any kind.
+    ///
+    /// These are the audit's PoC A2 verbatim. The exhaustive version, which
+    /// iterates D2's lists themselves so a name added later is covered, lives
+    /// beside those lists in `scope`.
+    #[test]
+    fn machine_bound_state_is_refused_however_the_bundle_capitalises_it() {
+        for refused in [
+            "config/Bridge-State.json",
+            "desktop-profiles/work/Ant-Device-Registry.json",
+            "desktop-data/Backups/old.tar.gz",
+            "claude-home/Local-Agent-Mode-Sessions/x.json",
+            "config/BRIDGE-STATE.JSON",
+            "config/accounts/work/.TMP.credentials",
+            "config/sync/index.sqlite3-JOURNAL",
+        ] {
+            assert!(
+                !accept_for_write(Path::new(refused)),
+                "{refused} would have been written over this machine's own identity state"
             );
         }
     }

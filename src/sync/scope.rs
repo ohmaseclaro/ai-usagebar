@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 
 use crate::config::{SyncCategory, SyncConfig};
-use crate::sync::SyncRoots;
+use crate::sync::{FixedName, SyncRoots};
 
 /// Ceiling on entries visited per walk. Mirrors [`crate::context`]: a runaway
 /// tree stops and says so rather than scanning the machine. Generous enough for
@@ -29,12 +29,18 @@ const MAX_WALK_ENTRIES: usize = 200_000;
 /// crash, and it is deleted on every account switch anyway.
 /// `ant-device-registry.json` is a browser-extension pairing authorised
 /// server-side per account; it cannot be made valid elsewhere.
-const EXCLUDED_NAMES: [&str; 5] = [
-    "bridge-state.json",
-    "ant-device-registry.json",
-    ".stale",
-    ".last_error",
-    ".fetch.lock",
+///
+/// [`FixedName`], not `&str`, throughout this module's vocabulary: on the
+/// restore side these names are compared against strings a hostile remote
+/// chose, and a byte-exact comparison admits `Bridge-State.json` on the very
+/// filesystems this project's users run. The type makes that comparison a build
+/// error rather than a silent hole (see [`FixedName`] and F-2).
+const EXCLUDED_NAMES: [FixedName; 5] = [
+    FixedName::new("bridge-state.json"),
+    FixedName::new("ant-device-registry.json"),
+    FixedName::new(".stale"),
+    FixedName::new(".last_error"),
+    FixedName::new(".fetch.lock"),
 ];
 
 /// Directory names that are never descended into, and never collected.
@@ -43,17 +49,31 @@ const EXCLUDED_NAMES: [&str; 5] = [
 /// is machine-specific. `local-agent-mode-sessions` is Cowork: its paths embed
 /// the owning account UUID plus an unreconstructable suffix, so a copy renders
 /// as an empty chat — already documented as unmigratable.
-const EXCLUDED_DIRS: [&str; 4] = [
-    "backups",
-    "prelogin-backup",
-    "hidden",
-    "local-agent-mode-sessions",
+const EXCLUDED_DIRS: [FixedName; 4] = [
+    FixedName::new("backups"),
+    FixedName::new("prelogin-backup"),
+    FixedName::new("hidden"),
+    FixedName::new("local-agent-mode-sessions"),
 ];
 
 /// Regenerable or in-flight. `.tmp.` is the prefix [`crate::cache::atomic_write`]
 /// gives its tempfiles, so a concurrent write is never half-collected.
-const EXCLUDED_SUFFIXES: [&str; 3] = [".lock", ".tmp", "-journal"];
-const EXCLUDED_PREFIX: &str = ".tmp.";
+const EXCLUDED_SUFFIXES: [FixedName; 3] = [
+    FixedName::new(".lock"),
+    FixedName::new(".tmp"),
+    FixedName::new("-journal"),
+];
+const EXCLUDED_PREFIX: FixedName = FixedName::new(".tmp.");
+
+/// The file name that makes an entry credential-bearing whatever category it
+/// was collected under — `~/.claude/.credentials.json` and every
+/// `accounts/<name>/.credentials.json` beside the config.
+///
+/// One spelling for both directions: the [`SyncCategory::Config`] collector
+/// below filters on it, and [`crate::sync::restore::merge`] decides D2's second
+/// consent with it. Two copies of this literal is how one of them ends up
+/// case-sensitive while the other is not.
+pub(crate) const CREDENTIAL_FILE: FixedName = FixedName::new(".credentials.json");
 
 // Names owned by claude-acc's profile store and Claude Desktop's data dir.
 // They mirror the private consts in [`crate::claude_desktop`] (`META_JSON`,
@@ -128,10 +148,10 @@ pub fn is_excluded(path: &Path) -> bool {
     // Any excluded directory anywhere above the entry disqualifies it. The
     // walker already refuses to descend into one, so this is belt-and-braces
     // for the paths that are added directly rather than walked to.
-    if path
-        .components()
-        .any(|c| EXCLUDED_DIRS.contains(&c.as_os_str().to_string_lossy().as_ref()))
-    {
+    if path.components().any(|c| {
+        let c = c.as_os_str().to_string_lossy();
+        EXCLUDED_DIRS.iter().any(|d| d.matches(&c))
+    }) {
         return true;
     }
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -139,9 +159,9 @@ pub fn is_excluded(path: &Path) -> bool {
         // is a security predicate: refuse what cannot be checked.
         return true;
     };
-    EXCLUDED_NAMES.contains(&name)
-        || name.starts_with(EXCLUDED_PREFIX)
-        || EXCLUDED_SUFFIXES.iter().any(|s| name.ends_with(s))
+    EXCLUDED_NAMES.iter().any(|n| n.matches(name))
+        || EXCLUDED_PREFIX.is_prefix_of(name)
+        || EXCLUDED_SUFFIXES.iter().any(|s| s.is_suffix_of(name))
 }
 
 /// `(size, mtime_ns, inode)` — the single place the platform split lives, so
@@ -308,8 +328,12 @@ pub fn collect(
             // D1: config.toml itself, plus `accounts/*/.credentials.json` —
             // the credential, not the rest of a CLAUDE_CONFIG_DIR account tree.
             walk(&roots.config_dir.join("accounts"), &mut scan);
-            scan.files
-                .retain(|f| f.path.file_name().is_some_and(|n| n == ".credentials.json"));
+            scan.files.retain(|f| {
+                f.path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| CREDENTIAL_FILE.matches(n))
+            });
             scan.bytes = scan.files.iter().map(|f| f.size).sum();
             push_path(&roots.config_file, &mut scan);
         }
@@ -382,6 +406,109 @@ mod tests {
             dir.path().join("profiles"),
             dir.path().join("claude-home"),
         )
+    }
+
+    /// Every spelling of `name` a case-insensitive volume treats as the same
+    /// file. The last two are the non-ASCII folds: U+212A KELVIN SIGN lowercases
+    /// to `k`, and U+017F LATIN SMALL LETTER LONG S folds to `s` — both of which
+    /// appear in the lists above.
+    fn every_spelling(name: &str) -> Vec<String> {
+        let capitalised = {
+            let mut c = name.chars();
+            c.next()
+                .map(|f| f.to_uppercase().to_string() + c.as_str())
+                .unwrap_or_default()
+        };
+        let alternating: String = name
+            .chars()
+            .enumerate()
+            .map(|(i, c)| {
+                if i % 2 == 0 {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                }
+            })
+            .collect();
+        vec![
+            name.to_string(),
+            name.to_uppercase(),
+            capitalised,
+            alternating,
+            name.replace('k', "\u{212a}"),
+            name.replace('s', "\u{17f}"),
+        ]
+    }
+
+    /// F-2, and the net that keeps it fixed: D2's lists are matched the way the
+    /// filesystem matches them, in **every** spelling, for **every** entry.
+    ///
+    /// It iterates the constants rather than a hand-written fixture list, so a
+    /// name added to any of them is covered without anyone remembering — which
+    /// is the failure mode that produced this finding. A byte-exact comparison
+    /// reintroduced anywhere in [`is_excluded`] fails here; a byte-exact
+    /// comparison against a [`FixedName`] does not compile at all.
+    #[test]
+    fn every_machine_bound_name_is_excluded_in_every_spelling_the_filesystem_folds() {
+        for name in EXCLUDED_NAMES {
+            for spelling in every_spelling(&name.to_string()) {
+                let path = PathBuf::from("account").join(&spelling);
+                assert!(
+                    is_excluded(&path),
+                    "{spelling:?} is {name} on a case-insensitive volume, and was collected"
+                );
+            }
+        }
+        for dir in EXCLUDED_DIRS {
+            for spelling in every_spelling(&dir.to_string()) {
+                let path = PathBuf::from("root").join(&spelling).join("deep/x.json");
+                assert!(
+                    is_excluded(&path),
+                    "{spelling:?} is the {dir} directory, and something under it was collected"
+                );
+            }
+        }
+        for suffix in EXCLUDED_SUFFIXES {
+            for spelling in every_spelling(&suffix.to_string()) {
+                let path = PathBuf::from(format!("root/index{spelling}"));
+                assert!(is_excluded(&path), "index{spelling} was collected");
+            }
+        }
+        for spelling in every_spelling(&EXCLUDED_PREFIX.to_string()) {
+            let path = PathBuf::from(format!("root/{spelling}credentials"));
+            assert!(is_excluded(&path), "{spelling}credentials was collected");
+        }
+    }
+
+    /// A fixed name not written in its own folded spelling is a dead entry in a
+    /// security list. Checked over the constants themselves.
+    #[test]
+    fn every_fixed_name_is_written_in_its_own_folded_spelling() {
+        let all = EXCLUDED_NAMES
+            .iter()
+            .chain(EXCLUDED_DIRS.iter())
+            .chain(EXCLUDED_SUFFIXES.iter())
+            .chain([EXCLUDED_PREFIX, CREDENTIAL_FILE].iter());
+        for name in all {
+            assert!(
+                name.is_folded(),
+                "{name} can never match: it is not written in its own folded spelling"
+            );
+        }
+    }
+
+    /// The widening is deliberate, and it stops where D2 stops: an ordinary
+    /// file whose name merely resembles an excluded one is still collected.
+    #[test]
+    fn a_name_that_is_not_one_of_the_excluded_ones_is_still_collected() {
+        for kept in [
+            "root/bridge-state.json.bak",
+            "root/my-bridge-state.json",
+            "root/backups-of-mine/x.json",
+            "root/.stale-notes",
+        ] {
+            assert!(!is_excluded(Path::new(kept)), "{kept} was dropped");
+        }
     }
 
     fn names(scan: &CategoryScan) -> Vec<String> {
@@ -461,7 +588,7 @@ mod tests {
     fn every_d2_hard_excluded_name_is_rejected() {
         let dir = TempDir::new().unwrap();
         for name in EXCLUDED_NAMES {
-            seed(dir.path(), name, "x");
+            seed(dir.path(), &name.to_string(), "x");
         }
         seed(dir.path(), "keep.json", "x");
 
@@ -476,7 +603,9 @@ mod tests {
         for d in EXCLUDED_DIRS {
             seed(dir.path(), &format!("{d}/inner.json"), "x");
             seed(dir.path(), &format!("nested/{d}/inner.json"), "x");
-            assert!(is_excluded(&dir.path().join(d).join("inner.json")));
+            assert!(is_excluded(
+                &dir.path().join(d.to_string()).join("inner.json")
+            ));
         }
         seed(dir.path(), "keep.json", "x");
 

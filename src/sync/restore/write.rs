@@ -93,7 +93,7 @@ use chrono::{DateTime, Utc};
 
 use crate::error::{AppError, Result};
 
-use super::{Applied, Disposition, ItemPlan, PackSource, RestoreCtx, RestorePlan, layout};
+use super::{Applied, Disposition, ItemPlan, PackSource, RestoreCtx, RestorePlan, layout, report};
 
 /// Write every item the plan decided to write.
 ///
@@ -131,9 +131,27 @@ pub fn apply(ctx: &RestoreCtx<'_>, plan: &RestorePlan, packs: &PackSource) -> Re
             ))
         })?;
 
-        // Defence in depth: the path rule runs again at the write boundary, and
-        // a destination that fails it here is a hard error rather than a skip —
-        // if the two disagree, something between them rewrote the plan.
+        // Defence in depth, both halves of the layout gate. The path rule runs
+        // again at the write boundary, and a destination that fails it here is
+        // a hard error rather than a skip — if the two disagree, something
+        // between them rewrote the plan.
+        //
+        // The **policy** rule is re-run alongside it for the same reason, and
+        // used not to be: `accept_for_write` had exactly one call site, in
+        // `merge`, so the two halves of one gate had different postures and a
+        // plan mutated the way this preflight's own doc describes could carry
+        // an `ExcludedByPolicy` path promoted to a writing disposition. There
+        // is no live hole — the plan is an in-process `Vec` between the two
+        // points — which is why this is a cheap list comparison rather than a
+        // rewrite, and why it is here at all: the claim in the module doc
+        // should be true of the whole gate.
+        if !layout::accept_for_write(Path::new(&item.manifest_path)) {
+            return Err(AppError::Other(format!(
+                "{:?} is machine-bound state D4 refuses to write, yet reached the write path \
+                 as a planned write — refusing",
+                item.manifest_path
+            )));
+        }
         let checked = layout::from_manifest_path(ctx.roots, &item.manifest_path)?;
         if &checked != dest {
             return Err(AppError::Other(format!(
@@ -152,7 +170,7 @@ pub fn apply(ctx: &RestoreCtx<'_>, plan: &RestorePlan, packs: &PackSource) -> Re
             // `Applied` carries where the run stopped, which is what the summary
             // renders; the cause is only useful now, so it goes to stderr rather
             // than being swallowed.
-            eprintln!("sync: restore stopped at {}: {why}", item.manifest_path);
+            eprintln!("{}", stopped_line(&item.manifest_path, &why));
             out.failed_at = Some(item.manifest_path.clone());
             break;
         }
@@ -163,6 +181,29 @@ pub fn apply(ctx: &RestoreCtx<'_>, plan: &RestorePlan, packs: &PackSource) -> Re
     }
 
     Ok(out)
+}
+
+/// The one line a failed item prints, built rather than interpolated so it can
+/// be tested — and sanitised on **both** halves.
+///
+/// Every sibling message in this module uses `{:?}`, whose `Debug for str`
+/// escapes; every other rendering site in the phase goes through
+/// `report::safe`. This line used `{}` on `item.manifest_path`, a verbatim
+/// string from the hostile remote, and printed it straight to stderr
+/// immediately after the report the user had just read and consented to — so a
+/// cursor-repositioning or screen-clearing sequence rewrote the record of what
+/// was about to happen, and OSC 52 reached the clipboard (F-3, T-5-50).
+///
+/// `why` is sanitised too: an `AppError::Io` renders a `PathBuf` that was built
+/// out of the same manifest string. That is belt-and-braces now that
+/// `AppError::Io`'s own `Display` escapes it, and it stays because this
+/// function must be correct for every error variant, not for today's.
+fn stopped_line(manifest_path: &str, why: &AppError) -> String {
+    format!(
+        "sync: restore stopped at {}: {}",
+        report::safe(manifest_path),
+        report::safe(&why.to_string())
+    )
 }
 
 /// One file: reassemble its chunks in order, straight into a tempfile beside
@@ -862,6 +903,83 @@ mod tests {
         assert_eq!(files_under(&m.roots.config_dir), vec![dest.clone()]);
         #[cfg(unix)]
         assert_eq!(mode_of(&dest), 0o600);
+    }
+
+    /// **F-3.** The failure line is the one output site in the phase that
+    /// printed a remote-chosen string with `{}` — no `{:?}`, no `safe()` — and
+    /// it lands on stderr right after the report the user has just read and
+    /// consented to. An ESC there rewrites the record of what was about to
+    /// happen; an OSC 52 reaches the clipboard.
+    ///
+    /// Both halves are checked, because both are attacker-authored: the
+    /// manifest path verbatim, and the `PathBuf` inside an `AppError::Io` that
+    /// was built out of that same manifest path.
+    #[test]
+    fn the_failure_line_escapes_the_manifest_path_and_the_error_alike() {
+        let hostile = "config/\u{1b}[2J\u{1b}]52;c;cGF5bG9hZA==\u{7}wiped\nforged report line";
+        let why = AppError::io_at(
+            Path::new("/home/u/.claude/\u{1b}[1;1Hoverwritten"),
+            std::io::Error::other("no such file or directory"),
+        );
+
+        let line = stopped_line(hostile, &why);
+
+        assert!(
+            !line.contains('\u{1b}') && !line.contains('\u{7}'),
+            "a terminal escape survived to stderr: {line:?}"
+        );
+        assert_eq!(
+            line.lines().count(),
+            1,
+            "the failure line forged a second line: {line:?}"
+        );
+        assert!(
+            line.contains("wiped") && line.contains("overwritten"),
+            "{line:?}"
+        );
+    }
+
+    /// **NEW-2.** T-5-36 re-runs the *path* half of the layout gate over the
+    /// whole plan before the first byte and calls a disagreement a hard error.
+    /// The *policy* half — D4 — had a single call site in `merge`, so the two
+    /// halves of one gate had different postures and this module's own doc
+    /// overclaimed. There was no live hole (the plan is an in-process `Vec`
+    /// between the two points), which is exactly why closing it is one list
+    /// comparison rather than an argument.
+    #[test]
+    fn a_machine_bound_path_promoted_to_a_write_is_refused_before_the_first_byte() {
+        let m = Machine::new();
+        let (packs, ids) = packed(&[b"stale identity"]);
+        let excluded = "config/bridge-state.json";
+        let mut promoted = item(
+            &m,
+            excluded,
+            b"stale identity",
+            ids[0].clone(),
+            Disposition::Create,
+        );
+        // What `merge` would never build: a D4 path carrying a destination and
+        // a writing disposition.
+        promoted.dest = Some(m.dest(excluded));
+        let plan = plan_of(vec![
+            promoted,
+            item(
+                &m,
+                "config/config.toml",
+                b"stale identity",
+                ids[0].clone(),
+                Disposition::Create,
+            ),
+        ]);
+
+        let err = apply(&m.ctx(), &plan, &packs)
+            .expect_err("a machine-bound path must not reach the write path")
+            .to_string();
+        assert!(err.contains("bridge-state.json"), "{err}");
+
+        // `Err` from `apply` means nothing was written — including the
+        // perfectly legitimate item queued behind it.
+        assert!(files_under(&m.roots.config_dir).is_empty());
     }
 
     /// SAFE-05, asserted against the source rather than against a `TMPDIR` this

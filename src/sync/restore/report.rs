@@ -38,7 +38,7 @@ use std::io::{BufRead, Write};
 use chrono::{DateTime, Utc};
 
 use crate::config::SyncCategory;
-use crate::display::sanitize_untrusted_field;
+use crate::display::sanitize_untrusted_line;
 use crate::error::Result;
 use crate::sync::report::human_bytes;
 
@@ -715,8 +715,11 @@ impl Counts {
 /// come out through the crate's existing sanitizer. The extra newline collapse
 /// is what keeps one path from forging extra report lines — and from slipping
 /// past the line budgets above (T-5-50, T-5-53).
-fn safe(value: &str) -> String {
-    sanitize_untrusted_field(value).replace('\n', " ")
+///
+/// `pub(super)` because `write`'s failure line needs exactly this rule and had
+/// its own `{}` instead — the one output site T-5-50's mitigation missed (F-3).
+pub(super) fn safe(value: &str) -> String {
+    sanitize_untrusted_line(value)
 }
 
 #[cfg(test)]
