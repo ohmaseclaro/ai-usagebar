@@ -704,6 +704,10 @@ mod tests {
     /// An interruption between the upload and the flip: the pointer still names
     /// the old keyfile, nothing is deleted, and this machine still opens the
     /// bundle under the old password.
+    ///
+    /// The flip is attempted twice, not once: a 409 is what `pointer::commit`
+    /// retries, exactly once, re-running `rebuild` against the winner. The
+    /// count is asserted rather than left open so the retry stays bounded.
     #[tokio::test]
     async fn a_run_interrupted_before_the_flip_leaves_the_old_keyfile_published() {
         let local = Local::new();
@@ -745,6 +749,7 @@ mod tests {
             .with_status(409)
             .with_body(r#"{"message":"conflict"}"#)
             .match_request(record(&trace))
+            .expect(2)
             .create_async()
             .await;
         let delete = server
