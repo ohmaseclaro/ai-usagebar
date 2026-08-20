@@ -195,6 +195,11 @@ fn open_index(roots: &SyncRoots) -> Option<Index> {
 /// menu open. A plan would want the sync password on a stdin a subprocess has
 /// no way to answer (D-02) and would open file bodies to get it; a repository
 /// section would put a network round-trip behind a UI gesture (T-6-04).
+///
+/// It does ask the machine-bound credential store **whether it holds an
+/// entry** — see [`report::build_status`]. That is none of the three things
+/// above: no password, no socket, no file body, and not even the store's value,
+/// so it cannot raise a Keychain prompt on a menu open either.
 fn status(
     config: &Config,
     roots: &SyncRoots,

@@ -18,6 +18,7 @@ use chrono::{DateTime, Utc};
 
 use crate::config::{SyncCategory, SyncConfig};
 use crate::sync::index::Index;
+use crate::sync::keystore;
 use crate::sync::plan::{CategoryPlan, SyncPlan};
 use crate::sync::scope;
 use crate::sync::{SyncRoots, scope::CategoryScan};
@@ -32,8 +33,16 @@ use crate::sync::{SyncRoots, scope::CategoryScan};
 pub const WARN_INDEX_UNAVAILABLE: &str =
     "the local index is unavailable, so last-sync and pending changes are unknown";
 
+/// The machine-bound half of `credentials` could not be counted.
+///
+/// A **third** answer, and it exists because the other two would both be
+/// wrong: a locked Keychain is not "no credential here", and a count that
+/// silently omitted it is the under-report this warning was added to end.
+pub const WARN_KEYSTORE_UNAVAILABLE: &str = "the machine-bound credential store could not be read, so the credentials \
+     count may be one short of what a push would carry";
+
 /// Every string that may appear in [`StatusReport::warnings`].
-pub const WARNINGS: [&str; 1] = [WARN_INDEX_UNAVAILABLE];
+pub const WARNINGS: [&str; 2] = [WARN_INDEX_UNAVAILABLE, WARN_KEYSTORE_UNAVAILABLE];
 
 /// What a push would have to look at, counted without opening anything.
 ///
@@ -180,6 +189,14 @@ pub fn build_status(
     plan: Option<SyncPlan>,
     repo: Option<RepoSection>,
 ) -> StatusReport {
+    // The index is the only thing this builder can fail to have on the planned
+    // path, so it is the only warning that path can raise — and raising it here
+    // rather than at each call site is what keeps `pending: None` and the
+    // explanation for it from ever disagreeing.
+    let mut warnings = match index {
+        Some(_) => Vec::new(),
+        None => vec![WARN_INDEX_UNAVAILABLE.to_string()],
+    };
     // `pending` is `None` whenever the index is, in both arms: without one
     // there is nothing to compare against, and a confident zero would be a lie.
     let (lines, pending) = match &plan {
@@ -195,10 +212,16 @@ pub fn build_status(
                 .map(|&category| scope::collect(category, roots, cfg, now))
                 .collect();
             let pending = index.map(|i| pending_of_scans(&scans, i));
-            (
-                scans.into_iter().map(|scan| line(scan, cfg)).collect(),
-                pending,
-            )
+            let mut lines: Vec<CategoryLine> =
+                scans.into_iter().map(|scan| line(scan, cfg)).collect();
+            // The half a walk cannot see. Only on this path: a plan has already
+            // counted the stores itself (`plan::build`'s third pass), and
+            // adding them again here would double them.
+            match count_stores(roots, cfg) {
+                Ok(stores) => add_stores(&mut lines, stores),
+                Err(_) => warnings.push(WARN_KEYSTORE_UNAVAILABLE.to_string()),
+            }
+            (lines, pending)
         }
     };
     StatusReport {
@@ -210,14 +233,52 @@ pub fn build_status(
         plan,
         repo,
         pending,
-        // The index is the only thing this builder can fail to have, so it is
-        // the only warning it can raise — and raising it here rather than at
-        // each call site is what keeps `pending: None` and the explanation for
-        // it from ever disagreeing.
-        warnings: match index {
-            Some(_) => Vec::new(),
-            None => vec![WARN_INDEX_UNAVAILABLE.to_string()],
-        },
+        warnings,
+    }
+}
+
+/// How many machine-bound credential stores this machine holds — the half of
+/// `credentials` that is not a file, and so is invisible to [`scope::collect`].
+///
+/// **Existence only, never a value.** `sync status --json` is what the macOS
+/// menu bar runs on every menu open, so this path may not ask for a password,
+/// open a network connection, or read a file body;
+/// [`Stores::has`](crate::sync::keystore::Stores::has) does none of the three.
+///
+/// The `cfg.includes` guard mirrors the planner's third pass exactly: with
+/// `credentials` switched off, `scope::collect` returns no files and the
+/// planner reads no store, so this must contribute nothing either.
+///
+/// `Err` is "this machine could not say", which the caller turns into
+/// [`WARN_KEYSTORE_UNAVAILABLE`]. Never a zero: an unreadable store reported as
+/// absent is the under-count this whole function exists to fix.
+fn count_stores(roots: &SyncRoots, cfg: &SyncConfig) -> crate::error::Result<usize> {
+    if !cfg.includes(SyncCategory::Credentials) {
+        return Ok(0);
+    }
+    let mut held = 0usize;
+    for store in keystore::Store::ALL {
+        if roots.stores.has(store)? {
+            held += 1;
+        }
+    }
+    Ok(held)
+}
+
+/// Add the stores to the row they belong to, which is `credentials` and only
+/// `credentials` — the same category the planner attributes them to.
+///
+/// ponytail: the count moves and the byte total does not. A store's size
+/// is its value's length, and reading a value is the thing this path may not
+/// do; the shortfall is a few hundred bytes against a total rendered in
+/// megabytes. If a store ever holds something big enough to see, the size has
+/// to travel out of the planner rather than be measured here.
+fn add_stores(lines: &mut [CategoryLine], stores: usize) {
+    if let Some(line) = lines
+        .iter_mut()
+        .find(|l| l.category == SyncCategory::Credentials)
+    {
+        line.files += stores;
     }
 }
 
@@ -1940,5 +2001,131 @@ mod tests {
 
         // …and give it back a mode the TempDir can clean up.
         fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    // ---- 6-11: the half a filesystem walk cannot see ---------------------
+
+    /// One credential file and one machine-bound store, under `credentials`.
+    fn a_machine_with_a_keystore(dir: &TempDir) -> SyncRoots {
+        seed(dir.path(), "claude-home/.credentials.json", "{}");
+        let roots = roots_at(dir);
+        roots
+            .stores
+            .edit()
+            .set(keystore::Store::ClaudeCodeOauth, r#"{"claudeAiOauth":{}}"#);
+        roots
+    }
+
+    fn only_credentials() -> SyncConfig {
+        SyncConfig {
+            categories: vec![SyncCategory::Credentials],
+            repo: None,
+            ..SyncConfig::default()
+        }
+    }
+
+    fn credentials_files(report: &StatusReport) -> usize {
+        report
+            .lines
+            .iter()
+            .find(|l| l.category == SyncCategory::Credentials)
+            .expect("every category has a row")
+            .files
+    }
+
+    /// **The defect.** `sync status` walks the filesystem, and a machine-bound
+    /// store is not a file — so it reported one credential fewer than
+    /// `sync push --dry-run` planned, and the missing one was the Claude Code
+    /// login: the single most sensitive item in the bundle. The two commands
+    /// answer the same question at different moments and must agree.
+    #[test]
+    fn status_counts_the_keystore_the_way_a_push_would() {
+        use crate::sync::crypto::{KdfParams, Keyfile};
+        use crate::sync::index::Index;
+
+        let dir = TempDir::new().unwrap();
+        let roots = a_machine_with_a_keystore(&dir);
+        let cfg = only_credentials();
+        let index = Index::at(&dir.path().join("index.sqlite3")).unwrap();
+
+        // No plan: the walk, plus the store the walk cannot see.
+        let walked = build_status(&roots, &cfg, Some(&index), fixed_now(), None, None);
+        assert_eq!(credentials_files(&walked), 2, "one file and one store");
+        assert!(walked.warnings.is_empty(), "{:?}", walked.warnings);
+
+        // A plan: the planner's own third pass, which is what a push sends.
+        let cheap = KdfParams {
+            m_kib: 8,
+            t: 1,
+            p: 1,
+        };
+        let keys = Keyfile::create_with_floor(b"a-test-passphrase", cheap, cheap.m_kib)
+            .unwrap()
+            .1;
+        let plan = plan::build_with_keys(&roots, &cfg, &index, fixed_now(), &keys).unwrap();
+        let planned = build_status(&roots, &cfg, Some(&index), fixed_now(), Some(plan), None);
+
+        assert_eq!(
+            credentials_files(&walked),
+            credentials_files(&planned),
+            "status and push --dry-run disagree about what would be carried"
+        );
+    }
+
+    /// The planner reads no store with `credentials` switched off, so neither
+    /// may this — otherwise turning the category off would still advertise the
+    /// login as in scope.
+    #[test]
+    fn a_store_is_not_counted_when_credentials_is_switched_off() {
+        let dir = TempDir::new().unwrap();
+        let roots = a_machine_with_a_keystore(&dir);
+        let cfg = SyncConfig {
+            categories: vec![SyncCategory::Config],
+            repo: None,
+            ..SyncConfig::default()
+        };
+        let report = build_status(&roots, &cfg, None, fixed_now(), None, None);
+        assert_eq!(credentials_files(&report), 0);
+    }
+
+    /// A locked Keychain is a **third** answer. Reporting it as "no credential
+    /// here" is the under-count this path was fixed to end, so it is said out
+    /// loud instead — in the fixed vocabulary the JSON document promises.
+    #[test]
+    fn an_unreadable_store_is_a_warning_rather_than_a_quietly_short_count() {
+        let dir = TempDir::new().unwrap();
+        let roots = a_machine_with_a_keystore(&dir);
+        roots.stores.edit().set_unreadable(true);
+
+        let report = build_status(&roots, &only_credentials(), None, fixed_now(), None, None);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w == WARN_KEYSTORE_UNAVAILABLE),
+            "{:?}",
+            report.warnings
+        );
+        // The row still carries what the walk could see, and no invented store.
+        assert_eq!(credentials_files(&report), 1);
+        // And the warning is one the machine-readable document may carry.
+        assert!(WARNINGS.contains(&WARN_KEYSTORE_UNAVAILABLE));
+    }
+
+    /// Nothing on this path may reach for the store's *value*: `--json` is what
+    /// the macOS menu bar runs on every menu open, and a value read is what
+    /// raises the Keychain ACL prompt.
+    #[test]
+    fn the_status_path_asks_whether_a_store_has_an_entry_and_never_what_it_holds() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sync/report.rs"),
+        )
+        .expect("the crate's own source is readable");
+        let production = crate::sync::guard::production_code(&source);
+        assert!(production.contains("stores.has("), "the probe is the seam");
+        assert!(
+            !production.contains("stores.read("),
+            "sync status must never read a credential's value"
+        );
     }
 }
