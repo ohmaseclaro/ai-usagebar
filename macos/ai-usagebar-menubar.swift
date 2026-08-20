@@ -1147,6 +1147,123 @@ func syncSummaryLine(_ status: SyncStatus?, now: Date = Date()) -> String {
     return parts.joined(separator: "   ·   ")
 }
 
+// MARK: - The two sync actions the dropdown offers
+//
+// **Neither of them runs here, and that is the design.** `sync push` publishes
+// ciphertext that cannot be un-published; `sync pull --apply` writes over local
+// credentials. Both derive their key from a sync password that arrives on stdin
+// and nowhere else — never argv, never the environment, never `config.toml` —
+// and both of `sync pull`'s confirmations are offered *only* when stdin is a
+// terminal. Piped, they are not asked at all: they are answered by `--yes` and
+// `--force-credentials`.
+//
+// So a background subprocess launched from a menu click could reach a restore
+// only by passing the flags that skip the questions — a shorter path to an
+// irreversible write than the CLI itself offers. Instead the menu confirms, and
+// then hands the command to Terminal.app and steps out of the way, exactly as
+// "Adicionar conta…" already does for a sign-in it cannot perform. The password
+// is typed where the CLI asks for it, and every gate happens where it was
+// designed to (D-01, D-02).
+
+enum SyncAction: CaseIterable {
+    case push, pull
+}
+
+/// Single-quoted with `'` doubled out, so a path with a quote in it cannot
+/// break out of the generated command.
+func shellQuote(_ s: String) -> String {
+    "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+}
+
+/// The argument vector each action names — the only place it is spelled.
+///
+/// `--apply`, `--yes`, `--force` and `--force-credentials` are the four
+/// spellings that turn `sync pull` from a report into a write, and none of them
+/// belongs in a string a menu click produces: what is handed over is always the
+/// form that stops and asks. `testSyncActions` asserts that, and asserts no
+/// password option is spelled here either.
+func syncCommand(_ action: SyncAction) -> [String] {
+    switch action {
+    case .push: return ["sync", "push"]
+    case .pull: return ["sync", "pull"]
+    }
+}
+
+/// The command as the user will see it in the confirmation and as the script
+/// will run it — one spelling, so the line they approved is the line that runs.
+/// Only the binary is quoted; the rest are fixed literals with no metacharacter
+/// in them, and quoting those would make the dialog harder to read for nothing.
+func syncCommandLine(binary: String, _ action: SyncAction) -> String {
+    ([shellQuote(binary)] + syncCommand(action)).joined(separator: " ")
+}
+
+/// The script handed to `runInTerminal`, in the shape `addAccountScript`
+/// established: run it, then hold the window open so a refusal can be read.
+func syncTerminalScript(binary: String, _ action: SyncAction) -> String {
+    "#!/usr/bin/env bash\n"
+        + syncCommandLine(binary: binary, action) + "\n"
+        + "echo; read -n 1 -s -r -p 'Pressione qualquer tecla para fechar…'\n"
+}
+
+struct SyncPrompt: Equatable {
+    var title: String
+    var body: String
+    var go: String
+}
+
+/// What the confirmation says. Each one states the consequence the CLI's own
+/// gate states, because handing the operation to a terminal is not a reason to
+/// hand it over silently.
+func syncPrompt(_ action: SyncAction) -> SyncPrompt {
+    switch action {
+    case .push:
+        return SyncPrompt(
+            title: "Enviar este backup agora?",
+            body: "Uma publicação não se desfaz: os bytes cifrados vão para o repositório "
+                + "remoto e podem já ter sido copiados de lá antes de você mudar de ideia.\n\n"
+                + "O comando abre no Terminal, que é onde a senha do sync é pedida — ela "
+                + "nunca passa por este menu.",
+            go: "Abrir no Terminal")
+    case .pull:
+        return SyncPrompt(
+            title: "Restaurar esta máquina do backup?",
+            body: "O comando abre no Terminal e, sozinho, apenas mostra o que mudaria — "
+                + "nada é escrito. A restauração só acontece quando você repete o comando "
+                + "com --apply ali mesmo, e cada credencial a ser sobrescrita é confirmada "
+                + "nesse terminal.\n\n"
+                + "Este menu não tem como fazer essas perguntas, então não as pula.",
+            go: "Abrir no Terminal")
+    }
+}
+
+/// `SyncCategory::label()` is a machine key (`chat_index`), so the menu names
+/// it. Five fixed rows, not a provider table: an unrecognised category still
+/// renders, under the label the binary sent, stripped because it crossed a
+/// process boundary.
+private let SYNC_CATEGORY_NAMES = [
+    "config": "Configuração",
+    "credentials": "Credenciais",
+    "routines": "Rotinas",
+    "chat_index": "Índice de conversas",
+    "transcripts": "Transcrições",
+]
+
+/// What is actually in this backup, one row per category — the half of D-04 the
+/// one-line summary has no room for. A category that is switched off says so
+/// rather than being left out, because "credentials: desativado" is exactly the
+/// thing a user needs to discover before the machine they are backing up dies.
+func syncCategoryRows(_ status: SyncStatus?) -> [String] {
+    guard let s = status else { return [] }
+    return s.categories.map { line in
+        let name = SYNC_CATEGORY_NAMES[line.category] ?? stripMarkup(line.category)
+        guard line.enabled else { return "\(name): desativado" }
+        guard line.files > 0 else { return "\(name): vazio" }
+        let noun = line.files == 1 ? "arquivo" : "arquivos"
+        let size = BYTES_SYNC.string(fromByteCount: Int64(line.bytes))
+        return "\(name): \(line.files) \(noun) (\(size))"
+    }
+}
+
 /// `-y` because the menu has already asked; without it the binary would prompt
 /// on a stdin that is not a terminal and abort.
 func switchArgs(label: String, desktop: Bool, deleting: [String] = []) -> [String] {
@@ -1169,12 +1286,11 @@ func conflictPreview(_ conflicts: [DeletionConflict], limit: Int = 10) -> String
 
 /// Adding an account is interactive — a Desktop capture waits for you to sign
 /// in, and a CLI one runs `claude` — so it goes to Terminal rather than being
-/// swallowed by a background subprocess. Single-quoted with `'` doubled out,
-/// so a label with a quote in it can't break out of the command.
+/// swallowed by a background subprocess. Quoted through `shellQuote`, which the
+/// sync scripts share, so a label with a quote in it can't break out.
 func addAccountScript(binary: String, label: String, desktop: Bool) -> String {
-    func quote(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
     return "#!/usr/bin/env bash\n"
-        + "\(quote(binary)) account add \(quote(label))\(desktop ? " --desktop" : "")\n"
+        + "\(shellQuote(binary)) account add \(shellQuote(label))\(desktop ? " --desktop" : "")\n"
         + "echo; read -n 1 -s -r -p 'Pressione qualquer tecla para fechar…'\n"
 }
 
@@ -1721,6 +1837,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// dim row, disabled and hidden until `sync status --json` answers, so a
     /// binary that predates the flag shows exactly the menu it always did.
     let syncInfoItem = NSMenuItem()
+    /// What is in the backup, and the two actions the menu hands to a terminal.
+    /// Hidden on the same condition as the row above.
+    let syncSubmenu = NSMenu()
+    let syncMenuItem = NSMenuItem(title: "Sync", action: nil, keyEquivalent: "")
     var lastSyncStatus: SyncStatus?
     var syncStatusFetchedAt = Date.distantPast
     var syncStatusGeneration = 0
@@ -2046,6 +2166,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             item.isHidden = true
             menu.addItem(item)
         }
+        // Beside the account submenus, not beside the dim status row: the row
+        // is a sub-line of the header, and every item that *does* something
+        // lives down here.
+        syncSubmenu.autoenablesItems = false
+        syncMenuItem.submenu = syncSubmenu
+        syncMenuItem.isHidden = true
+        menu.addItem(syncMenuItem)
         addAction(menu, "Preferências…", #selector(openPrefs), ",")
         menu.addItem(.separator())
         addAction(menu, "Sair", #selector(quit), "q")
@@ -2706,6 +2833,51 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let line = syncSummaryLine(lastSyncStatus)
         syncInfoItem.isHidden = line.isEmpty
         syncInfoItem.attributedTitle = run(line, .secondaryLabelColor)
+        renderSyncSubmenu()
+    }
+
+    /// Rebuilt from the last status, so the category rows can never be stale,
+    /// and hidden until `sync status --json` answers for the same reason the
+    /// row is: a binary that predates the flag shows the menu it always did.
+    func renderSyncSubmenu() {
+        syncMenuItem.isHidden = lastSyncStatus == nil
+        syncSubmenu.removeAllItems()
+        for row in syncCategoryRows(lastSyncStatus) {
+            let it = NSMenuItem()
+            it.attributedTitle = run(row, .secondaryLabelColor)
+            it.isEnabled = false
+            syncSubmenu.addItem(it)
+        }
+        if syncSubmenu.numberOfItems > 0 { syncSubmenu.addItem(.separator()) }
+        addAction(syncSubmenu, "Atualizar estado", #selector(refreshSyncStatus), "")
+        syncSubmenu.addItem(.separator())
+        // No keyEquivalent on either. Every other item in this menu is
+        // read-only or locally reversible; a hot-key that publishes bytes is
+        // not something to hand out by accident.
+        addAction(syncSubmenu, "Enviar agora…", #selector(pushSync), "")
+        addAction(syncSubmenu, "Restaurar deste backup…", #selector(pullSync), "")
+    }
+
+    @objc func refreshSyncStatus() { fetchSyncStatus() }
+    @objc func pushSync() { confirmSyncInTerminal(.push) }
+    @objc func pullSync() { confirmSyncInTerminal(.pull) }
+
+    /// Both sync actions leave through here, and **neither starts a
+    /// subprocess**: the consequence is stated, the exact command is shown, and
+    /// on confirmation Terminal.app is handed the script. There is no in-flight
+    /// flag because nothing is in flight — the work happens in a window the
+    /// user owns, where the password is asked for and every gate is answered.
+    private func confirmSyncInTerminal(_ action: SyncAction) {
+        guard let bin = resolveBinary("ai-usagebar") else { return }
+        let prompt = syncPrompt(action)
+        let alert = NSAlert()
+        alert.messageText = prompt.title
+        alert.informativeText = prompt.body + "\n\n" + syncCommandLine(binary: bin, action)
+        alert.addButton(withTitle: prompt.go)
+        alert.addButton(withTitle: "Cancelar")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        runInTerminal(syncTerminalScript(binary: bin, action))
     }
 
     func applyAccountStatus(_ status: AccountStatus) {
