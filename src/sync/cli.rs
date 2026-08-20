@@ -468,11 +468,20 @@ fn render_setup(outcome: &github::setup::SetupOutcome) -> String {
     if outcome.reused_pairing {
         out.push_str("pairing:    reused — this machine was already paired.\n");
     }
-    out.push_str(
-        "\nThis machine is paired and ready to push.\n\
-         Nothing was uploaded — `sync setup` never uploads. Run `ai-usagebar sync push` when \
-         you are ready.\n",
-    );
+    // The one thing setup can put in the repository, and only ever with an
+    // explicit yes — so the closing line reports it rather than repeating a
+    // "nothing was uploaded" that would no longer be true.
+    if outcome.initialised {
+        out.push_str("repo:       initialised — a README was added to the empty repository.\n");
+    }
+    out.push_str("\nThis machine is paired and ready to push.\n");
+    out.push_str(if outcome.initialised {
+        "The README you approved is the only thing there — `sync setup` uploads no bundle \
+         data. Run `ai-usagebar sync push` when you are ready.\n"
+    } else {
+        "Nothing was uploaded — `sync setup` never uploads. Run `ai-usagebar sync push` when \
+         you are ready.\n"
+    });
     out
 }
 
@@ -1373,6 +1382,13 @@ mod tests {
             .mock("GET", "/repos/o/n/contents/sync/pointer.json")
             .with_status(404)
             .with_body(r#"{"message":"Not Found"}"#)
+            .create();
+        // …and it already has a commit, so setup makes no offer to add one.
+        let _c = server
+            .mock("GET", "/repos/o/n/commits")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body("[]")
             .create();
 
         let script = Script::new();
