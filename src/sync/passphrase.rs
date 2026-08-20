@@ -456,12 +456,14 @@ mod tests {
             scanned += 1;
             let source = std::fs::read_to_string(&path).expect("readable module");
             // Prose may discuss the rule freely, and test modules may name the
-            // needles; only shipped code is scanned.
-            for line in crate::sync::guard::production_code(&source).lines() {
+            // needles; only shipped code is scanned. `production_code` drops
+            // both — comments first, so a doc comment naming `#[cfg(test)]`
+            // cannot truncate the region this loop sees, which is how five
+            // production functions in `github/pairing.rs` sat outside this
+            // guard while it reported green on a real violation (F-4).
+            let production = crate::sync::guard::production_code(&source);
+            for line in production.lines() {
                 let trimmed = line.trim_start();
-                if trimmed.starts_with("//") {
-                    continue;
-                }
                 for needle in ["std::env", "env::var", "var_os", "clap", "Arg::new"] {
                     assert!(
                         !trimmed.contains(needle),

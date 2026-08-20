@@ -245,10 +245,36 @@ pub(crate) mod guard {
         rs_files(&Path::new(env!("CARGO_MANIFEST_DIR")).join(rel))
     }
 
-    /// Everything before a file's own `#[cfg(test)]`. A test that names a needle
-    /// is a test, not a violation.
-    pub(crate) fn production_code(source: &str) -> &str {
-        source.split("#[cfg(test)]").next().unwrap_or_default()
+    /// A file's production code: every line that is neither a comment nor part
+    /// of the file's own `#[cfg(test)]` module. A test that names a needle is a
+    /// test, not a violation, and prose that discusses one is neither.
+    ///
+    /// **Comments are removed before the marker is looked for, and that is the
+    /// fix.** The previous shape split the raw source on the first *textual*
+    /// `#[cfg(test)]`. In `github/pairing.rs` the first occurrence is inside a
+    /// doc comment at line 76, so the scanned region ended at line 75 and the
+    /// 397 lines below it — five production functions — were invisible to every
+    /// guard built on this helper. Phase 5's audit put
+    /// `std::env::var("SYNC_PASSWORD")` in that region and watched the T-5-66
+    /// guard pass.
+    ///
+    /// `github/mod.rs`'s own guard recorded this exact defect and worked around
+    /// it for itself; the lesson reached one call site and not the shared helper
+    /// every other guard depends on. A *smarter* marker search — line-anchored,
+    /// or `\n#[cfg(test)]\nmod tests` — keeps the same shape: a guard that stops
+    /// looking where it happens to find a string. Dropping comments first makes
+    /// the marker unambiguous by construction, because prose is no longer part
+    /// of the text being searched.
+    ///
+    /// Returns an owned `String` rather than a borrowed slice, since the result
+    /// is no longer a contiguous piece of the input.
+    pub(crate) fn production_code(source: &str) -> String {
+        source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .take_while(|line| !line.trim_start().starts_with("#[cfg(test)]"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -273,5 +299,57 @@ mod tests {
         assert!(check_version(1, 1, "keyfile").is_ok());
         let err = check_version(2, 1, "keyfile").expect_err("above the ceiling must be refused");
         assert!(err.to_string().contains("upgrade ai-usagebar"));
+    }
+
+    /// F-4: prose is not code, so a doc comment naming the marker must not
+    /// truncate the region every structural guard scans.
+    #[test]
+    fn a_marker_inside_a_comment_does_not_truncate_the_scanned_region() {
+        let source = concat!(
+            "fn before() {}\n",
+            "/// The only production wrapper here, and nothing under `#[cfg(test)]` calls it.\n",
+            "fn after_the_prose() {}\n",
+            "    // #[cfg(test)] — indented prose, still prose\n",
+            "fn also_after() {}\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    fn inside_the_test_module() {}\n",
+            "}\n",
+        );
+        let production = guard::production_code(source);
+        assert!(production.contains("fn after_the_prose"), "{production}");
+        assert!(production.contains("fn also_after"), "{production}");
+        assert!(
+            !production.contains("inside_the_test_module"),
+            "the test module is still excluded: {production}"
+        );
+        assert!(
+            !production.contains("The only production wrapper"),
+            "comments are not code: {production}"
+        );
+    }
+
+    /// The file the blind spot was actually in, named rather than described.
+    /// `pairing.rs`'s first textual `#[cfg(test)]` is prose near the top, and
+    /// its last production function is hundreds of lines below it.
+    #[test]
+    fn every_production_function_in_pairing_rs_is_inside_the_scanned_region() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sync/github/pairing.rs"),
+        )
+        .expect("the crate's own source is readable");
+        let production = guard::production_code(&source);
+        for needle in [
+            "fn default_path",
+            "fn read_from",
+            "fn write_to",
+            "fn check_drift",
+            "fn went_public_incident",
+        ] {
+            assert!(
+                production.contains(needle),
+                "pairing.rs::{needle} is outside the region every structural guard scans"
+            );
+        }
     }
 }

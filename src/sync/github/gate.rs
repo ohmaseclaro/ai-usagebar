@@ -849,7 +849,7 @@ mod tests {
         let source =
             std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file!()))
                 .unwrap();
-        let code = source.split("#[cfg(test)]").next().unwrap();
+        let code = crate::sync::guard::production_code(&source);
         assert!(
             code.contains("pub fn spend(self,"),
             "spend must consume self"
@@ -895,7 +895,7 @@ mod tests {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sync/github/write.rs"),
         )
         .unwrap();
-        let code = write.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+        let code = crate::sync::guard::production_code(&write);
         assert_eq!(
             code.matches("permit.covers(repo)?;").count(),
             code.matches("permit: &Pushing,").count(),
