@@ -6,9 +6,13 @@
 //! replace. Everything before it is inert; everything after it is visible.
 //!
 //! Plan 4-01 created this file with [`load`] complete and [`commit`]'s
-//! no-conflict path working. **Plan 4-04 owns it** and fills the 409 arm — the
-//! `rebuild` closure exists from the tracer precisely so that retry can be added
-//! here without touching the orchestrator that supplies the closure.
+//! no-conflict path working; plan 4-04 filled the 409 arm. The `rebuild`
+//! closure exists from the tracer precisely so that retry could be added here
+//! without touching the orchestrator that supplies the closure.
+//!
+//! **Nothing in this file deletes anything.** A losing race costs one extra
+//! round trip; it must never cost remote data (SYNC-04), and a test scans the
+//! whole file to keep that true.
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -104,10 +108,29 @@ pub async fn load(
 /// Nothing in this file deletes anything. A losing race costs one extra round
 /// trip; it must never cost remote data.
 ///
-/// **Plan 4-04 fills the 409 arm**: re-`load`, call `rebuild` again with what is
-/// now there, `PUT` once more, and on a second conflict stop rather than loop.
-/// The shared `with_retry` helper deliberately does not retry a `Conflict`,
-/// which is what leaves this bounded retry as the only path.
+/// # The conflict path
+///
+/// A `Conflict` means another machine flipped between this run's read and its
+/// `PUT`. The response is one re-`load`, one further `rebuild` against **the
+/// pointer that is actually current**, and one further `PUT` — then stop. A
+/// closure invoked once and reused across retries would republish this run's
+/// view of a remote it has already lost, silently clobbering the winner's
+/// snapshot; re-invoking it is the whole point of the compare-and-swap.
+///
+/// Two machines retrying against each other without bound is a livelock that
+/// burns the content-creation budget and never converges, so the second
+/// conflict reports rather than loops — the human re-run is a perfectly good
+/// backoff. The shared `with_retry` helper deliberately does not retry a
+/// `Conflict`, which is what leaves this bounded retry as the only path.
+///
+/// Anything that is not a `Conflict` is returned **unchanged**: Phase 3's
+/// `classify` already produced the right variant and `actionable` already has
+/// the right text, and a second layer of interpretation here would make two
+/// messages for one failure.
+///
+/// The returned [`Pointer`] is the one that went to the remote, never the local
+/// candidate — `prune` is handed it, and pruning against the candidate after a
+/// lost race would strand the winner's packs.
 pub async fn commit<F>(
     client: &Client,
     repo: &RepoRef,
@@ -121,7 +144,51 @@ where
     F: Fn(Option<&Pointer>) -> Result<Pointer>,
 {
     let next = rebuild(current)?;
-    let body = serde_json::to_vec(&next).map_err(|e| {
+    match put(client, repo, &next, sha, permit, now).await {
+        Ok(new_sha) => return Ok((next, new_sha)),
+        Err(e) if !is_conflict(&e) => return Err(e),
+        Err(_) => {}
+    }
+
+    // Lost the race. Re-read, rebuild on top of whoever won, and try once more.
+    // `next.repo_id` is this machine's own — the closure copies it from local
+    // configuration — so `load` still refuses a pointer belonging to a different
+    // bundle before the merge can see it (T-4-31).
+    let (winner, winner_sha) = load(client, repo, &next.repo_id, now).await?;
+    let merged = rebuild(winner.as_ref())?;
+    match put(client, repo, &merged, winner_sha.as_deref(), permit, now).await {
+        Ok(new_sha) => Ok((merged, new_sha)),
+        Err(e) if is_conflict(&e) => Err(AppError::Other(
+            "another machine is pushing to this repository right now: the snapshot pointer \
+             changed twice while this push was publishing it. Nothing was deleted, and every \
+             pack this run uploaded is still there — re-run the same command in a moment and it \
+             will re-read the remote state and reuse what already landed."
+                .into(),
+        )),
+        Err(other) => Err(other),
+    }
+}
+
+/// A conflict, whichever status carried it.
+///
+/// `GithubError::Conflict` converts to `AppError::Http { status: 409, .. }`, and
+/// `write::put_contents` maps its 422 — a `sha`-less `PUT` against a path that
+/// already exists — onto that same variant at the one call site that knows it
+/// omitted the `sha`. Both arrive here as one thing and take one path.
+fn is_conflict(err: &AppError) -> bool {
+    matches!(err, AppError::Http { status: 409, .. })
+}
+
+/// One attempt: serialize, check the size, `PUT`. Returns the new blob `sha`.
+async fn put(
+    client: &Client,
+    repo: &RepoRef,
+    next: &Pointer,
+    sha: Option<&str>,
+    permit: &gate::Pushing,
+    now: DateTime<Utc>,
+) -> Result<String> {
+    let body = serde_json::to_vec(next).map_err(|e| {
         AppError::Other(format!("the snapshot pointer could not be serialized: {e}"))
     })?;
     if body.len() as u64 > MAX_POINTER_BYTES {
@@ -132,10 +199,9 @@ where
             body.len()
         )));
     }
-    let new_sha = client
+    client
         .put_contents(repo, POINTER_PATH, COMMIT_MESSAGE, &body, sha, permit, now)
-        .await?;
-    Ok((next, new_sha))
+        .await
 }
 
 #[cfg(test)]
@@ -415,6 +481,10 @@ mod tests {
     /// attempt carried can be asserted from the wire. A matcher that asserted
     /// `sha` would also *select* on it, and a wrong `sha` would then arrive as
     /// an unmatched-request 501 instead of as a failed assertion.
+    ///
+    /// **One per server.** mockito evaluates every mock's `match_request`
+    /// against every request that clears method and path, so attaching a second
+    /// recorder records each request twice.
     fn recorder(sink: Arc<Mutex<Vec<String>>>) -> impl Fn(&mockito::Request) -> bool + 'static {
         move |req: &mockito::Request| {
             sink.lock()
@@ -451,7 +521,7 @@ mod tests {
             .mock("PUT", PATH)
             .with_status(409)
             .with_body(r#"{"message":"sync/pointer.json does not match blob1"}"#)
-            .match_request(recorder(Arc::clone(&bodies)))
+            .match_request(recorder(bodies.clone()))
             .expect(1)
             .create_async()
             .await;
@@ -459,7 +529,6 @@ mod tests {
             .mock("PUT", PATH)
             .with_status(200)
             .with_body(r#"{"content":{"sha":"blob3"}}"#)
-            .match_request(recorder(Arc::clone(&bodies)))
             .expect(1)
             .create_async()
             .await;
@@ -518,6 +587,7 @@ mod tests {
             .mock("PUT", PATH)
             .with_status(409)
             .with_body(r#"{"message":"stale"}"#)
+            .match_request(recorder(bodies.clone()))
             .expect(1)
             .create_async()
             .await;
@@ -525,7 +595,6 @@ mod tests {
             .mock("PUT", PATH)
             .with_status(200)
             .with_body(r#"{"content":{"sha":"blob3"}}"#)
-            .match_request(recorder(Arc::clone(&bodies)))
             .expect(1)
             .create_async()
             .await;
@@ -551,7 +620,7 @@ mod tests {
 
         assert_eq!(roots_of(&landed), vec!["c", "new"]);
         assert_eq!(
-            roots_of(&sent(&bodies.lock().unwrap()[0])),
+            roots_of(&sent(&bodies.lock().unwrap()[1])),
             vec!["c", "new"],
             "already truncated as it went out"
         );
@@ -610,7 +679,7 @@ mod tests {
             .mock("PUT", PATH)
             .with_status(422)
             .with_body(r#"{"message":"Invalid request. sha wasn't supplied."}"#)
-            .match_request(recorder(Arc::clone(&bodies)))
+            .match_request(recorder(bodies.clone()))
             .expect(1)
             .create_async()
             .await;
@@ -618,7 +687,6 @@ mod tests {
             .mock("PUT", PATH)
             .with_status(201)
             .with_body(r#"{"content":{"sha":"blob3"}}"#)
-            .match_request(recorder(Arc::clone(&bodies)))
             .expect(1)
             .create_async()
             .await;

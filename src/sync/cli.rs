@@ -1278,10 +1278,12 @@ mod tests {
         flip.assert();
     }
 
-    /// A failed flip is a failed push, and the compare-and-swap is not re-driven
-    /// behind the user's back — `with_retry` never retries a conflict.
+    /// A failed flip is a failed push. `with_retry` still never retries a
+    /// conflict; the **one** re-drive is plan 4-04's bounded compare-and-swap in
+    /// `pointer::commit` — re-read, rebuild on whoever won, `PUT` once more —
+    /// and it stops there rather than looping. Two `PUT`s and no third.
     #[test]
-    fn a_failed_pointer_put_exits_non_zero_and_makes_no_second_attempt() {
+    fn a_failed_pointer_put_exits_non_zero_after_exactly_one_bounded_retry() {
         let dir = TempDir::new().unwrap();
         let (roots, keyfile) = seeded(&dir);
         let mut server = mockito::Server::new();
@@ -1296,7 +1298,7 @@ mod tests {
             .mock("PUT", "/repos/o/n/contents/sync/pointer.json")
             .with_status(409)
             .with_body(r#"{"message":"is at abc but expected def"}"#)
-            .expect(1)
+            .expect(2)
             .create();
 
         assert_ne!(
