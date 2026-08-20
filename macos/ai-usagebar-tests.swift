@@ -659,6 +659,100 @@ func testDesktopAccounts() {
                 "menu uses the source selected by Rust status")
 }
 
+// ─── 6-01: `sync status --json`, the menu bar's read ──────────────────────
+//
+// Every field is optional and a non-object parses to nil, which is what makes
+// the older-binary path safe: a build that does not know `--json` prints an
+// error, the parse fails, and the row stays hidden instead of crashing.
+func testSyncStatus() {
+    print("sync status")
+    func data(_ s: String) -> Data { Data(s.utf8) }
+
+    // Every key `report::status_json` freezes, plus one it does not know.
+    let full = data("""
+    {"last_sync":"2026-08-19T12:00:00+00:00","pending":true,"pending_files":3,
+     "pending_bytes":4096,"total_files":9,"total_bytes":8192,
+     "index":"/nowhere/index.sqlite3","warnings":[],"repo":"o/n",
+     "categories":[{"category":"config","enabled":true,"files":2,"bytes":4096,"capped":false},
+                   {"category":"transcripts","enabled":false,"files":0,"bytes":0,"capped":false}]}
+    """)
+    guard let s = parseSyncStatus(full) else {
+        assertNotNil(nil, "a full object parses")
+        return
+    }
+    assertEqual(s.pending, true, "pending is true")
+    assertEqual(s.pendingFiles, 3, "pending files")
+    assertEqual(s.pendingBytes, 4096, "pending bytes")
+    assertNotNil(s.lastSync, "an RFC 3339 last_sync decodes")
+    assertEqual(s.categories.count, 2, "one entry per category")
+    assertEqual(s.categories.first,
+                SyncCategoryLine(category: "config", enabled: true, files: 2, bytes: 4096),
+                "the first category line")
+    // An unknown key is ignored, not rejected — that is what lets 6-02 add one
+    // without breaking a menu bar already in someone's status bar.
+    assertEqual(s.warnings, [], "no warnings")
+
+    // chrono's to_rfc3339 carries nanoseconds; the row says "há 2 h", so the
+    // fraction is dropped rather than allowed to fail the parse.
+    assertNotNil(parseSyncStatus(data(#"{"last_sync":"2026-08-19T12:00:00.123456789+00:00"}"#))?
+                    .lastSync,
+                 "a nanosecond timestamp still decodes")
+
+    // nil and false are different answers and must stay different.
+    guard let sparse = parseSyncStatus(data(#"{"last_sync":null}"#)) else {
+        assertNotNil(nil, "a one-key object still parses")
+        return
+    }
+    assertNil(sparse.pending, "an absent pending is unknown, not false")
+    assertNil(sparse.lastSync, "an explicit null last_sync is nil")
+
+    // The older-binary path: none of these may crash, all yield nil.
+    assertNil(parseSyncStatus(Data()), "empty output parses to nil")
+    assertNil(parseSyncStatus(data("error: unrecognized subcommand 'sync'")),
+              "an older binary's error is not a status")
+    assertNil(parseSyncStatus(data("[1,2,3]")), "a non-object is not a status")
+
+    // ── the one dim row ──────────────────────────────────────────────────
+    let base = Date(timeIntervalSince1970: 1_760_000_000)
+    assertEqual(syncSummaryLine(nil), "", "a nil status hides the row")
+
+    var never = SyncStatus()
+    never.pending = false
+    assertEqual(syncSummaryLine(never, now: base), "Sync: nunca",
+                "no last sync reads as nunca, never a formatted garbage date")
+
+    // A last_sync that is not RFC 3339 yields no date, and therefore the same
+    // honest wording rather than a date built out of nothing.
+    guard let junk = parseSyncStatus(data(#"{"last_sync":"ontem","pending":false}"#)) else {
+        assertNotNil(nil, "a junk timestamp still parses the object")
+        return
+    }
+    assertNil(junk.lastSync, "an unparseable timestamp is nil")
+    assertEqual(syncSummaryLine(junk, now: base), "Sync: nunca", "…and reads as nunca")
+
+    var recent = SyncStatus()
+    recent.lastSync = base.addingTimeInterval(-7200)
+    recent.pending = true
+    let pendingLine = syncSummaryLine(recent, now: base)
+    assertEqual(pendingLine.hasPrefix("Sync: "), true, "the row names the surface")
+    assertEqual(pendingLine.contains("nunca"), false, "a decoded date is not nunca")
+    assertEqual(pendingLine.contains("pendente"), true, "pending changes are marked")
+
+    recent.pending = false
+    assertEqual(syncSummaryLine(recent, now: base).contains("pendente"), false,
+                "nothing pending, nothing said")
+
+    // D-04's third state. Unknown is not "up to date", and the reason comes
+    // from a subprocess, so it is stripped before it reaches an NSMenuItem.
+    recent.pending = nil
+    recent.warnings = ["<b>o índice</b> não está disponível"]
+    let unknown = syncSummaryLine(recent, now: base)
+    assertEqual(unknown.contains("<b>"), false,
+                "binary text is stripped before it reaches a menu item")
+    assertEqual(unknown.contains("o índice não está disponível"), true,
+                "unknown is surfaced, not silently rendered as up-to-date")
+}
+
 @main
 struct TestRunner {
     static func main() {
@@ -674,6 +768,7 @@ struct TestRunner {
         testShortReset()
         testOverviewProviderToggle()
         testAccountStatus()
+        testSyncStatus()
         testSystemIntegrations()
         if failures > 0 {
             print("\n\(failures) test(s) FAILED")
