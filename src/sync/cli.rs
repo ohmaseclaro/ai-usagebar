@@ -1430,6 +1430,26 @@ mod tests {
             "{rendered}"
         );
         assert!(!rendered.contains("a-suppli"), "{rendered}");
+        assert!(!outcome.initialised, "this repository already had a commit");
+
+        // 6-11: and when setup *did* put the approved README in an empty
+        // repository, the closing line reports it instead of claiming over it.
+        let initialised = render_setup(&github::setup::SetupOutcome {
+            initialised: true,
+            ..outcome
+        });
+        assert!(
+            initialised.contains("a README was added to the empty repository"),
+            "{initialised}"
+        );
+        assert!(
+            !initialised.contains("Nothing was uploaded"),
+            "a README was: {initialised}"
+        );
+        assert!(
+            initialised.contains("uploads no bundle data"),
+            "D-05 still holds for everything else: {initialised}"
+        );
     }
 
     // ---- 3-07: `sync status` learns about the repository -----------------
