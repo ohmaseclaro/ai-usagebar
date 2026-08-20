@@ -272,7 +272,8 @@ mod tests {
         .unwrap()
     }
 
-    /// **Every request body in this directory lives in `write.rs`.**
+    /// **Every request body in this directory lives in `write.rs`, and no second
+    /// HTTP client is built anywhere under `src/sync/`.**
     ///
     /// This replaces plan 3-01's guard, which read `include_str!("mod.rs")` and
     /// proved that [`Client`] had no body-carrying method. Rust lets a sibling
@@ -284,29 +285,46 @@ mod tests {
     /// What it buys, now that bytes do leave the machine: an upload or a delete
     /// added anywhere in this directory but `write.rs` fails the suite. That
     /// matters because `write.rs` is the file reviewed *as* the outbound path —
-    /// it is where the retry discipline, the body caps, and the one destructive
+    /// it is where the retry discipline, the body caps and the one destructive
     /// verb are, and a seventh write verb grown quietly in `gate.rs` would
-    /// inherit none of it.
+    /// inherit none of it. The second half closes the way around the first: a
+    /// bare `reqwest::Client` built elsewhere under `src/sync/` would carry
+    /// neither the same-origin redirect policy nor the request timeout, and
+    /// could send anything it liked without ever touching this directory.
+    ///
+    /// **The needles are assembled at runtime, and the scan covers whole files
+    /// rather than a production/test split.** Both details are load-bearing, and
+    /// both were learned by watching this guard pass on a violation. Spelling a
+    /// needle out as a literal is what forced 3-01's guard to skip the half of
+    /// the file it lives in; and the marker it skipped to also occurs inside a
+    /// doc comment in `pairing.rs`, which silently truncated that file's scanned
+    /// region to its first 76 lines. A guard that stops looking where it happens
+    /// to find a string is not a guard. Assembling the needles removes the
+    /// reason to skip anything, so nothing is skipped.
     ///
     /// A directory walk rather than a per-file `include_str!`, so a file added
-    /// to this module later is covered without anyone remembering to add it.
-    /// Reading the crate's own source is hermetic: `CARGO_MANIFEST_DIR` is a
-    /// compile-time constant, so this passes inside `makepkg`'s `check()` and
-    /// depends on no working directory.
+    /// to this module later is covered without anyone remembering. Reading the
+    /// crate's own source is hermetic: `CARGO_MANIFEST_DIR` is a compile-time
+    /// constant, so this passes inside `makepkg`'s `check()` and depends on no
+    /// working directory.
     #[test]
     fn every_request_body_in_this_directory_lives_in_write_rs() {
-        // `.delete(` is in the list even though a DELETE carries no body: it is
-        // the crate's only destructive remote verb, and it belongs beside the
-        // uploads for the same reason.
-        const BODY_CALL_SITES: [&str; 7] = [
-            ".post(",
-            ".put(",
-            ".patch(",
-            ".delete(",
-            ".body(",
-            ".multipart(",
-            ".json(",
-        ];
+        // Assembled, never written out: a literal here is a needle in the very
+        // file being scanned. "delete" is in the list even though a DELETE
+        // carries no body — it is the crate's only destructive remote verb and
+        // belongs beside the uploads for the same reason.
+        let needles: Vec<String> = [
+            "post",
+            "put",
+            "patch",
+            "delete",
+            "body",
+            "multipart",
+            "json",
+        ]
+        .iter()
+        .map(|verb| format!(".{verb}("))
+        .collect();
 
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sync/github");
         let mut scanned = 0usize;
@@ -324,15 +342,10 @@ mod tests {
             }
             scanned += 1;
             let text = std::fs::read_to_string(&path).unwrap();
-            // Everything before the test module is the shipped surface — and it
-            // is also what keeps *this* test's own needle list from tripping it.
-            let production = text.split("#[cfg(test)]").next().unwrap();
-            if path.file_name().is_some_and(|n| n == "mod.rs") {
-                saw_mod = production.contains("pub async fn get_json");
-            }
-            for needle in BODY_CALL_SITES {
+            saw_mod |= text.contains("pub async fn get_json");
+            for needle in &needles {
                 assert!(
-                    !production.contains(needle),
+                    !text.contains(needle.as_str()),
                     "REQUEST BODIES LIVE ONLY IN write.rs: `{needle}` appeared in {}. \
                      Every outbound body and every remote delete goes through \
                      src/sync/github/write.rs, which is where the retry discipline (D7), \
@@ -345,14 +358,73 @@ mod tests {
         }
 
         // Non-vacuity, both ways: a guard that asserts an absence must prove it
-        // looked at something, and that the one file it excludes was actually
-        // there to exclude. Without these a renamed directory reports green.
+        // looked at something, and that the one file it excludes was there to
+        // exclude. Without these a renamed directory reports green forever.
         assert_eq!(
             skipped, 1,
             "write.rs must be present and excluded exactly once"
         );
         assert!(scanned >= 5, "only {scanned} files walked under {dir:?}");
-        assert!(saw_mod, "mod.rs's production half was not located");
+        assert!(saw_mod, "the client's read verb was not located");
+    }
+
+    /// The second half, and the one that keeps the first from being routed
+    /// around: exactly two HTTP clients exist under `src/sync/`.
+    ///
+    /// [`Client::new`] builds the authenticated one, with the same-origin
+    /// redirect policy that stops a bearer token following a 302 (T-3-02), and
+    /// `write::follow_unauthenticated` builds the deliberately token-free one
+    /// that completes an asset download (T-4-01). A third would be a request
+    /// path with neither property.
+    #[test]
+    fn no_third_http_client_is_built_under_src_sync() {
+        let needle = format!("reqwest::{}::", "Client");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sync");
+        let mut files = Vec::new();
+        collect_rs(&root, &mut files);
+
+        // Shipped code only, and the marker is the whole `mod tests` header
+        // rather than the bare attribute: the bare form also occurs inside a doc
+        // comment in `pairing.rs`, and splitting on it there would truncate that
+        // file to its first 76 lines.
+        const TEST_MODULE: &str = "\n#[cfg(test)]\nmod tests";
+        let mut sites: Vec<String> = Vec::new();
+        let mut split_files = 0usize;
+        for path in &files {
+            let text = std::fs::read_to_string(path).unwrap();
+            if text.contains(TEST_MODULE) {
+                split_files += 1;
+            }
+            for line in text.split(TEST_MODULE).next().unwrap().lines() {
+                // The type named in a field or a doc comment is not a
+                // construction, so match the path-and-associated-item form.
+                if line.contains(&needle) {
+                    sites.push(format!("{}: {}", path.display(), line.trim()));
+                }
+            }
+        }
+        assert!(
+            split_files > 5,
+            "only {split_files} files carried a test module; the split marker has drifted"
+        );
+        assert_eq!(
+            sites.len(),
+            2,
+            "exactly two HTTP clients may be built under src/sync/ — the \
+             authenticated one in github/mod.rs and the token-free storage one in \
+             github/write.rs. Found: {sites:#?}"
+        );
+    }
+
+    fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect_rs(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
     }
 
     #[test]
