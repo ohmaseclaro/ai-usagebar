@@ -1,14 +1,17 @@
 # GitHub sync setup and authentication
 
-The sync feature will back up your usage history and configuration to a private GitHub
-repository, encrypted with a password only you hold. **This release pairs with the
-repository and verifies it; `sync push` is what uploads** — see "What this release
-does" below. This guide covers repository creation, token setup, and what the tool
-checks before it will touch your data.
+The sync feature backs up your usage history and configuration to a private GitHub
+repository, encrypted with a password only you hold. This guide covers repository
+creation, token setup, what the tool checks before it will touch your data, and the
+four commands: `sync setup`, `sync push`, `sync prune`, and `sync rekey`.
+
+`docs/sync-format.md` is the specification — the on-the-wire layout, the crypto, and
+the honest limits. This page is the one you read to use the thing; where it needs a
+detail, it links there rather than repeating it.
 
 ## Create your backup repository
 
-The tool never creates repositories on your behalf. This is by design: the GitHub token deliberately holds no repository-creation permission, which makes it structurally impossible for the token to create a public repository, even by accident. Naming the repository is a one-time, explicit act you perform once.
+**The tool never creates a repository, and it cannot.** The token you give it is configured without `Administration: write`, so repository creation is not a permission it holds — it is structurally impossible for the tool to create a repository, public or private, even by accident. You create the repository yourself, **private**, and you create a fine-grained personal access token with exactly two permissions: `Contents: read/write` and `Metadata: read`. Naming the repository is a one-time, explicit act you perform once.
 
 You can create the repository either way:
 
@@ -113,9 +116,98 @@ It is a guided, five-step flow:
 4. **The size.** Runs the same planner `sync push --dry-run` runs and shows its figures — files, raw bytes, and what a first push would actually send — then asks you to confirm.
 5. **Everything that persists.** Writes the keyfile at mode 0600, saves your category choices back into `config.toml` with comments and key order preserved, stores the token where only you can read it (the Keychain on macOS, the mode-0600 file elsewhere), and records the pairing. Nothing before this point writes anything, so declining at step 4 leaves the machine exactly as it was and the command can simply be re-run.
 
-Once setup succeeds, `ai-usagebar sync push` uploads. It re-checks that the repository is private before the first byte and again before publishing, uploads the encrypted packs as release assets, verifies each one reads back correctly, and only then publishes the snapshot pointer with a compare-and-swap precondition. **Interrupting a push before that last step leaves the previous snapshot exactly as it was** — the uploaded packs are referenced by nothing and are collected later.
+## What `sync push` does
 
-Two more commands round it out: `ai-usagebar sync prune` deletes remote data no kept snapshot still references (nothing younger than a day, so it cannot race another machine's in-flight push), and `ai-usagebar sync rekey` changes the sync password. A password change rewraps the master key and moves no pack bytes — and it is **not revocation**: anyone who already holds a copy of the old keyfile can still open it with the old password.
+```bash
+ai-usagebar sync push
+```
+
+It re-checks that the repository is private **before the first byte and again before publishing** — every push, never once at setup. A repository can be made public from the web interface between the two, and the second check is what that is for. Then it uploads the encrypted data as release assets, downloads each one back and checks it matches what was sent, and only then publishes the snapshot pointer with a compare-and-swap precondition.
+
+That last `PUT` is the only step that changes what a reader sees. Everything above it is inert: the assets are content-addressed and nothing references them yet. **Interrupting a push at any point before the flip leaves the previous snapshot exactly as it was**, byte for byte.
+
+Things worth knowing about the shape of a push:
+
+- **It uploads several assets, not one.** Your files are packed into large objects, and the bundle's own manifest and index travel in packs alongside them — so even a one-file bundle produces more than one. A separate small asset carries your wrapped master key; it is published after the second privacy check, not before, because it is the most sensitive object in the bundle.
+- **It is a handful of requests, not one per file.** A first push of ~190 chunks costs 13 HTTP requests in total: nine fixed, plus one upload and one verifying download per pack. The count tracks packs, never your data.
+- **`--dry-run` shows what a push would send** without sending it, and needs no network.
+
+### Re-running an interrupted push
+
+Re-running is safe and is the intended recovery. A push lists what is already on the release and skips anything that matches by name, size *and* upload state — all three, because GitHub creates an asset record before the body finishes, so a torn upload carries the right name. A torn asset is deleted and re-sent rather than trusted.
+
+One honest caveat. Asset names are content addresses, and the bundle's manifest — which lists every file in the bundle — travels inside a pack. **The first re-run after a push that included a file for the first time may re-send its packs**, because the manifest is written in a different order once the local index has seen that file, which changes the packs' addresses. A further re-run sends nothing at all. Nothing is lost either way; it costs bandwidth once.
+
+### What progress looks like
+
+Progress goes to **standard error**, at asset granularity — "uploading 2/3 assets — 24.0 MiB of 36.0 MiB". On a terminal it rewrites one line in place. Anywhere else — a pipe, a log file, the macOS menu bar capturing the command as a subprocess — it degrades to one plain line per completed asset, with no carriage returns and no escape sequences.
+
+**Standard output carries the result**, so piping the command stays clean:
+
+```
+uploaded:   2 pack(s), 24.0 MiB
+skipped:    3 pack(s) already present
+snapshots:  4 kept
+pruned:     1 pack(s)
+
+The snapshot is published.
+```
+
+## Retention, and what a prune deletes
+
+The remote keeps the last **10 snapshots** by default. Change it with:
+
+```toml
+[sync]
+keep_snapshots = 10
+```
+
+Old snapshots are cheap: they share packs with newer ones, so keeping ten costs little more than keeping three. `0` is refused when the config is loaded, and the value is clamped to at least one everywhere else — a zero would mean the flip that publishes a snapshot also drops it.
+
+**A prune runs automatically after every successful push.** It drops snapshot records past `keep_snapshots`, oldest first, and then deletes pack assets no surviving snapshot still references. The record always goes first: the reverse order can leave a live snapshot pointing at a pack that is gone, which is an unrestorable backup and the worst thing this feature could produce.
+
+**A prune failure is a warning, never a failed push.** If the cleanup step fails you will see:
+
+```
+warning:    the push succeeded and the snapshot is published, but cleaning up
+            superseded data did not: <reason>
+            This costs storage, not correctness. `ai-usagebar sync prune` retries it.
+```
+
+Read that literally. Your data is safe and the snapshot is published; some storage was not reclaimed. Run the on-demand form when convenient:
+
+```bash
+ai-usagebar sync prune
+```
+
+### The two guards are not interchangeable
+
+A prune is the one destructive operation in the tool, and it is protected by two rules. **Neither is sufficient alone, and neither replaces the other:**
+
+- The deletion set is computed against the pointer that **landed** — whatever the remote returned from the compare-and-swap, never the one this machine built. That closes the *committed* competitor: if another machine won the race, the landed pointer is its pointer and its packs are live.
+- **Nothing younger than 24 hours is deleted, whatever the pointer says.** That closes the *in-flight* competitor, which a landed pointer cannot see by definition: a machine that has uploaded packs and has not flipped yet is referenced by no snapshot at all. The cost is that genuine garbage lingers for a day.
+
+So a `sync prune` immediately after a push will not reclaim data that only just became superseded. That is the guard doing its job, not a failure. `docs/sync-format.md` §10 has the full rule.
+
+One case where an on-demand prune deletes nothing at all: if this bundle has **never published a snapshot pointer**, `sync prune` returns having done nothing. Without a pointer there is nothing to prove an asset is garbage against, and creating a release purely to run a delete would be wrong. A stray asset left by an interrupted first push therefore stays until a push succeeds; after that, the ordinary prune collects it.
+
+## Changing the sync password
+
+```bash
+ai-usagebar sync rekey
+```
+
+It asks for the current password, then the new one — on the terminal, or on standard input; never as a command-line argument and never through an environment variable. It unwraps the master key with the old password, rewraps *the same* master key with the new one, publishes the new keyfile, points the bundle at it, and then **deletes the old keyfile asset and re-lists to confirm it is really gone**. A delete that cannot be confirmed is reported as a failure, not a warning: this command's entire value is that the old wrapper is destroyed.
+
+Not one pack byte moves. That is the point — a password change costs 48 rewritten bytes instead of re-uploading the whole bundle.
+
+**A rekey is not revocation.** The command says so on the way in and on the way out, and it means it:
+
+> Changing the sync password rewraps the master key. Not one pack byte moves — and this is NOT revocation: anyone who already holds a copy of the old keyfile can still open it with the old password.
+
+Anyone holding a copy of the old keyfile can still open the bundle with the old password — **including data written after the change**, because the data keys never changed. Deleting the remote asset removes the copy this tool published; it cannot reach one somebody already took. Real revocation means a new master key and re-encrypting the entire bundle, which is exactly the whole-bundle re-upload this command exists to avoid. See `docs/sync-format.md` §9.
+
+If this bundle has never published a pointer, `sync rekey` changes the password locally and uploads nothing — there is no remote wrapper to replace yet. The next successful push publishes the new keyfile through the ordinary path.
 
 Check the status of your pairing with:
 
@@ -136,6 +228,13 @@ The `token:` line reports the token's **source**, never its value. The four labe
 
 The repository half and the category listing fail independently: an expired token still leaves the listing visible, so you can always see what *would* be sent — but any repository-section failure is a non-zero exit.
 
-## Bandwidth caveat
+## GitHub's acceptable-use policy
 
-GitHub's acceptable-use policy reserves the right to throttle or suspend accounts for bandwidth use significantly out of line with comparable users. A frequently-rewritten multi-gigabyte bundle could fit that profile if pushed many times. There is no rule against backing up to a private repository, but you should know the shape of the risk rather than discover it by surprise. Monitor your GitHub bandwidth usage if you plan to push frequently.
+There is **no prohibition** on using a private repository for backups, and nothing here is a warning that you are doing something wrong. But GitHub's acceptable-use policy reserves the right to throttle or suspend accounts whose bandwidth or storage use is significantly out of line with comparable users, and the profile that draws attention is a specific one: a **multi-gigabyte bundle rewritten frequently**. It is worth knowing the shape of that rather than discovering it by surprise, because your account is not a storage tier and should not be turned into one without your knowing.
+
+Two mitigations are already built in and need no configuration:
+
+- **Content-addressed packs.** An unchanged file is never re-uploaded — a push only sends what actually changed since the last one. `sync push --dry-run` shows that number before you spend it.
+- **Prune.** Superseded generations are deleted automatically after every successful push, so remote size tracks live data rather than cumulative history. In a twelve-push measurement of a growing file at `keep_snapshots = 3`, 25 assets were uploaded over the run and 14 remained.
+
+If you plan to push very frequently, `sync push --dry-run` and your GitHub account's storage page are the two numbers to watch.
