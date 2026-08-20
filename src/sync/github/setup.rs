@@ -37,10 +37,12 @@ use zeroize::Zeroizing;
 
 use crate::config::{SyncCategory, SyncConfig};
 use crate::error::{AppError, Result};
-use crate::sync::crypto::{KdfParams, Keyfile};
+use crate::sync::crypto::{KdfParams, Keyfile, Keys};
 use crate::sync::index::Index;
 use crate::sync::passphrase::{self, Strength};
+use crate::sync::push::{self, Pointer, pointer};
 use crate::sync::report::{self, DryRunReport};
+use crate::sync::restore::fetch;
 use crate::sync::{SyncRoots, plan};
 
 use super::gate;
@@ -69,6 +71,20 @@ pub trait SetupPrompt {
     /// no-recovery warning; the implementation either accepts it or supplies
     /// its own. Called again when the strength floor refuses a supplied one.
     fn passphrase(&mut self, generated: &str) -> Result<Zeroizing<String>>;
+
+    /// Step 3 on a machine **joining** a bundle this repository already holds.
+    ///
+    /// A method of its own rather than [`SetupPrompt::passphrase`] with an
+    /// empty `generated`, because there is nothing to offer: the password that
+    /// opens the published keyfile was chosen on another machine and this build
+    /// cannot mint an alternative to it. Reused, [`TtyPrompt`] would print
+    /// *"Press Enter to take the generated passphrase"* over `""` — an
+    /// instruction to submit no password at all.
+    ///
+    /// Called again while the keyfile refuses to open, up to
+    /// [`JOIN_ATTEMPTS`] times, the way the generate path re-prompts on a
+    /// passphrase under the strength floor.
+    fn existing_passphrase(&mut self) -> Result<Zeroizing<String>>;
 
     /// Step 1, and the gate's own input: whether `credentials` is in the answer
     /// is what decides D-04's public-repo carve-out, so this is asked before the
@@ -145,6 +161,15 @@ impl SetupPrompt for TtyPrompt {
         // Never argv, never an environment variable (T-3-37, Phase 1's rule).
         let typed = passphrase::read_line(std::io::stdin().lock())?;
         Ok(typed)
+    }
+
+    fn existing_passphrase(&mut self) -> Result<Zeroizing<String>> {
+        println!(
+            "Type the sync password this bundle was created with.\n\
+             It is echoed — this build has no hidden-input dependency."
+        );
+        // Never argv, never an environment variable (T-3-37, Phase 1's rule).
+        passphrase::read_line(std::io::stdin().lock())
     }
 
     fn categories(&mut self, current: &[SyncCategory]) -> Result<Vec<SyncCategory>> {
@@ -312,36 +337,31 @@ pub async fn run(
     }
 
     // ---- Step 3: the passphrase, and the keyfile -------------------------
-    let kdf = prompt.kdf();
-    let generated = passphrase::generate()?;
-    prompt.say("\n3/5  A sync password protects the bundle.");
-    prompt.say(passphrase::NO_RECOVERY);
-    prompt.say(passphrase::OFFLINE_ATTACK_NOTE);
-    // Shown exactly once — not re-displayed on a re-prompt below.
-    prompt.say(&format!("\n     generated passphrase:  {}\n", &*generated));
-
-    let chosen_pw = loop {
-        let candidate = prompt.passphrase(&generated)?;
-        let candidate = if candidate.is_empty() {
-            generated.clone()
-        } else {
-            candidate
-        };
-        match passphrase::check(&candidate, kdf) {
-            Strength::Rejected(why) => prompt.say(&format!("     refused: {why}")),
-            Strength::Weak(why) => {
-                prompt.say(&format!("     {why}"));
-                break candidate;
-            }
-            Strength::Strong => break candidate,
-        }
+    //
+    // **Which of the two shapes this is comes off the remote, not off this
+    // machine.** A repository that already holds a published bundle already has
+    // a password, and minting a second master key for it produced a machine
+    // that could pull and never push: `restore` opens the keyfile the *pointer*
+    // names, so a fresh local one was never consulted, while
+    // `upload::assert_keyfile_is_current` correctly refused to republish a
+    // divergent wrapper. Read-only was the whole failure — two machines
+    // continuing each other's work is what this milestone is for.
+    //
+    // The read sits here rather than beside the gate on purpose: step 2 is the
+    // private-repo refusal and must stay the first thing that touches this
+    // repository, and steps 1, 2 and 4 do not move.
+    let published = pointer::load(
+        &client,
+        &repo,
+        &push::repo_id_for(drift.record.repo_id),
+        now,
+    )
+    .await?
+    .0;
+    let (keyfile_bytes, keys) = match published {
+        Some(bundle) => join(prompt, &client, &repo, &bundle, now).await?,
+        None => generate(prompt)?,
     };
-
-    // Created, **not written**: see step 5. F-10 — the file used to land here,
-    // before the confirmation that can abort, and its own existence then refused
-    // the re-run, stranding a user who declined behind a passphrase they were
-    // shown once and told there is no recovery for.
-    let (keyfile, keys) = Keyfile::create(chosen_pw.as_bytes(), kdf)?;
 
     // ---- Step 4: the size ------------------------------------------------
     let index = Index::at(&roots.index_file)?;
@@ -381,7 +401,7 @@ pub async fn run(
     // ---- Step 5: everything that persists --------------------------------
     // Nothing above this line writes. The confirmation is the last thing that
     // can abort, so it is the last thing before the first write (F-10).
-    write_keyfile(&keyfile_path, &keyfile)?;
+    write_keyfile(&keyfile_path, &keyfile_bytes)?;
     prompt.say(&format!(
         "\n5/5  keyfile written: {}",
         keyfile_path.display()
@@ -412,6 +432,124 @@ pub async fn run(
         raw_bytes,
         would_send,
     })
+}
+
+/// Passphrase attempts a joining machine gets before setup gives up.
+///
+/// A cap rather than the generate path's unbounded re-prompt, because the two
+/// loops end differently: a weak passphrase is refused by a pure check the user
+/// can satisfy by typing a longer one, while a wrong password against a
+/// published keyfile is an Argon2id derivation and an AEAD unwrap per attempt,
+/// driven by whatever is on stdin. Three is enough for a typo and not enough
+/// for a script.
+const JOIN_ATTEMPTS: u32 = 3;
+
+/// Step 3, the first-machine shape: mint a master key under a password this
+/// machine chooses.
+///
+/// Returns the **bytes to persist** rather than a [`Keyfile`], so step 5 has one
+/// write for both shapes. Nothing here writes: see step 5 and F-10.
+fn generate(prompt: &mut dyn SetupPrompt) -> Result<(Vec<u8>, Keys)> {
+    let kdf = prompt.kdf();
+    let generated = passphrase::generate()?;
+    prompt.say("\n3/5  A sync password protects the bundle.");
+    prompt.say(passphrase::NO_RECOVERY);
+    prompt.say(passphrase::OFFLINE_ATTACK_NOTE);
+    // Shown exactly once — not re-displayed on a re-prompt below.
+    prompt.say(&format!("\n     generated passphrase:  {}\n", &*generated));
+
+    let chosen_pw = loop {
+        let candidate = prompt.passphrase(&generated)?;
+        let candidate = if candidate.is_empty() {
+            generated.clone()
+        } else {
+            candidate
+        };
+        match passphrase::check(&candidate, kdf) {
+            Strength::Rejected(why) => prompt.say(&format!("     refused: {why}")),
+            Strength::Weak(why) => {
+                prompt.say(&format!("     {why}"));
+                break candidate;
+            }
+            Strength::Strong => break candidate,
+        }
+    };
+
+    // Created, **not written**: see step 5. F-10 — the file used to land here,
+    // before the confirmation that can abort, and its own existence then refused
+    // the re-run, stranding a user who declined behind a passphrase they were
+    // shown once and told there is no recovery for.
+    let (keyfile, keys) = Keyfile::create(chosen_pw.as_bytes(), kdf)?;
+    Ok((serde_json::to_vec_pretty(&keyfile)?, keys))
+}
+
+/// Step 3, the second-machine shape: adopt the keyfile the published pointer
+/// names, under the password it was created with.
+///
+/// **[`Keyfile::create`] is not reachable from here, deliberately.** A generated
+/// passphrase shown to a user whose bundle it cannot open is worse than a
+/// refusal: they are told there is no recovery for a string that was never a
+/// key to anything.
+///
+/// # These bytes are hostile until they open
+///
+/// They came off a remote the format treats as such, and the pointer that named
+/// them is the one unauthenticated link in the chain. The **only** thing that
+/// authenticates them is that the passphrase unwraps the master key — an AEAD
+/// tag over the keyfile's own `{format, kdf}` associated data — so a failure
+/// here is refused and nothing is returned to persist. It is deliberately one
+/// message for "wrong password" and "not this bundle's keyfile" alike;
+/// separating them is the oracle Phase 1 refused to build.
+///
+/// The bytes are returned **verbatim**, so step 5 writes a file byte-identical
+/// to the published asset. That is what makes this machine's first push
+/// *accepted*: `upload::assert_keyfile_is_current` compares the content address
+/// of the local keyfile's canonical form against `Pointer.keyfile`, and a
+/// re-serialization here would be a second place for the two to diverge.
+async fn join(
+    prompt: &mut dyn SetupPrompt,
+    client: &Client,
+    repo: &RepoRef,
+    published: &Pointer,
+    now: DateTime<Utc>,
+) -> Result<(Vec<u8>, Keys)> {
+    let bytes = fetch::published_keyfile(client, repo, &published.keyfile, now).await?;
+    let keyfile: Keyfile = serde_json::from_slice(&bytes).map_err(|_| {
+        AppError::Other(format!(
+            "the keyfile asset {:?} this repository's snapshot pointer names is not a \
+             readable sync keyfile, so this machine cannot join the bundle. Nothing was \
+             written here.",
+            published.keyfile
+        ))
+    })?;
+
+    prompt.say(
+        "\n3/5  This repository already holds a bundle, so this machine joins it rather than \
+         starting a second one.",
+    );
+    prompt.say(
+        "     Type the sync password that bundle was created with. It is not stored anywhere \
+         this tool can read, and there is no recovery for it by design.",
+    );
+
+    for attempt in 1..=JOIN_ATTEMPTS {
+        let candidate = prompt.existing_passphrase()?;
+        if let Ok(keys) = keyfile.open(candidate.as_bytes()) {
+            return Ok((bytes, keys));
+        }
+        prompt.say(&format!(
+            "     refused: that password does not open this bundle's keyfile \
+             (attempt {attempt} of {JOIN_ATTEMPTS})."
+        ));
+    }
+
+    Err(AppError::Other(format!(
+        "the sync password did not open this bundle's keyfile in {JOIN_ATTEMPTS} attempts.\n\
+         Nothing was written on this machine — no keyfile, no config change, no stored token — \
+         so re-running setup with the right password is all this takes. It is the password the \
+         bundle was created with on the first machine; it cannot be reset from here, and this \
+         tool has no copy of it."
+    )))
 }
 
 /// `<config_dir>/sync-token` — the same file [`token::TokenChain::production`]
@@ -497,9 +635,14 @@ fn existing_keyfile_message(path: &Path) -> String {
 /// Atomically, then mode 0600 — the same belt-and-braces `anchor::write_to` and
 /// the Settings overlay apply. The temp file lands in the destination's own
 /// directory, never `/tmp`.
-fn write_keyfile(path: &Path, keyfile: &Keyfile) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(keyfile)?;
-    crate::cache::atomic_write(path, &bytes)?;
+///
+/// Takes **bytes**, not a [`Keyfile`]: the two step-3 shapes disagree about what
+/// the file should contain. [`generate`] pretty-prints its own new keyfile;
+/// [`join`] writes the published asset verbatim, because byte-identity with
+/// `Pointer.keyfile`'s content address is what makes this machine's first push
+/// accepted rather than refused as a superseded wrapper.
+fn write_keyfile(path: &Path, bytes: &[u8]) -> Result<()> {
+    crate::cache::atomic_write(path, bytes)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -562,6 +705,11 @@ pub(crate) struct Script {
     pub said: Vec<String>,
     /// Answers for `passphrase`, in order. Exhausted ⇒ the generated one.
     pub passphrases: Vec<String>,
+    /// Answers for `existing_passphrase`, in order — the join path's ask, which
+    /// has no generated alternative to fall back to. Exhausted ⇒ `""`, which
+    /// opens nothing, so a script that runs out fails loudly rather than
+    /// silently taking a password it was never given.
+    pub existing: Vec<String>,
     /// `None` keeps whatever the config already had.
     pub categories: Option<Vec<SyncCategory>>,
     pub confirm: bool,
@@ -606,6 +754,16 @@ impl SetupPrompt for Double {
         };
         Ok(Zeroizing::new(next))
     }
+    fn existing_passphrase(&mut self) -> Result<Zeroizing<String>> {
+        let mut s = self.0.borrow_mut();
+        s.reached.push("existing_passphrase".into());
+        let next = if s.existing.is_empty() {
+            String::new()
+        } else {
+            s.existing.remove(0)
+        };
+        Ok(Zeroizing::new(next))
+    }
     fn categories(&mut self, current: &[SyncCategory]) -> Result<Vec<SyncCategory>> {
         let mut s = self.0.borrow_mut();
         s.reached.push("categories".into());
@@ -638,6 +796,7 @@ impl SetupPrompt for Double {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use base64::Engine as _;
     use std::cell::RefCell;
     use std::fs;
     use std::rc::Rc;
@@ -684,7 +843,12 @@ mod tests {
         }
     }
 
-    /// One private-repo mock, one scripted run.
+    /// One private-repo mock, an empty repository, one scripted run.
+    ///
+    /// The 404 on `sync/pointer.json` is what makes this the **first** machine:
+    /// step 3 reads the pointer to decide whether to mint a master key or join
+    /// an existing bundle, so a fixture without it would answer that question
+    /// with mockito's 501.
     async fn drive(
         cfg: &SyncConfig,
         dir: &TempDir,
@@ -699,8 +863,114 @@ mod tests {
             .with_body(body)
             .create_async()
             .await;
+        let _p = no_pointer(&mut server).await;
         run(
             cfg,
+            &roots_at(dir),
+            &endpoints_at(&server.url()),
+            &chain(),
+            &mut Double(Rc::clone(script)),
+            now(),
+        )
+        .await
+    }
+
+    /// "Nothing has ever been pushed here."
+    async fn no_pointer(server: &mut mockito::ServerGuard) -> mockito::Mock {
+        server
+            .mock("GET", "/repos/o/n/contents/sync/pointer.json")
+            .with_status(404)
+            .with_body(r#"{"message":"Not Found"}"#)
+            .create_async()
+            .await
+    }
+
+    /// A published bundle: the pointer, the release it hangs off, the asset
+    /// listing, and the keyfile bytes themselves.
+    ///
+    /// `asset` is served verbatim, so a corrupted-keyfile case is this same
+    /// fixture with different bytes — and the byte-identity assertion compares
+    /// against exactly what the fake handed over.
+    async fn publish(server: &mut mockito::ServerGuard, name: &str, asset: Vec<u8>) {
+        let pointer = serde_json::json!({
+            "format": 1,
+            "repo_id": "github:1",
+            "keyfile": name,
+            "snapshots": [],
+        })
+        .to_string();
+        server
+            .mock("GET", "/repos/o/n/contents/sync/pointer.json")
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"sha":"blob1","content":"{}"}}"#,
+                base64::engine::general_purpose::STANDARD.encode(&pointer)
+            ))
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/repos/o/n/releases/tags/ai-usagebar-sync-v1")
+            .with_status(200)
+            .with_body(r#"{"id":9}"#)
+            .create_async()
+            .await;
+        server
+            .mock("GET", mockito::Matcher::Regex("/releases/9/assets".into()))
+            .with_status(200)
+            .with_body(format!(
+                r#"[{{"id":42,"name":"{name}","size":{},"state":"uploaded",
+                     "created_at":"2023-11-14T22:13:20Z"}}]"#,
+                asset.len()
+            ))
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/repos/o/n/releases/assets/42")
+            .with_status(200)
+            .with_body(asset)
+            .create_async()
+            .await;
+    }
+
+    /// A keyfile the fake publishes, at parameters a test can afford, plus the
+    /// canonical bytes and asset name that go with it.
+    ///
+    /// `Keyfile::create` is the production verb and enforces
+    /// `MIN_KDF_MEMORY_KIB`; 8 MiB of Argon2id is milliseconds, which is what
+    /// keeps the AUR `check()` inside its budget on an installer's machine.
+    fn published_keyfile(pw: &str) -> (Vec<u8>, String) {
+        let (keyfile, _keys) = Keyfile::create(
+            pw.as_bytes(),
+            KdfParams {
+                m_kib: crate::sync::crypto::MIN_KDF_MEMORY_KIB,
+                t: 1,
+                p: 1,
+            },
+        )
+        .unwrap();
+        let bytes = serde_json::to_vec(&keyfile).unwrap();
+        let name =
+            crate::sync::push::keyfile_asset_name(&crate::sync::crypto::content_address(&bytes));
+        (bytes, name)
+    }
+
+    /// One already-published-bundle mock set, one scripted run.
+    async fn drive_joining(
+        dir: &TempDir,
+        asset_name: &str,
+        asset: Vec<u8>,
+        script: &Rc<RefCell<Script>>,
+    ) -> Result<SetupOutcome> {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/repos/o/n")
+            .with_status(200)
+            .with_body(PRIVATE)
+            .create_async()
+            .await;
+        publish(&mut server, asset_name, asset).await;
+        run(
+            &cfg_for(Some("o/n")),
             &roots_at(dir),
             &endpoints_at(&server.url()),
             &chain(),
@@ -1326,5 +1596,149 @@ mod tests {
         drive(&cfg_for(Some("o/n")), &dir, PRIVATE, 200, &again)
             .await
             .expect("a declined setup is re-runnable");
+    }
+
+    // ---- 6-07: the second machine ----------------------------------------
+
+    /// The gap, and the reason it made a second machine read-only: setup always
+    /// called `Keyfile::create`, so the local keyfile's content address never
+    /// matched `Pointer.keyfile`. Pull worked (it opens the keyfile the pointer
+    /// names), push was refused as a superseded wrapper.
+    ///
+    /// Byte-identity is the assertion rather than "opens with the same
+    /// password", because it is byte-identity that
+    /// `upload::assert_keyfile_is_current` compares: two keyfiles wrapping the
+    /// same master key under the same password are still two different assets.
+    #[tokio::test]
+    async fn a_repository_that_already_holds_a_bundle_is_joined_not_re_keyed() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("config.toml"), "[sync]\n").unwrap();
+        let (asset, name) = published_keyfile("the first machine's password");
+        let script = Script::new();
+        script.borrow_mut().existing = vec!["the first machine's password".into()];
+
+        let out = drive_joining(&dir, &name, asset.clone(), &script)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fs::read(&out.keyfile).unwrap(),
+            asset,
+            "the adopted keyfile is the published asset, byte for byte"
+        );
+        let reached = script.borrow().reached.clone();
+        assert_eq!(reached[0], "categories", "{reached:?}");
+        assert_eq!(reached[1], "existing_passphrase", "{reached:?}");
+        assert!(reached[2].starts_with("confirm:"), "{reached:?}");
+        assert!(
+            !reached.iter().any(|r| r == "passphrase"),
+            "the generate path's ask has no answer here: {reached:?}"
+        );
+        let said = script.borrow().said.join("\n");
+        assert!(
+            !said.contains("generated passphrase:"),
+            "nothing was generated, so nothing was shown as generated: {said}"
+        );
+        assert!(said.contains("already holds a bundle"), "{said}");
+        assert!(!said.contains("the first machine's password"), "{said}");
+    }
+
+    /// A wrong password must leave **no** keyfile: `existing_keyfile_message`
+    /// then refuses the re-run, which would strand the user behind a file that
+    /// opens with a password nobody has.
+    #[tokio::test]
+    async fn a_wrong_passphrase_on_join_refuses_and_writes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let roots = roots_at(&dir);
+        let (asset, name) = published_keyfile("the first machine's password");
+        let script = Script::new();
+        script.borrow_mut().existing = vec!["wrong".into(), "also wrong".into(), "still".into()];
+
+        let err = drive_joining(&dir, &name, asset, &script)
+            .await
+            .expect_err("that password opens nothing");
+
+        let text = err.to_string();
+        assert!(text.contains("3 attempts"), "{text}");
+        assert!(text.contains("Nothing was written"), "{text}");
+        assert!(
+            !text.contains("wrong"),
+            "the attempts are not echoed: {text}"
+        );
+        assert_eq!(
+            script
+                .borrow()
+                .reached
+                .iter()
+                .filter(|r| *r == "existing_passphrase")
+                .count(),
+            3,
+            "capped, so a script cannot spin: {:?}",
+            script.borrow().reached
+        );
+        assert!(
+            !crate::sync::cli::keyfile_path(&roots).exists(),
+            "a wrong password leaves no keyfile to refuse the re-run"
+        );
+        assert!(!pairing::default_path(&roots).exists(), "no pairing record");
+        assert!(script.borrow().stored.is_empty(), "no stored token");
+    }
+
+    /// The asset is remote-chosen bytes. Unreadable ones are refused before the
+    /// user is asked for anything — there is nothing a password could do.
+    #[tokio::test]
+    async fn a_corrupted_published_keyfile_is_refused_before_the_password_ask() {
+        let dir = TempDir::new().unwrap();
+        let script = Script::new();
+        let err = drive_joining(
+            &dir,
+            "sync-keyfile-deadbeef.json",
+            b"not a keyfile".to_vec(),
+            &script,
+        )
+        .await
+        .expect_err("that asset is not a keyfile");
+
+        assert!(
+            err.to_string().contains("not a readable sync keyfile"),
+            "{err}"
+        );
+        assert!(
+            !script
+                .borrow()
+                .reached
+                .iter()
+                .any(|r| r == "existing_passphrase"),
+            "{:?}",
+            script.borrow().reached
+        );
+        assert!(!crate::sync::cli::keyfile_path(&roots_at(&dir)).exists());
+    }
+
+    /// The first machine is untouched: nothing published, so step 3 generates
+    /// exactly as it did before, and shows the passphrase once.
+    #[tokio::test]
+    async fn an_empty_repository_still_generates_and_shows_the_passphrase_once() {
+        let dir = TempDir::new().unwrap();
+        let script = Script::new();
+        let out = drive(&cfg_for(Some("o/n")), &dir, PRIVATE, 200, &script)
+            .await
+            .unwrap();
+
+        assert!(out.keyfile.exists());
+        let said = script.borrow().said.join("\n");
+        assert_eq!(
+            said.matches("generated passphrase:").count(),
+            1,
+            "shown exactly once: {said}"
+        );
+        assert!(
+            !script
+                .borrow()
+                .reached
+                .iter()
+                .any(|r| r == "existing_passphrase"),
+            "there is no existing passphrase to ask for"
+        );
     }
 }
