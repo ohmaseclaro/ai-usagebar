@@ -61,21 +61,25 @@ pub trait SetupPrompt {
     fn say(&mut self, line: &str);
 
     /// A yes/no with a default — step 4's size confirmation, and anything else
-    /// that needs one.
+    /// that needs one. It is the last thing that can abort: nothing persists
+    /// until it has passed.
     fn confirm(&mut self, question: &str, default_yes: bool) -> Result<bool>;
 
-    /// Step 2. `generated` has already been displayed with Phase 1's
+    /// Step 3. `generated` has already been displayed with Phase 1's
     /// no-recovery warning; the implementation either accepts it or supplies
     /// its own. Called again when the strength floor refuses a supplied one.
     fn passphrase(&mut self, generated: &str) -> Result<Zeroizing<String>>;
 
-    /// Step 3. Returns the categories to keep, in any order.
+    /// Step 1, and the gate's own input: whether `credentials` is in the answer
+    /// is what decides D-04's public-repo carve-out, so this is asked before the
+    /// gate rather than after it (F-2). Returns the categories to keep, in any
+    /// order.
     fn categories(&mut self, current: &[SyncCategory]) -> Result<Vec<SyncCategory>>;
 
     /// The KDF cost a new keyfile is written at.
     ///
     /// A seam, not a question: the shipped default is 1 GiB and takes about a
-    /// second and a half, which every test that reaches step 2 would otherwise
+    /// second and a half, which every test that reaches step 3 would otherwise
     /// pay — and the AUR `check()` runs those tests during `makepkg`. Tests
     /// override it with [`crate::sync::crypto::MIN_KDF_MEMORY_KIB`].
     fn kdf(&self) -> KdfParams {
@@ -1021,7 +1025,7 @@ mod tests {
         assert!(script.borrow().cleared.is_empty(), "a 403 must not clear");
     }
 
-    // ---- step 2 ----------------------------------------------------------
+    // ---- step 3: the passphrase and the keyfile --------------------------
 
     #[tokio::test]
     async fn the_keyfile_is_written_owner_only_inside_the_injected_directory() {
@@ -1088,14 +1092,17 @@ mod tests {
             .await
             .expect_err("a keyfile is already there");
         assert!(err.to_string().contains("will not overwrite"), "{err}");
-        assert!(script.borrow().reached.is_empty(), "before step 2's prompt");
+        assert!(
+            script.borrow().reached.is_empty(),
+            "before any prompt at all — it is a local precondition, not a gate decision"
+        );
         assert_eq!(
             fs::read_to_string(&existing).unwrap(),
             "{\"already\":\"here\"}"
         );
     }
 
-    // ---- step 3 ----------------------------------------------------------
+    // ---- step 1: the categories ------------------------------------------
 
     #[tokio::test]
     async fn a_toggled_category_lands_in_the_injected_config_and_reads_back() {
@@ -1149,7 +1156,8 @@ mod tests {
         assert!(!script.borrow().reached.is_empty(), "the flow continued");
     }
 
-    /// Credentials **on**: the same repository stops at step 1.
+    /// Credentials **on**: the same repository stops at the gate, having asked
+    /// only the one question the gate needed answered.
     #[tokio::test]
     async fn a_public_repository_with_credentials_on_stops_before_the_passphrase() {
         let dir = TempDir::new().unwrap();
