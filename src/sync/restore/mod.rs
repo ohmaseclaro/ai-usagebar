@@ -199,11 +199,7 @@ impl BackupRecord {
     /// The copy-pasteable undo, printed on both the success and the
     /// partial-failure path.
     pub fn rollback_command(&self) -> String {
-        format!(
-            "tar -xzf {} -C {}",
-            self.archive.display(),
-            self.root.display()
-        )
+        backup::rollback_command(self)
     }
 }
 
