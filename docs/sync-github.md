@@ -72,6 +72,8 @@ The tool looks for the token in this order:
 
 4. **`gh auth token`** (convenience fallback) — If the GitHub CLI is installed and logged in, the tool can use its authentication. This is never required; it is a convenience so you do not need to manage a separate token.
 
+If GitHub rejects the token with a 401, the tool clears **only the store the rejected token came from** — the Keychain item if it came from the Keychain, the `sync-token` file if it came from the file, and nothing at all if it came from `AI_USAGEBAR_SYNC_TOKEN` or from `gh`. Those two are not the tool's to delete, and a 401 on one of them says nothing about a stored token that was never sent. The message names which of them to change instead: while the environment variable is set, a replacement written anywhere else is never reached.
+
 The tool never writes the token into `config.toml`. Inline API keys there are a deliberate choice for read-only provider keys (Claude, OpenAI, Z.AI) because a leaked key is a minor risk on a read-only endpoint. A token that can write to a repository is a different class of secret, so it lives in a separate, mode-0600 location (or in the Keychain on macOS).
 
 ### Why not D-Bus secret service?
@@ -105,11 +107,11 @@ This is not optional. If you backed up credentials before you made the repositor
 
 It is a guided, five-step flow:
 
-1. **The repository and the gate.** Resolves the token, fetches the repository's details, and refuses unless it passes every condition above. Every refusal stops *here* — you are never asked to choose a sync password for a repository that is about to be rejected.
-2. **The sync password.** Offers a generated 20-character passphrase (press Enter to take it) or accepts your own, subject to a length floor. There is no recovery: the password is the only thing that can open the bundle. A keyfile is written to `<config dir>/sync/keyfile.json` at mode 0600. If one is already there, setup stops rather than overwriting it — overwriting a keyfile makes every bundle written under the old password permanently unreadable.
-3. **The categories.** Shows what gets bundled and lets you toggle each one, `credentials` included and explicit. Your choices are written back into `config.toml` with comments and key order preserved.
+1. **The categories.** Shows what gets bundled and lets you toggle each one, `credentials` included and explicit. This comes first because it is an *input to the gate*: whether `credentials` is in the bundle is what decides whether a public repository is refused outright or merely warned about, and the gate has to be asked the question you actually answered.
+2. **The repository and the gate.** Resolves the token, fetches the repository's details, and refuses unless it passes every condition above, judged against the categories you just chose. Every refusal stops *here* — you are never asked to choose a sync password for a repository that is about to be rejected. On a first pairing it names the repository and owner ids it is pairing with; if this machine was already paired, that line means the pairing record went missing, which is worth investigating.
+3. **The sync password.** Offers a generated 20-character passphrase (press Enter to take it) or accepts your own, subject to a length floor. There is no recovery: the password is the only thing that can open the bundle. If a keyfile is already at `<config dir>/sync/keyfile.json`, setup stops before anything else — overwriting one makes every bundle written under the old password permanently unreadable.
 4. **The size.** Runs the same planner `sync push --dry-run` runs and shows its figures — files, raw bytes, and what a first push would actually send — then asks you to confirm.
-5. **Ready.** Stores the token where only you can read it (the Keychain on macOS, the mode-0600 file elsewhere), records the pairing, and says plainly that nothing was uploaded.
+5. **Everything that persists.** Writes the keyfile at mode 0600, saves your category choices back into `config.toml` with comments and key order preserved, stores the token where only you can read it (the Keychain on macOS, the mode-0600 file elsewhere), and records the pairing. Nothing before this point writes anything, so declining at step 4 leaves the machine exactly as it was and the command can simply be re-run.
 
 Pushing to the repository arrives in a later release. If you need to back up your data today, this phase verifies the foundation is in place; it does not yet upload anything.
 

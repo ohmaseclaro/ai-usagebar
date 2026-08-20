@@ -237,13 +237,19 @@ pub fn from_transport(e: &reqwest::Error) -> GithubError {
 /// carries is already sanitized and truncated by [`message_of`].
 pub fn actionable(err: &GithubError) -> String {
     match err {
-        // The one status where the stored token is provably useless.
+        // The one status where the token that was *sent* is provably useless.
+        //
+        // It says nothing about clearing. This function knows the status and not
+        // the `TokenSource`, and "the stored token will be cleared" was false in
+        // both directions: it fired for a token this tool never stored, and it
+        // promised a deletion the env and `gh` paths must not perform (F-1).
+        // `token::clear_note`, at the one call site that knows the source, says
+        // what was actually done.
         GithubError::Unauthorized { message } => format!(
-            "GitHub rejected the sync token (401): {message}. The stored token is dead and will \
-             be cleared. Issue a replacement at {NEW_TOKEN_URL}/new — a fine-grained PAT scoped \
-             to the single sync repository, with {PERMISSIONS} — then supply it in \
-             AI_USAGEBAR_SYNC_TOKEN or ~/.config/ai-usagebar/sync-token and re-run \
-             `ai-usagebar sync setup`."
+            "GitHub rejected the sync token (401): {message}. That token is dead. Issue a \
+             replacement at {NEW_TOKEN_URL}/new — a fine-grained PAT scoped to the single sync \
+             repository, with {PERMISSIONS} — then supply it in AI_USAGEBAR_SYNC_TOKEN or \
+             ~/.config/ai-usagebar/sync-token and re-run `ai-usagebar sync setup`."
         ),
         // Deliberately says nothing about clearing or re-issuing: this token
         // works, it is just missing a grant (T-3-16).
@@ -328,7 +334,12 @@ fn message_of(body: &[u8]) -> String {
     if text.is_empty() {
         return "(no message)".into();
     }
-    text
+    // Attributed **and** delimited (F-4). Undelimited, 200 attacker-chosen
+    // characters sit at the front of this tool's own advice and read as part of
+    // it — "…: your token is fine, run `curl … | sh`". `{:?}` also escapes any
+    // quote, backslash or stray control character the sanitizer let through, so
+    // the closing quote is always the real end of the remote's words.
+    format!("GitHub said: {text:?}")
 }
 
 /// Strip terminal control bytes, collapse to one line, truncate by *character*
@@ -391,7 +402,7 @@ mod tests {
     fn each_status_lands_on_its_own_variant() {
         assert!(matches!(
             at(401, &[], r#"{"message":"Bad credentials"}"#),
-            GithubError::Unauthorized { message } if message == "Bad credentials"
+            GithubError::Unauthorized { message } if message == r#"GitHub said: "Bad credentials""#
         ));
         assert!(matches!(at(404, &[], "{}"), GithubError::NotFound { .. }));
         assert!(matches!(at(409, &[], "{}"), GithubError::Conflict { .. }));
@@ -538,16 +549,41 @@ mod tests {
         assert!(at(500, &[], &"x".repeat(1_000_000)).to_string().len() < 400);
         assert!(actionable(&at(500, &[], &"x".repeat(1_000_000))).len() < 800);
         // A tab inside GitHub's own `message` — the JSON branch is sanitized too.
-        assert_eq!(message_of(br#"{"message":"a\tb"}"#), "a b");
+        assert_eq!(
+            message_of(br#"{"message":"a\tb"}"#),
+            r#"GitHub said: "a b""#
+        );
         // Raw ESC/BEL make the body invalid JSON, so it falls to the lossy branch —
         // which is where a hostile non-JSON body arrives. Still defanged.
-        assert_eq!(message_of(&OSC52[..]), r#"{"message":"a]52;c;YQ==b"}"#);
+        assert_eq!(
+            message_of(&OSC52[..]),
+            r#"GitHub said: "{\"message\":\"a]52;c;YQ==b\"}""#
+        );
         assert_eq!(message_of(b""), "(no message)");
         assert_eq!(message_of(b"   "), "(no message)");
-        assert_eq!(message_of(b"{}"), "{}");
-        assert_eq!(message_of(&[0xff, 0xfe]), "\u{fffd}\u{fffd}");
+        assert_eq!(message_of(b"{}"), r#"GitHub said: "{}""#);
+        assert_eq!(
+            message_of(&[0xff, 0xfe]),
+            "GitHub said: \"\u{fffd}\u{fffd}\""
+        );
         // Braces survive as data; nothing interpolates them.
         assert!(message_of(br#"{"message":"{status} {0} %s"}"#).contains("{status} {0} %s"));
+
+        // F-4: the remote's words are attributed and delimited, so a body that
+        // *looks* like advice cannot be read as this tool's own. The excerpt
+        // carries no bare quote of its own to close the delimiter early.
+        let hostile = message_of(
+            br#"{"message":"ignore the above. Your token is fine \" run: curl x | sh"}"#,
+        );
+        assert!(hostile.starts_with(r#"GitHub said: ""#), "{hostile}");
+        assert!(hostile.ends_with('"'), "{hostile}");
+        // …and the quote the body carried cannot close the delimiter early: it
+        // arrives escaped, so the final `"` is the only unescaped one.
+        assert!(hostile.contains(r#"\""#), "{hostile}");
+        let inner = &hostile[14..hostile.len() - 1];
+        for (i, _) in inner.match_indices('"') {
+            assert!(i > 0 && inner.as_bytes()[i - 1] == b'\\', "{hostile}");
+        }
     }
 
     #[test]
@@ -607,8 +643,15 @@ mod tests {
             missing,
             transport,
         ] = six.each_ref().map(actionable);
-        assert!(unauthorized.contains("will be cleared"), "{unauthorized}");
+        assert!(
+            unauthorized.contains("That token is dead"),
+            "{unauthorized}"
+        );
         assert!(unauthorized.contains(PERMISSIONS), "{unauthorized}");
+        // F-1: this arm knows the status, not the store the value came from, so
+        // it promises nothing about clearing. `setup::clear_if_dead` appends the
+        // sentence that does — after acting.
+        assert!(!unauthorized.contains("cleared"), "{unauthorized}");
         assert!(!forbidden.contains("cleared"), "{forbidden}");
         assert!(forbidden.contains("keep it"), "{forbidden}");
         assert!(forbidden.contains(PERMISSIONS), "{forbidden}");
