@@ -55,7 +55,7 @@
 //!
 //! ## Calibration and shape probes (encrypted sync, plans 1-08, 2-06 and 3-06)
 //!
-//! Five probes at the bottom of this file are not vendor smoke tests. They
+//! Six probes at the bottom of this file are not vendor smoke tests. They
 //! answer sizing and API-shape questions the encrypted-sync format would
 //! otherwise have to guess at, and they live here because this is where the
 //! project keeps every test allowed to cost real seconds, real gibibytes, or a
@@ -86,6 +86,12 @@
 //!   and sealed size of this machine's default bundle, per category. Needs no
 //!   credential and no network:
 //!   `cargo test --release --test live -- --ignored --nocapture cal4_`
+//! - **CAL-5**, `cal5_release_asset_state_and_digest`: what `state` a release
+//!   asset reports when its upload is cut off mid-body, and whether GitHub
+//!   populates `digest` on a complete one — the two MEDIUM-confidence answers
+//!   the resume scan and D3's verifying download are built around. It **writes
+//!   and deletes release assets**, so it wants a throwaway private repo and a
+//!   `Contents: write` PAT; credential-gated and skips cleanly when unset.
 //! - `permissions_shape_for_a_fine_grained_contents_token`: whether
 //!   `permissions.admin` on `GET /repos/{owner}/{repo}` is a property of the
 //!   token or of the user, which is what decides whether D-03's
@@ -1427,4 +1433,242 @@ fn sync_token_keychain_live_round_trip() {
         None,
         "the probe left nothing on the login Keychain"
     );
+}
+
+/// **CAL-5** — what `state` does a release asset report when its upload is cut
+/// off, and does GitHub populate `digest` on a complete one?
+///
+/// Both questions the research left at MEDIUM confidence, and both change later
+/// code if they resolve:
+///
+/// - **`state`.** `src/sync/push/upload.rs` *does* branch on it: the resume scan
+///   skips only on the `"uploaded"` literal and deletes on everything else. What
+///   this probe establishes is that the branch fails in the **safe** direction
+///   whatever GitHub actually reports, because every unrecognised state
+///   re-uploads. Nothing in `src/` may be *relaxed* on the strength of it. In
+///   particular **the size check stays**: `state` is not authoritative, and a
+///   future reader must not drop a check believing that it is.
+/// - **`digest`.** If GitHub populates it over the uploaded bytes, a later phase
+///   can compare a locally computed hash instead of re-downloading every asset,
+///   and D3's verification pass loses its extra 115 MB on a first push. If it is
+///   absent or covers something else, that download stays.
+///
+/// **Setup** — a throwaway **private** repository with one published release,
+/// and a fine-grained PAT with `Contents: write` scoped to it. This probe writes
+/// and deletes release assets; point it at nothing you care about. Delete the
+/// repository and revoke the token afterwards.
+///
+/// ```bash
+/// GSD_CAL5_TOKEN=github_pat_… \
+/// GSD_CAL5_REPO=owner/throwaway-repo \
+///   cargo test --test live -- --ignored --nocapture \
+///     cal5_release_asset_state_and_digest
+/// ```
+///
+/// Skips with a printed message when the variables are absent, so it is never a
+/// hard failure on a machine that was not set up for it. Nothing in the default
+/// `cargo test` set — which is what the AUR `check()` runs on an installer's
+/// machine — touches this.
+#[tokio::test]
+#[ignore = "live API; writes and deletes release assets — run with --ignored"]
+async fn cal5_release_asset_state_and_digest() {
+    let (Some(token), Some(repo)) = (
+        non_empty_var("GSD_CAL5_TOKEN"),
+        non_empty_var("GSD_CAL5_REPO"),
+    ) else {
+        eprintln!(
+            "cal5_release_asset_state_and_digest: GSD_CAL5_TOKEN and GSD_CAL5_REPO \
+             (owner/name) must both be set — skipping; the resume scan's conservative \
+             `delete anything that is not \"uploaded\"` rule stands either way"
+        );
+        return;
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .unwrap();
+    let api = |suffix: String| format!("https://api.github.com/repos/{repo}{suffix}");
+
+    let release: serde_json::Value = client
+        .get(api("/releases/latest".into()))
+        .header("authorization", format!("Bearer {token}"))
+        .header("accept", "application/vnd.github+json")
+        .header("user-agent", GITHUB_PROBE_UA)
+        .send()
+        .await
+        .expect("the release lookup must reach api.github.com")
+        // A 401/404 here is a broken setup, and must never be recorded as an
+        // answer about asset states.
+        .error_for_status()
+        .expect("the release lookup must succeed — check the repo name and the token's scope")
+        .json()
+        .await
+        .expect("the release lookup must return JSON");
+    let release_id = release["id"].as_u64().expect("the release's numeric id");
+
+    // Every asset this probe writes, so a re-run starts from a clean release
+    // and leaves nothing behind.
+    const TORN: &str = "cal5-torn.bin";
+    const WHOLE: &str = "cal5-whole.bin";
+    let list = |c: reqwest::Client, token: String, url: String| async move {
+        c.get(url)
+            .header("authorization", format!("Bearer {token}"))
+            .header("accept", "application/vnd.github+json")
+            .header("user-agent", GITHUB_PROBE_UA)
+            .send()
+            .await
+            .expect("the asset listing must reach api.github.com")
+            .json::<Vec<serde_json::Value>>()
+            .await
+            .expect("the asset listing must return JSON")
+    };
+    let assets_url = api(format!("/releases/{release_id}/assets?per_page=100"));
+
+    for asset in list(client.clone(), token.clone(), assets_url.clone()).await {
+        let name = asset["name"].as_str().unwrap_or_default();
+        if name == TORN || name == WHOLE {
+            let id = asset["id"].as_u64().expect("an asset id");
+            client
+                .delete(api(format!("/releases/assets/{id}")))
+                .header("authorization", format!("Bearer {token}"))
+                .header("user-agent", GITHUB_PROBE_UA)
+                .send()
+                .await
+                .expect("the cleanup delete must reach api.github.com");
+            println!("CAL-5 — removed a leftover {name} from a previous run");
+        }
+    }
+
+    let upload = |name: &str, body: Vec<u8>| {
+        client
+            .post(format!(
+                "https://uploads.github.com/repos/{repo}/releases/{release_id}/assets?name={name}"
+            ))
+            .header("authorization", format!("Bearer {token}"))
+            .header("accept", "application/vnd.github+json")
+            .header("content-type", "application/octet-stream")
+            .header("user-agent", GITHUB_PROBE_UA)
+            .body(body)
+            .send()
+    };
+
+    // ---- question 1: the state a torn upload leaves behind -----------------
+    //
+    // The tear is a dropped future, not a truncated body: without reqwest's
+    // `stream` feature there is no way to hand it a body that ends early, and
+    // enabling one is the dependency decision plan 4-01 recorded as closed.
+    // Cutting the request at 250 ms of a 32 MiB body is the same thing from
+    // GitHub's side — a connection that stops mid-transfer.
+    println!("CAL-5 — {repo}, release {release_id}");
+    let torn = tokio::time::timeout(
+        Duration::from_millis(250),
+        upload(TORN, vec![0x5a; 32 * 1024 * 1024]),
+    )
+    .await;
+    match torn {
+        Err(_) => println!("  the 32 MiB upload was cut at 250 ms, as intended"),
+        Ok(done) => println!(
+            "  WARNING: the 32 MiB upload COMPLETED inside 250 ms ({:?}) — this run says \
+             nothing about a torn upload; re-run on a slower link or with a larger body",
+            done.map(|r| r.status())
+        ),
+    }
+
+    // Polled rather than slept on: each listing is a real round trip, which is
+    // the only delay this probe is willing to spend.
+    for attempt in 1..=5 {
+        let found = list(client.clone(), token.clone(), assets_url.clone())
+            .await
+            .into_iter()
+            .find(|a| a["name"].as_str() == Some(TORN));
+        match found {
+            Some(a) => println!(
+                "  poll {attempt}: {TORN} state={:?} size={:?} digest={:?}",
+                a["state"].as_str(),
+                a["size"].as_u64(),
+                a["digest"].as_str()
+            ),
+            None => println!("  poll {attempt}: {TORN} is not in the listing at all"),
+        }
+    }
+    println!(
+        "  CAL-5a = whatever state is printed above, the resume scan deletes and re-uploads \
+         anything that is not exactly \"uploaded\", so an unrecognised value fails safe. \
+         Record the observed value in docs/sync-format.md §10 — and do NOT relax the size \
+         check on the strength of it."
+    );
+
+    // ---- question 2: digest on a complete upload ---------------------------
+    let body = b"cal5 complete upload".to_vec();
+    let whole: serde_json::Value = upload(WHOLE, body.clone())
+        .await
+        .expect("the complete upload must reach uploads.github.com")
+        .error_for_status()
+        .expect("the complete upload must succeed")
+        .json()
+        .await
+        .expect("the upload response must be JSON");
+    println!(
+        "  {WHOLE} on upload: state={:?} size={:?} digest={:?}",
+        whole["state"].as_str(),
+        whole["size"].as_u64(),
+        whole["digest"].as_str()
+    );
+    let relisted = list(client.clone(), token.clone(), assets_url.clone())
+        .await
+        .into_iter()
+        .find(|a| a["name"].as_str() == Some(WHOLE));
+    let digest = relisted
+        .as_ref()
+        .and_then(|a| a["digest"].as_str())
+        .map(str::to_string);
+    println!(
+        "  {WHOLE} relisted:  state={:?} digest={digest:?}",
+        relisted.as_ref().and_then(|a| a["state"].as_str())
+    );
+
+    match &digest {
+        Some(d) => {
+            let sha = {
+                use sha2::{Digest, Sha256};
+                let hex: String = Sha256::digest(&body)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                format!("sha256:{hex}")
+            };
+            println!(
+                "  CAL-5b = digest IS populated as {d:?}; a plain SHA-256 of the body is \
+                 {sha:?} — {}. If they agree, a later phase can verify uploads without \
+                 re-downloading them and D3's extra 115 MB on a first push disappears. \
+                 Record it in docs/sync-format.md §10.",
+                if *d == sha {
+                    "they AGREE"
+                } else {
+                    "they DIFFER"
+                }
+            );
+        }
+        None => println!(
+            "  CAL-5b = digest is NOT populated. D3's verifying download stays exactly as \
+             `upload::run` implements it. Record it in docs/sync-format.md §10."
+        ),
+    }
+
+    // Leave the release as it was found.
+    for asset in list(client.clone(), token.clone(), assets_url).await {
+        let name = asset["name"].as_str().unwrap_or_default();
+        if name == TORN || name == WHOLE {
+            let id = asset["id"].as_u64().expect("an asset id");
+            client
+                .delete(api(format!("/releases/assets/{id}")))
+                .header("authorization", format!("Bearer {token}"))
+                .header("user-agent", GITHUB_PROBE_UA)
+                .send()
+                .await
+                .expect("the cleanup delete must reach api.github.com");
+            println!("  cleaned up {name}");
+        }
+    }
 }
