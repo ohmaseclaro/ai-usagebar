@@ -16,12 +16,16 @@ encrypted end-to-end with a password only they know, syncing only what changed.
 - [ ] **SCOPE-01**: The bundle covers, as independently toggleable categories: app config,
       Claude Desktop account credentials/profiles, routines/scheduled tasks, chat session
       indexes, and (opt-in) chat transcripts.
+
 - [ ] **SCOPE-02**: Every category except chat transcripts is enabled by default; the user
       can uncheck any of them.
+
 - [ ] **SCOPE-03**: Chat transcripts are **off** by default and, when enabled, are bounded
       (by age and/or total size) with the resulting bundle size shown before the first push.
+
 - [ ] **SCOPE-04**: The user can preview exactly what a push would include — per category,
       file count and byte size — without pushing (`--dry-run`).
+
 - [ ] **SCOPE-05**: Category selection persists in `config.toml` and is itself part of the
       synced config, so a second machine inherits the same choices.
 
@@ -29,17 +33,23 @@ encrypted end-to-end with a password only they know, syncing only what changed.
 
 - [ ] **CRYPTO-01**: The whole bundle is encrypted client-side with a key derived from a
       user-set password; the remote never receives plaintext or the password.
+
 - [ ] **CRYPTO-02**: Password-derived keys use a memory-hard KDF with parameters stored
       alongside the data, so parameters can be raised in future versions without breaking
       existing bundles.
+
 - [ ] **CRYPTO-03**: A wrong password fails cleanly and unambiguously — never partial or
       garbage output.
+
 - [ ] **CRYPTO-04**: The user can change the sync password without re-uploading the entire
       bundle.
+
 - [ ] **CRYPTO-05**: Tampering with, reordering, truncating, or rolling back remote data is
       detected on pull and refuses to restore.
+
 - [ ] **CRYPTO-06**: Password strength is enforced at set time, with the offline-attack risk
       explained in plain language.
+
 - [ ] **CRYPTO-07**: Key material is zeroized after use and never appears in process
       arguments, environment variables, logs, or error messages.
 
@@ -47,61 +57,80 @@ encrypted end-to-end with a password only they know, syncing only what changed.
 
 - [ ] **SAFE-01**: A push whose bundle contains credentials is **refused** unless the target
       repo is verified private, checked immediately before every push.
+
 - [ ] **SAFE-02**: If a previously-private target repo is found to be public, the push aborts
       and the user is told to rotate the affected credentials.
-- [ ] **SAFE-03**: Restoring never silently overwrites local credentials that are newer than
+
+- [x] **SAFE-03**: Restoring never silently overwrites local credentials that are newer than
       the remote copy; the user is told what would change first.
-- [ ] **SAFE-04**: A local backup is taken before the first restore writes anything, and the
+
+- [x] **SAFE-04**: A local backup is taken before the first restore writes anything, and the
       command to roll it back is printed.
-- [ ] **SAFE-05**: No plaintext of any synced file is ever written to a temporary path that
+
+- [x] **SAFE-05**: No plaintext of any synced file is ever written to a temporary path that
       outlives the operation.
 
 ### Sync mechanics
 
 - [ ] **SYNC-01**: Only data that actually changed since the last successful sync is
       uploaded.
+
 - [ ] **SYNC-02**: A sync with no local changes completes near-instantly and uploads nothing.
 - [ ] **SYNC-03**: Appending to a large file uploads roughly the appended bytes, not the whole
       file.
+
 - [ ] **SYNC-04**: An interrupted push leaves the remote in its previous consistent state —
       never a half-written snapshot a pull could read.
+
 - [ ] **SYNC-05**: A resumed push after interruption reuses what already uploaded.
-- [ ] **SYNC-06**: When two machines have both changed the same item, the most recent wins
+- [x] **SYNC-06**: When two machines have both changed the same item, the most recent wins
       per item and the user is told what was overwritten.
+
 - [ ] **SYNC-07**: Remote storage does not grow without bound; superseded data can be pruned.
 
 ### GitHub integration
 
 - [ ] **REPO-01**: The user supplies a GitHub token scoped to the **single** sync repo, with
       no permission to create or administer repositories.
+
 - [ ] **REPO-02**: The GitHub token is stored with the same protection as existing
       credentials (macOS Keychain / mode-0600 file), never in a tracked file.
+
 - [ ] **REPO-03**: The tool **never creates a repository**. The user points it at a private
       repo they already own; a missing repo is an actionable error, not an auto-fix.
       *(Research finding: withholding `Administration: write` makes the app structurally
       incapable of creating a public repo — a stronger guarantee than SAFE-01's runtime
       check, which remains as defence in depth.)*
+
 - [ ] **REPO-04**: An existing token from the environment or the user's git/gh credential
       helper can be reused so setup needs no new secret.
+
 - [ ] **REPO-05**: Network, auth, and rate-limit failures produce an actionable message and a
       non-zero exit — never a silent partial success.
+
 - [ ] **REPO-06**: Bulk data is uploaded as a small number of large objects, never one
       request per chunk, staying inside GitHub's content-creation limits (80/min, 500/hour).
+
 - [ ] **REPO-07**: The snapshot pointer is published with a compare-and-swap precondition, so
       two machines pushing concurrently cannot interleave into a corrupt state.
 
 ### Commands and surfaces
 
-- [ ] **UX-01**: `ai-usagebar sync push` and `ai-usagebar sync pull` (or equivalent) perform
+- [x] **UX-01**: `ai-usagebar sync push` and `ai-usagebar sync pull` (or equivalent) perform
       the two directions, with `--dry-run` on both.
+
 - [ ] **UX-02**: `ai-usagebar sync status` reports what is configured, when the last sync ran,
       and what would change now.
+
 - [ ] **UX-03**: First-time setup is guided end to end: choose repo, set password, choose
       categories, confirm the size, push.
+
 - [ ] **UX-04**: Progress is visible for a long first push (bytes/objects, not a frozen
       terminal).
+
 - [ ] **UX-05**: The macOS menu bar exposes sync state and can trigger a push/pull, reusing
       the existing non-interactive-subprocess conventions.
+
 - [ ] **UX-06**: The widget's exit-0 invariant holds — a sync failure never takes the status
       bar down.
 
@@ -157,15 +186,15 @@ Deferred. Tracked, not in this roadmap.
 | CRYPTO-07 | Phase 1 | Pending |
 | SAFE-01 | Phase 3 | Pending |
 | SAFE-02 | Phase 3 | Pending |
-| SAFE-03 | Phase 5 | Pending |
-| SAFE-04 | Phase 5 | Pending |
-| SAFE-05 | Phase 5 | Pending |
+| SAFE-03 | Phase 5 | Complete |
+| SAFE-04 | Phase 5 | Complete |
+| SAFE-05 | Phase 5 | Complete |
 | SYNC-01 | Phase 2 | Pending |
 | SYNC-02 | Phase 2 | Pending |
 | SYNC-03 | Phase 2 | Pending |
 | SYNC-04 | Phase 4 | Pending |
 | SYNC-05 | Phase 4 | Pending |
-| SYNC-06 | Phase 5 | Pending |
+| SYNC-06 | Phase 5 | Complete |
 | SYNC-07 | Phase 4 | Pending |
 | REPO-01 | Phase 3 | Pending |
 | REPO-02 | Phase 3 | Pending |
@@ -174,7 +203,7 @@ Deferred. Tracked, not in this roadmap.
 | REPO-05 | Phase 3 | Pending |
 | REPO-06 | Phase 4 | Pending |
 | REPO-07 | Phase 4 | Pending |
-| UX-01 | Phase 5 | Pending |
+| UX-01 | Phase 5 | Complete |
 | UX-02 | Phase 2 | Pending |
 | UX-03 | Phase 3 | Pending |
 | UX-04 | Phase 4 | Pending |
@@ -182,6 +211,7 @@ Deferred. Tracked, not in this roadmap.
 | UX-06 | Phase 6 | Pending |
 
 **Coverage:**
+
 - v1 requirements: 37 total
 - Mapped to phases: 37 ✓
 - Unmapped: 0
