@@ -128,10 +128,10 @@ encrypted end-to-end with a password only they know, syncing only what changed.
 - [ ] **UX-04**: Progress is visible for a long first push (bytes/objects, not a frozen
       terminal).
 
-- [ ] **UX-05**: The macOS menu bar exposes sync state and can trigger a push/pull, reusing
+- [x] **UX-05**: The macOS menu bar exposes sync state and can trigger a push/pull, reusing
       the existing non-interactive-subprocess conventions.
 
-- [ ] **UX-06**: The widget's exit-0 invariant holds — a sync failure never takes the status
+- [x] **UX-06**: The widget's exit-0 invariant holds — a sync failure never takes the status
       bar down.
 
 ## v2 Requirements
@@ -207,8 +207,8 @@ Deferred. Tracked, not in this roadmap.
 | UX-02 | Phase 2 | Pending |
 | UX-03 | Phase 3 | Pending |
 | UX-04 | Phase 4 | Pending |
-| UX-05 | Phase 6 | Pending |
-| UX-06 | Phase 6 | Pending |
+| UX-05 | Phase 6 | Complete |
+| UX-06 | Phase 6 | Complete |
 
 **Coverage:**
 
