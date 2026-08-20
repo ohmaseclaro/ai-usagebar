@@ -136,7 +136,7 @@ Things worth knowing about the shape of a push:
 
 Re-running is safe and is the intended recovery. A push lists what is already on the release and skips anything that matches by name, size *and* upload state — all three, because GitHub creates an asset record before the body finishes, so a torn upload carries the right name. A torn asset is deleted and re-sent rather than trusted.
 
-One honest caveat. Asset names are content addresses, and the bundle's manifest — which lists every file in the bundle — travels inside a pack. **The first re-run after a push that included a file for the first time may re-send its packs**, because the manifest is written in a different order once the local index has seen that file, which changes the packs' addresses. A further re-run sends nothing at all. Nothing is lost either way; it costs bandwidth once.
+Asset names are content addresses, and the bundle's manifest — which lists every file in the bundle — travels inside a pack, so anything that changes the manifest's bytes changes those addresses. The manifest lists files in path order for exactly that reason: the addresses depend on what is on disk, not on what your local index happens to have seen before, and not on the order your filesystem enumerated the directory. So a re-run after an interrupted push re-sends nothing.
 
 ### What progress looks like
 

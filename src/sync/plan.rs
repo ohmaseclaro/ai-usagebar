@@ -178,6 +178,7 @@ pub fn build<F: Fn(&[u8]) -> [u8; 32]>(
         let scan = scope::collect(category, roots, cfg, now);
         let mut new_bytes = 0u64;
         let mut new_stored_bytes = 0u64;
+        let category_start = plan.file_plans.len();
 
         // Pass one: the D5 short-circuit. `lookup` returning Some ends the work
         // for that file — no open, no read, no hash. Doing every hit first also
@@ -220,6 +221,17 @@ pub fn build<F: Fn(&[u8]) -> [u8; 32]>(
                 .extend(file_plan.new_chunk_ids.iter().copied());
             plan.file_plans.push(file_plan);
         }
+
+        // The two passes emit cached files first and changed files last, so the
+        // order depends on *what was cached* rather than on what is on disk. The
+        // manifest is built from this list and rides inside a pack, so an
+        // unstable order moves every chunk address after it: measured, the first
+        // re-run following an interrupted push reused nothing at all, and only
+        // the second re-run onwards reused anything.
+        //
+        // Sorting by path rather than restoring scan order also removes the
+        // filesystem's enumeration order from the addresses.
+        plan.file_plans[category_start..].sort_by(|a, b| a.path.cmp(&b.path));
 
         plan.categories.push(CategoryPlan {
             category,

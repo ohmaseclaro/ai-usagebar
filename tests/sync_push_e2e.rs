@@ -826,20 +826,19 @@ async fn a_first_push_issues_one_upload_per_pack_and_never_one_per_chunk() {
 /// one property: the flip is the only commit point, and what landed before it
 /// is reused rather than re-sent. This is the most important test in the file.
 ///
-/// # The fixture trap that cost an hour, pinned here
+/// # Why one refused push is enough, and once was not
 ///
 /// `plan::build` emits `file_plans` in **two passes** — every file the index
-/// already knows, in scan order, then every file that changed. So the *first*
-/// run that sees a new file puts it last, and the next run puts it in scan
-/// order. The manifest is built from that list and travels inside a pack, so
-/// the two runs seal packs with different content addresses and the first
-/// re-run after an interruption reuses **nothing**. A second re-run reuses
-/// everything, because by then the order has stabilised.
+/// already knows, then every file that changed — so the order used to depend on
+/// what happened to be cached. The manifest is built from that list and travels
+/// inside a pack, so a run that ordered the files differently sealed packs with
+/// different content addresses, and the first re-run after an interruption
+/// reused **nothing**; only the second re-run onwards reused anything.
 ///
-/// The test therefore drives two refused pushes before the resume and asserts
-/// full reuse on the third. That is the shipped behaviour rather than the
-/// behaviour the plan assumed, and `docs/sync-github.md` says the same thing in
-/// a user's words.
+/// `plan::build` now sorts each category's file plans by path, so the addresses
+/// depend on what is on disk rather than on what was cached — or on the order
+/// the filesystem happened to enumerate. This test asserts full reuse on the
+/// **first** resume, which is what makes it a regression test for that.
 #[tokio::test]
 async fn a_push_killed_before_the_flip_leaves_the_previous_pointer_byte_identical() {
     let local = Local::new();
@@ -879,15 +878,6 @@ async fn a_push_killed_before_the_flip_leaves_the_previous_pointer_byte_identica
         }
     });
 
-    // The re-plan the two-pass ordering forces, still refused at the flip.
-    push(&local, &remote)
-        .await
-        .expect_err("still refused at the flip");
-    assert_eq!(
-        settled,
-        remote.with(|st| st.pointer.clone().expect("still published")),
-        "and a second killed push leaves it byte-identical too"
-    );
     let landed_before = remote.with(|st| st.live_names());
 
     // Criterion 3: the resume. Nothing goes back on the wire but the flip.
@@ -936,10 +926,10 @@ async fn a_resume_deletes_a_torn_asset_rather_than_skipping_on_its_name() {
     local.seed("only", &payload(3, 1024 * 1024));
     let remote = Remote::new().await;
 
-    // Two refused pushes to reach the stable plan order (see the test above),
-    // so the third run rebuilds exactly the packs already on the release.
+    // One refused push, so the next run rebuilds exactly the packs already on
+    // the release. It takes one rather than two because `plan::build` sorts each
+    // category's file plans by path — see the test above.
     remote.with(|st| st.refuse_put = true);
-    push(&local, &remote).await.expect_err("refused");
     push(&local, &remote).await.expect_err("refused");
 
     let torn = remote.with(|st| {
