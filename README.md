@@ -235,7 +235,7 @@ Encrypted backup of your usage history and configuration to a private GitHub rep
 
 To set up:
 
-1. Create a private repository for your backup (`gh repo create owner/name --private`) — the tool never creates one, and its token holds no permission that could
+1. Create a private repository for your backup (`gh repo create owner/name --private`) — the tool never creates one, and its token holds no permission that could create a public one by mistake
 2. Generate a fine-grained personal access token scoped to that repository, with **Contents: read/write** and **Metadata: read** permissions only
 3. Add the repository to your config: `[sync] repo = "owner/name"`
 4. Run `ai-usagebar sync setup` to authenticate and verify the repository

@@ -129,7 +129,7 @@ That last `PUT` is the only step that changes what a reader sees. Everything abo
 Things worth knowing about the shape of a push:
 
 - **It uploads several assets, not one.** Your files are packed into large objects, and the bundle's own manifest and index travel in packs alongside them — so even a one-file bundle produces more than one. A separate small asset carries your wrapped master key; it is published after the second privacy check, not before, because it is the most sensitive object in the bundle.
-- **It is a handful of requests, not one per file.** A first push of ~190 chunks costs 13 HTTP requests in total: nine fixed, plus one upload and one verifying download per pack. The count tracks packs, never your data.
+- **It is a handful of requests, not one per file.** A push of ~190 chunks costs 13 HTTP requests in total: nine fixed, plus one upload and one verifying download per pack. The very first push against a repository costs one more, because the release has to be created before anything can hang off it. The count tracks packs, never your data.
 - **`--dry-run` shows what a push would send** without sending it, and needs no network.
 
 ### Re-running an interrupted push
@@ -162,7 +162,7 @@ The remote keeps the last **10 snapshots** by default. Change it with:
 keep_snapshots = 10
 ```
 
-Old snapshots are cheap: they share packs with newer ones, so keeping ten costs little more than keeping three. `0` is refused when the config is loaded, and the value is clamped to at least one everywhere else — a zero would mean the flip that publishes a snapshot also drops it.
+Old snapshots are cheap: they share packs with newer ones, so keeping ten costs little more than keeping three. `0` is refused when the config is loaded, and `prune` clamps it to at least one — a zero would mean the flip that publishes a snapshot also drops it.
 
 **A prune runs automatically after every successful push.** It drops snapshot records past `keep_snapshots`, oldest first, and then deletes pack assets no surviving snapshot still references. The record always goes first: the reverse order can leave a live snapshot pointing at a pack that is gone, which is an unrestorable backup and the worst thing this feature could produce.
 
