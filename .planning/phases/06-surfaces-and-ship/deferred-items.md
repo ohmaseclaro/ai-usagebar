@@ -9,3 +9,15 @@
   password path — this dead seam is the closest thing to one. 6-02 should
   decide deliberately: wire it, or refuse the action with "run it in a
   terminal" (D-02).
+
+## From 6-07 (out of scope — pre-existing, not caused by this plan)
+
+- `cli::rekey` (src/sync/cli.rs) calls `prompt.passphrase("")` **twice** — once
+  for "The CURRENT sync password" and once for "The NEW sync password". Both
+  therefore print `TtyPrompt`'s *"Press Enter to take the generated
+  passphrase, or type your own now."*, which is wrong at both: neither ask has
+  a generated alternative, and at the CURRENT one an empty answer is submitted
+  as the password. 6-07 added `SetupPrompt::existing_passphrase` for exactly
+  this shape of ask and it fits the CURRENT one verbatim; the NEW one wants a
+  third variant or a `what: &str` label. Left alone because a sibling plan is
+  editing narration in this area and a half-fix reads worse than none.
