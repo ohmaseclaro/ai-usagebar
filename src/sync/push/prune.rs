@@ -187,18 +187,18 @@ mod tests {
     use crate::sync::push::{POINTER_VERSION, SnapshotRecord, keyfile_asset_name, pack_asset_name};
 
     /// Fixed. Nothing here reads a clock: `plan_deletions` takes `now`.
-    const NOW: DateTime<Utc> = match DateTime::from_timestamp(1_700_000_000, 0) {
+    pub(super) const NOW: DateTime<Utc> = match DateTime::from_timestamp(1_700_000_000, 0) {
         Some(t) => t,
         None => panic!("a fixed timestamp"),
     };
 
-    fn id(byte: u8) -> ChunkId {
+    pub(super) fn id(byte: u8) -> ChunkId {
         ChunkId::from_bytes([byte; 32])
     }
 
     /// `age` is how long before [`NOW`] the remote created it — the only input
     /// the grace window reads.
-    fn asset(asset_id: u64, name: &str, age: TimeDelta) -> Asset {
+    pub(super) fn asset(asset_id: u64, name: &str, age: TimeDelta) -> Asset {
         Asset {
             id: asset_id,
             name: name.to_owned(),
@@ -209,11 +209,11 @@ mod tests {
         }
     }
 
-    fn pack(asset_id: u64, byte: u8, age: TimeDelta) -> Asset {
+    pub(super) fn pack(asset_id: u64, byte: u8, age: TimeDelta) -> Asset {
         asset(asset_id, &pack_asset_name(&id(byte)), age)
     }
 
-    fn snapshot(packs: Vec<ChunkId>) -> SnapshotRecord {
+    pub(super) fn snapshot(packs: Vec<ChunkId>) -> SnapshotRecord {
         SnapshotRecord {
             root: format!("root-{}", packs.len()),
             index_chunks: Vec::new(),
@@ -221,7 +221,7 @@ mod tests {
         }
     }
 
-    fn pointer(keyfile: &str, snapshots: Vec<SnapshotRecord>) -> Pointer {
+    pub(super) fn pointer(keyfile: &str, snapshots: Vec<SnapshotRecord>) -> Pointer {
         Pointer {
             format: POINTER_VERSION,
             repo_id: "github:1".into(),
@@ -230,8 +230,8 @@ mod tests {
         }
     }
 
-    const OLD: TimeDelta = TimeDelta::hours(48);
-    const GRACE: TimeDelta = TimeDelta::hours(24);
+    pub(super) const OLD: TimeDelta = TimeDelta::hours(48);
+    pub(super) const GRACE: TimeDelta = TimeDelta::hours(24);
 
     /// The base case: two surviving snapshots name A and B, C is nobody's.
     #[test]
@@ -399,5 +399,513 @@ mod tests {
         let (kept, doomed) = plan_deletions(&p, &[pack(1, 0x01, OLD)], 0, NOW, GRACE);
         assert_eq!(kept.snapshots, p.snapshots[1..]);
         assert_eq!(doomed, vec![1]);
+    }
+}
+
+/// The remote half: the delete pass and the on-demand entry point.
+///
+/// Split from [`tests`] because it needs a whole `PushCtx` and a mock server,
+/// while everything above proves its rules against a table.
+#[cfg(test)]
+mod delete_pass {
+    use super::tests::{GRACE, NOW, OLD, asset, id, pack, pointer, snapshot};
+    use super::*;
+
+    use std::sync::{Arc, Mutex};
+
+    use base64::Engine;
+    use tempfile::TempDir;
+    use zeroize::Zeroizing;
+
+    use crate::config::SyncConfig;
+    use crate::sync::SyncRoots;
+    use crate::sync::crypto::{KdfParams, Keyfile, Keys, MIN_KDF_MEMORY_KIB};
+    use crate::sync::github::gate::RepoFacts;
+    use crate::sync::github::token::TokenSource;
+    use crate::sync::github::{Client, Endpoints, RepoRef};
+    use crate::sync::index::Index;
+    use crate::sync::push::keyfile_asset_name;
+
+    const B64: base64::engine::general_purpose::GeneralPurpose =
+        base64::engine::general_purpose::STANDARD;
+
+    // -- the harness -------------------------------------------------------
+
+    fn repo() -> RepoRef {
+        RepoRef::parse("o/n").unwrap()
+    }
+
+    fn client_at(base: &str) -> Client {
+        Client::new(
+            &Endpoints {
+                api_base: base.into(),
+                uploads_base: base.into(),
+            },
+            Zeroizing::new("github_pat_fixture_not_a_real_token".into()),
+            TokenSource::Env,
+        )
+        .unwrap()
+    }
+
+    fn permit() -> gate::Pushing {
+        let facts = RepoFacts {
+            id: 1,
+            private: true,
+            visibility: "private".into(),
+            owner_login: "o".into(),
+            owner_id: 7,
+            archived: false,
+            fork: false,
+            admin_permission: false,
+        };
+        gate::assert_pushable(&facts, &repo(), true, NOW)
+            .expect("a private repository clears")
+            .0
+            .spend(NOW)
+            .expect("freshly minted")
+    }
+
+    /// The format's own floor, never the shipped 1 GiB: the AUR `check()` runs
+    /// these on an installer's machine.
+    fn cheap() -> KdfParams {
+        KdfParams {
+            m_kib: MIN_KDF_MEMORY_KIB,
+            t: 1,
+            p: 1,
+        }
+    }
+
+    /// Everything the context borrows, owned in one place so a test can hold it
+    /// across the `await`. A `TempDir`, never a real `$HOME`.
+    struct Local {
+        _dir: TempDir,
+        roots: SyncRoots,
+        cfg: SyncConfig,
+        keys: Keys,
+        index: Index,
+    }
+
+    impl Local {
+        fn new() -> Self {
+            let dir = TempDir::new().unwrap();
+            let roots = SyncRoots::at(
+                dir.path().join("config.toml"),
+                dir.path().to_path_buf(),
+                dir.path().join("desktop"),
+                dir.path().join("profiles"),
+                dir.path().join("claude-home"),
+            );
+            let (_keyfile, keys) = Keyfile::create(b"prune-fixture-password", cheap()).unwrap();
+            let index = Index::at(&roots.index_file).unwrap();
+            Self {
+                _dir: dir,
+                roots,
+                cfg: SyncConfig::default(),
+                keys,
+                index,
+            }
+        }
+
+        fn ctx<'a>(&'a self, client: &'a Client, repo: &'a RepoRef) -> PushCtx<'a> {
+            PushCtx {
+                client,
+                repo,
+                cfg: &self.cfg,
+                roots: &self.roots,
+                keys: &self.keys,
+                kdf: cheap(),
+                index: &self.index,
+                repo_id: "github:1".into(),
+                keyfile_asset: keyfile_asset_name(&id(0xff)),
+                previous: None,
+                now: NOW,
+            }
+        }
+    }
+
+    /// Every request the run made, in order, as `METHOD path` plus its body.
+    type Trace = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
+    fn record(trace: &Trace) -> impl Fn(&mockito::Request) -> bool + Send + Sync + 'static {
+        let trace = Arc::clone(trace);
+        move |req| {
+            trace.lock().unwrap().push((
+                format!("{} {}", req.method(), req.path()),
+                req.body().cloned().unwrap_or_default(),
+            ));
+            true
+        }
+    }
+
+    fn paths(trace: &Trace) -> Vec<String> {
+        trace
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(p, _)| p.clone())
+            .collect()
+    }
+
+    fn listing(assets: &[Asset]) -> String {
+        let each: Vec<String> = assets
+            .iter()
+            .map(|a| {
+                format!(
+                    r#"{{"id":{},"name":"{}","size":{},"state":"{}","created_at":"{}"}}"#,
+                    a.id,
+                    a.name,
+                    a.size,
+                    a.state,
+                    a.created_at.to_rfc3339()
+                )
+            })
+            .collect();
+        format!("[{}]", each.join(","))
+    }
+
+    fn repo_json(private: bool) -> String {
+        format!(
+            r#"{{"id":1,"private":{private},"visibility":"{}","owner":{{"login":"o","id":7}}}}"#,
+            if private { "private" } else { "public" }
+        )
+    }
+
+    fn contents_body(p: &Pointer) -> String {
+        format!(
+            r#"{{"sha":"blob1","content":"{}"}}"#,
+            B64.encode(serde_json::to_vec(p).unwrap())
+        )
+    }
+
+    /// The pointer decoded back out of the `PUT` body — what actually landed.
+    fn published(trace: &Trace) -> Pointer {
+        let (_, body) = trace
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(p, _)| p.starts_with("PUT"))
+            .cloned()
+            .expect("a pointer was published");
+        let outer: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let raw = B64.decode(outer["content"].as_str().unwrap()).unwrap();
+        serde_json::from_slice(&raw).unwrap()
+    }
+
+    // -- the delete pass ---------------------------------------------------
+
+    #[tokio::test]
+    async fn one_unreferenced_asset_is_one_delete_and_a_count_of_one() {
+        let live = keyfile_asset_name(&id(0xff));
+        let landed = pointer(&live, vec![snapshot(vec![id(0xaa)])]);
+        let assets = [pack(1, 0xaa, OLD), pack(2, 0xcc, OLD), asset(3, &live, OLD)];
+
+        let mut server = mockito::Server::new_async().await;
+        let trace: Trace = Arc::default();
+        let _list = server
+            .mock("GET", mockito::Matcher::Regex(r"/releases/9/assets".into()))
+            .with_status(200)
+            .with_body(listing(&assets))
+            .match_request(record(&trace))
+            .create_async()
+            .await;
+        let kept = server
+            .mock("DELETE", "/repos/o/n/releases/assets/1")
+            .with_status(204)
+            .expect(0)
+            .create_async()
+            .await;
+        let doomed = server
+            .mock("DELETE", "/repos/o/n/releases/assets/2")
+            .with_status(204)
+            .expect(1)
+            .match_request(record(&trace))
+            .create_async()
+            .await;
+
+        let local = Local::new();
+        let client = client_at(&server.url());
+        let repo = repo();
+        let deleted = run(&local.ctx(&client, &repo), 9, &landed, 10, &permit())
+            .await
+            .unwrap();
+
+        assert_eq!(deleted, 1);
+        kept.assert_async().await;
+        doomed.assert_async().await;
+        assert!(
+            paths(&trace)[0].starts_with("GET"),
+            "listed before deleting"
+        );
+    }
+
+    /// The asset is already gone, which is exactly what was asked for.
+    #[tokio::test]
+    async fn a_delete_answered_with_404_counts_as_success() {
+        let landed = pointer("keyfile-x.json", vec![snapshot(vec![id(0xaa)])]);
+
+        let mut server = mockito::Server::new_async().await;
+        let _list = server
+            .mock("GET", mockito::Matcher::Regex(r"/releases/9/assets".into()))
+            .with_status(200)
+            .with_body(listing(&[pack(2, 0xcc, OLD)]))
+            .create_async()
+            .await;
+        let _gone = server
+            .mock("DELETE", "/repos/o/n/releases/assets/2")
+            .with_status(404)
+            .with_body(r#"{"message":"Not Found"}"#)
+            .create_async()
+            .await;
+
+        let local = Local::new();
+        let client = client_at(&server.url());
+        let repo = repo();
+        assert_eq!(
+            run(&local.ctx(&client, &repo), 9, &landed, 10, &permit())
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    /// Sequential, stopping at the first error, is what makes a partial failure
+    /// comprehensible — and `forget_chunks` then sees the confirmed set only.
+    /// A row that survives a failed delete is correct; one dropped for a pack
+    /// still on the remote costs a re-upload, which is the safe direction.
+    #[tokio::test]
+    async fn a_refused_delete_stops_the_pass_and_forgets_only_what_went() {
+        let landed = pointer("keyfile-x.json", vec![snapshot(vec![id(0xaa)])]);
+        let assets = [pack(2, 0xcc, OLD), pack(3, 0xdd, OLD)];
+
+        let mut server = mockito::Server::new_async().await;
+        let _list = server
+            .mock("GET", mockito::Matcher::Regex(r"/releases/9/assets".into()))
+            .with_status(200)
+            .with_body(listing(&assets))
+            .create_async()
+            .await;
+        let first = server
+            .mock("DELETE", "/repos/o/n/releases/assets/2")
+            .with_status(204)
+            .expect(1)
+            .create_async()
+            .await;
+        let second = server
+            .mock("DELETE", "/repos/o/n/releases/assets/3")
+            .with_status(403)
+            .with_body(r#"{"message":"Forbidden"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let local = Local::new();
+        // One chunk in each of three packs: the one that goes, the one whose
+        // delete is refused, and the live one.
+        local
+            .index
+            .record_chunks(&[
+                (id(0x01), id(0xcc), 0, 10, 9),
+                (id(0x02), id(0xdd), 0, 10, 9),
+                (id(0x03), id(0xaa), 0, 10, 9),
+            ])
+            .unwrap();
+
+        let client = client_at(&server.url());
+        let repo = repo();
+        let err = run(&local.ctx(&client, &repo), 9, &landed, 10, &permit())
+            .await
+            .expect_err("the refusal is returned honestly");
+        assert!(!err.to_string().is_empty(), "{err}");
+
+        first.assert_async().await;
+        second.assert_async().await;
+        let known = local.index.known_chunks(&[id(0x01), id(0x02), id(0x03)]);
+        assert!(!known.contains(&id(0x01)), "the deleted pack is forgotten");
+        assert!(known.contains(&id(0x02)), "a failed delete keeps its rows");
+        assert!(known.contains(&id(0x03)), "a live pack keeps its rows");
+    }
+
+    /// T-4-35. `landed` is whatever `pointer::commit` returned, so a machine
+    /// that won the flip has its records — and therefore its packs — in the
+    /// list this pass reads. Every asset here is well past the grace window, so
+    /// the age floor is not what is doing the work.
+    #[tokio::test]
+    async fn a_competing_machines_packs_are_never_proposed_for_deletion() {
+        let landed = pointer(
+            "keyfile-x.json",
+            vec![snapshot(vec![id(0xaa)]), snapshot(vec![id(0xbb)])],
+        );
+        let assets = [pack(1, 0xaa, OLD), pack(2, 0xbb, OLD), pack(3, 0xcc, OLD)];
+
+        let mut server = mockito::Server::new_async().await;
+        let _list = server
+            .mock("GET", mockito::Matcher::Regex(r"/releases/9/assets".into()))
+            .with_status(200)
+            .with_body(listing(&assets))
+            .create_async()
+            .await;
+        let competitor = server
+            .mock("DELETE", "/repos/o/n/releases/assets/2")
+            .with_status(204)
+            .expect(0)
+            .create_async()
+            .await;
+        let _garbage = server
+            .mock("DELETE", "/repos/o/n/releases/assets/3")
+            .with_status(204)
+            .create_async()
+            .await;
+
+        let local = Local::new();
+        let client = client_at(&server.url());
+        let repo = repo();
+        assert_eq!(
+            run(&local.ctx(&client, &repo), 9, &landed, 10, &permit())
+                .await
+                .unwrap(),
+            1
+        );
+        competitor.assert_async().await;
+    }
+
+    // -- the on-demand entry point ----------------------------------------
+
+    /// T-4-42b. The gate is first, and a repository that is no longer private
+    /// stops the command before a single asset is listed.
+    #[tokio::test]
+    async fn run_on_demand_refuses_a_public_repository_before_listing_anything() {
+        let mut server = mockito::Server::new_async().await;
+        let trace: Trace = Arc::default();
+        let _repo = server
+            .mock("GET", "/repos/o/n")
+            .with_status(200)
+            .with_body(repo_json(false))
+            .match_request(record(&trace))
+            .create_async()
+            .await;
+        let listed = server
+            .mock("GET", mockito::Matcher::Regex(r"/releases/9/assets".into()))
+            .with_status(200)
+            .with_body("[]")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let local = Local::new();
+        let client = client_at(&server.url());
+        let repo = repo();
+        let err = run_on_demand(&local.ctx(&client, &repo), 10)
+            .await
+            .expect_err("a public repository is refused");
+        assert!(err.to_string().contains("REFUSING"), "{err}");
+        assert_eq!(paths(&trace), vec!["GET /repos/o/n".to_owned()]);
+        listed.assert_async().await;
+    }
+
+    /// D2's order on the on-demand path too: the record is dropped by the flip,
+    /// and the flip has already returned before the first `DELETE` is issued.
+    #[tokio::test]
+    async fn run_on_demand_publishes_the_truncated_pointer_before_deleting_anything() {
+        let current = pointer(
+            "keyfile-x.json",
+            vec![
+                snapshot(vec![id(0x01)]),
+                snapshot(vec![id(0x02)]),
+                snapshot(vec![id(0x03)]),
+            ],
+        );
+        let assets = [pack(1, 0x01, OLD), pack(2, 0x02, OLD), pack(3, 0x03, OLD)];
+
+        let mut server = mockito::Server::new_async().await;
+        let trace: Trace = Arc::default();
+        let mut mocks = Vec::new();
+        for mock in [
+            server
+                .mock("GET", "/repos/o/n")
+                .with_status(200)
+                .with_body(repo_json(true)),
+            server
+                .mock("GET", "/repos/o/n/contents/sync/pointer.json")
+                .with_status(200)
+                .with_body(contents_body(&current)),
+            server
+                .mock("GET", "/repos/o/n/releases/tags/ai-usagebar-sync-v1")
+                .with_status(200)
+                .with_body(r#"{"id":9}"#),
+            server
+                .mock("PUT", "/repos/o/n/contents/sync/pointer.json")
+                .with_status(200)
+                .with_body(r#"{"content":{"sha":"blob2"}}"#),
+            server
+                .mock("GET", mockito::Matcher::Regex(r"/releases/9/assets".into()))
+                .with_status(200)
+                .with_body(listing(&assets)),
+            server
+                .mock("DELETE", "/repos/o/n/releases/assets/1")
+                .with_status(204),
+        ] {
+            mocks.push(mock.match_request(record(&trace)).create_async().await);
+        }
+
+        let local = Local::new();
+        let client = client_at(&server.url());
+        let repo = repo();
+        assert_eq!(
+            run_on_demand(&local.ctx(&client, &repo), 2).await.unwrap(),
+            1
+        );
+
+        let seen = paths(&trace);
+        let flip = seen.iter().position(|p| p.starts_with("PUT")).unwrap();
+        let del = seen.iter().position(|p| p.starts_with("DELETE")).unwrap();
+        assert!(flip < del, "{seen:?}");
+        assert_eq!(published(&trace).snapshots, current.snapshots[1..]);
+    }
+
+    /// Nothing is published, so nothing is proven garbage — and creating a
+    /// release purely to run a delete is exactly what 4-06 refused to do.
+    #[tokio::test]
+    async fn run_on_demand_with_no_pointer_creates_no_release_and_deletes_nothing() {
+        let mut server = mockito::Server::new_async().await;
+        let trace: Trace = Arc::default();
+        let mut mocks = Vec::new();
+        for mock in [
+            server
+                .mock("GET", "/repos/o/n")
+                .with_status(200)
+                .with_body(repo_json(true)),
+            server
+                .mock("GET", "/repos/o/n/contents/sync/pointer.json")
+                .with_status(404)
+                .with_body(r#"{"message":"Not Found"}"#),
+        ] {
+            mocks.push(mock.match_request(record(&trace)).create_async().await);
+        }
+        let release = server
+            .mock("GET", "/repos/o/n/releases/tags/ai-usagebar-sync-v1")
+            .with_status(200)
+            .with_body(r#"{"id":9}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let local = Local::new();
+        let client = client_at(&server.url());
+        let repo = repo();
+        assert_eq!(
+            run_on_demand(&local.ctx(&client, &repo), 10).await.unwrap(),
+            0
+        );
+        release.assert_async().await;
+        assert!(
+            !paths(&trace).iter().any(|p| p.starts_with("PUT")),
+            "nothing was flipped"
+        );
+    }
+
+    /// The grace window is not a constant this module re-declares.
+    #[test]
+    fn the_pass_uses_the_shared_grace_window() {
+        assert_eq!(GRACE, super::super::PRUNE_GRACE);
     }
 }
