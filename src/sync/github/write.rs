@@ -19,7 +19,9 @@
 //! structurally prior to the first byte rather than merely earlier in a
 //! narrative: a `Pushing` exists only as the output of
 //! `assert_pushable(…)?.0.spend(now)?`, so a call that reaches this file at all
-//! proves a visibility check that was fresh within `MAX_CLEARANCE_AGE`.
+//! proves a visibility check that was fresh within `MAX_CLEARANCE_AGE` **and was
+//! about this repository** — every verb below opens with `permit.covers(repo)?`,
+//! so the permit proves its subject as well as its instant.
 //!
 //! It is taken by **reference**, not by value, and the distinction is deliberate.
 //! One push legitimately writes many times under one clearance — a release, `n`
@@ -253,9 +255,10 @@ impl Client {
         &self,
         repo: &RepoRef,
         tag: &str,
-        _permit: &Pushing,
+        permit: &Pushing,
         now: DateTime<Utc>,
     ) -> Result<u64> {
+        permit.covers(repo)?;
         let existing = retried(now, || async {
             let url = self.api_url(repo, &format!("/releases/tags/{tag}"));
             let (status, headers, body) = self
@@ -362,6 +365,7 @@ impl Client {
         permit: &Pushing,
         now: DateTime<Utc>,
     ) -> Result<Asset> {
+        permit.covers(repo)?;
         // Our asset names are a literal prefix plus 64 hex characters plus an
         // extension, so this never fires in practice — but the value is
         // interpolated into a query string, and a check is cheaper to reason
@@ -442,9 +446,10 @@ impl Client {
         &self,
         repo: &RepoRef,
         asset_id: u64,
-        _permit: &Pushing,
+        permit: &Pushing,
         now: DateTime<Utc>,
     ) -> Result<()> {
+        permit.covers(repo)?;
         retried(now, || async {
             let url = self.api_url(repo, &format!("/releases/assets/{asset_id}"));
             let (status, headers, body) = self
@@ -613,9 +618,10 @@ impl Client {
         message: &str,
         body: &[u8],
         sha: Option<&str>,
-        _permit: &Pushing,
+        permit: &Pushing,
         now: DateTime<Utc>,
     ) -> Result<String> {
+        permit.covers(repo)?;
         let content = B64.encode(body);
         let new_sha = retried(now, || async {
             let url = self.api_url(repo, &format!("/contents/{path}"));

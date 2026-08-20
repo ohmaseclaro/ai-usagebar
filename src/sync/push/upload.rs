@@ -49,7 +49,24 @@ type InFlight<'a> = (usize, Pin<Box<dyn Future<Output = Result<()>> + 'a>>);
 /// (T-4-23). Four 48 MiB bodies is also the memory ceiling of this module.
 const MAX_IN_FLIGHT: usize = 4;
 
-/// Upload `packs`, returning `(uploaded, skipped, bytes_uploaded)`.
+/// What one upload pass actually sent.
+///
+/// `names` exists because the incident path has to delete exactly what this run
+/// put on the release, and the only trustworthy answer is the one this process
+/// observed. Reconstructing it by comparing the remote's `created_at` against
+/// this machine's clock is wrong in both directions — see
+/// [`went_public_mid_push`](super::went_public_mid_push).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Uploaded {
+    /// The asset names this run uploaded, in the order they were sent.
+    pub names: Vec<String>,
+    /// Packs already present under the same content address.
+    pub skipped: usize,
+    /// Measured from the packs' own lengths, never from a projection.
+    pub bytes: u64,
+}
+
+/// Upload `packs`, reporting exactly what was sent.
 ///
 /// **Step 1, the resume scan.** One `list_assets`, then a three-way decision
 /// per pack — see [`decide`]. Resume is free because a pack's name *is* its
@@ -87,7 +104,7 @@ pub async fn run(
     packs: &[BuiltPack],
     permit: &gate::Pushing,
     progress: &mut dyn Progress,
-) -> Result<(usize, usize, u64)> {
+) -> Result<Uploaded> {
     let existing = ctx
         .client
         .list_assets(ctx.repo, release_id, ctx.now)
@@ -118,7 +135,52 @@ pub async fn run(
     let outcome = upload_all(ctx, release_id, &pending, permit, progress).await;
     progress.finish();
     outcome?;
-    Ok((pending.len(), skipped, bytes))
+    Ok(Uploaded {
+        names: pending.iter().map(|p| pack_asset_name(&p.id)).collect(),
+        skipped,
+        bytes,
+    })
+}
+
+/// Refuse when the arriving pointer names a keyfile this machine does not hold.
+///
+/// **A different address means another machine rekeyed and this one is stale.**
+/// The old wrapper is exactly what that rekey verifiably deleted; republishing
+/// it puts it back where the old password opens it, and `PRUNE_GRACE` then
+/// protects it for 24 h while every subsequent push from this machine resets
+/// `created_at` — so it is never collected and the password change was
+/// cosmetic.
+///
+/// It refuses rather than silently skipping the upload. A skip would leave the
+/// bundle correct and the *user* wrong: the old password would keep opening this
+/// machine's local keyfile forever while they believed the password had changed
+/// everywhere. The data is unaffected either way — a rekey rewraps the master
+/// key and re-encrypts nothing — so the refusal costs a manual file copy, not a
+/// backup.
+///
+/// `previous == None` is a first push and the only case that legitimately
+/// publishes from local state.
+pub(crate) fn assert_keyfile_is_current(ctx: &PushCtx<'_>) -> Result<()> {
+    let Some(published) = ctx.previous.as_ref().map(|p| p.keyfile.as_str()) else {
+        return Ok(());
+    };
+    let local = keyfile_asset_name(&content_address(&canonical_keyfile(ctx)?));
+    if published == local {
+        return Ok(());
+    }
+    let path = crate::sync::cli::keyfile_path(ctx.roots);
+    Err(AppError::Other(format!(
+        "STOP — the sync password was changed on another machine. The bundle names {published}, \
+         but this machine's keyfile is {local}, the superseded wrapper.\n\
+         Refusing to push: publishing it would put the old wrapper back on the remote, where \
+         the old password opens it again — undoing the password change. Nothing was uploaded \
+         and the snapshot pointer is untouched.\n\
+         Your data is unaffected. A password change rewraps the master key and re-encrypts no \
+         pack, so every byte already on the remote is still readable under the new password.\n\
+         To catch this machine up, copy {} from the machine where the password was changed, \
+         replacing the local file, then re-run the same command.",
+        path.display()
+    )))
 }
 
 /// Publish the local keyfile asset if the release does not already carry it.
@@ -143,18 +205,21 @@ pub async fn run(
 /// here re-wraps, re-derives or re-encrypts anything — getting a keyfile's bytes
 /// wrong is an unrecoverable bundle.
 ///
-/// **Known sharp edge, for whoever wires the rekey path.** This publishes
-/// whatever keyfile is on *this* machine's disk. If another machine has rekeyed
-/// and this one still holds the superseded wrapper, calling this re-uploads it
-/// — D5 destroyed that asset deliberately. The pointer is unaffected (its
-/// `keyfile` comes from the arriving pointer), so the bundle stays readable, but
-/// the old wrapper comes back as an orphan asset prune never collects. Rekey
-/// must write the new keyfile to disk *before* calling this.
+/// **It publishes only a keyfile the arriving pointer already names.** This
+/// reads whatever is on *this* machine's disk, and if another machine has
+/// rekeyed that is the superseded wrapper — the asset D5 verifiably deleted.
+/// Re-uploading it resurrects it, and prune's orphan-keyfile sweep cannot reach
+/// it because `PRUNE_GRACE` retains anything younger than 24 h and the next push
+/// from the same stale machine resets `created_at`. So
+/// [`assert_keyfile_is_current`] refuses first, here and again at the top of
+/// `push::run` where the refusal costs nothing. Rekey does not call this at all
+/// — during a rekey the local keyfile is still the old one until after the flip.
 pub async fn ensure_keyfile(
     ctx: &PushCtx<'_>,
     release_id: u64,
     permit: &gate::Pushing,
 ) -> Result<()> {
+    assert_keyfile_is_current(ctx)?;
     let bytes = canonical_keyfile(ctx)?;
     let name = keyfile_asset_name(&content_address(&bytes));
     let existing = ctx
@@ -414,6 +479,7 @@ mod tests {
                 repo_id: "github:1".into(),
                 keyfile_asset: "keyfile-unset.json".into(),
                 previous: None,
+                allow_rollback: false,
                 now: NOW,
             }
         }
@@ -500,13 +566,23 @@ mod tests {
         let (c_up, _c_down) = mock_pack(&mut server, &packs[2], 102).await;
 
         let local = Local::at(&server.url());
-        let (uploaded, skipped, bytes) = run(&local.ctx(), RELEASE, &packs, &permit(), &mut Silent)
+        let sent = run(&local.ctx(), RELEASE, &packs, &permit(), &mut Silent)
             .await
             .unwrap();
 
-        assert_eq!((uploaded, skipped), (2, 1));
+        assert_eq!((sent.names.len(), sent.skipped), (2, 1));
+        // **F-4.** The names are the ones this run observed itself sending, so
+        // the incident path never has to infer them from the remote's clock.
+        assert_eq!(
+            sent.names,
+            vec![pack_asset_name(&packs[1].id), pack_asset_name(&packs[2].id)],
+            "and the pack an earlier run landed is not among them"
+        );
         // Measured from the packs' own lengths, never projected.
-        assert_eq!(bytes, (packs[1].bytes.len() + packs[2].bytes.len()) as u64);
+        assert_eq!(
+            sent.bytes,
+            (packs[1].bytes.len() + packs[2].bytes.len()) as u64
+        );
         skipped_upload.assert_async().await;
         b_up.assert_async().await;
         c_up.assert_async().await;
@@ -531,11 +607,11 @@ mod tests {
         let (upload, _download) = mock_pack(&mut server, &packs[0], 101).await;
 
         let local = Local::at(&server.url());
-        let (uploaded, skipped, _) = run(&local.ctx(), RELEASE, &packs, &permit(), &mut Silent)
+        let sent = run(&local.ctx(), RELEASE, &packs, &permit(), &mut Silent)
             .await
             .unwrap();
 
-        assert_eq!((uploaded, skipped), (1, 0));
+        assert_eq!((sent.names.len(), sent.skipped), (1, 0));
         delete.assert_async().await;
         upload.assert_async().await;
     }
@@ -697,11 +773,11 @@ mod tests {
             .await;
 
         let local = Local::at(&server.url());
-        let (uploaded, _, _) = run(&local.ctx(), RELEASE, &packs, &permit(), &mut Silent)
+        let sent = run(&local.ctx(), RELEASE, &packs, &permit(), &mut Silent)
             .await
             .unwrap();
 
-        assert_eq!(uploaded, 6);
+        assert_eq!(sent.names.len(), 6);
         // The literal, not `MAX_IN_FLIGHT`: asserted against the constant this
         // test passes at any cap, because the observed maximum simply follows
         // it. Raising the ceiling must turn this red and make someone justify

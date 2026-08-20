@@ -214,18 +214,48 @@ const VISIBILITY_INTERNAL: &str = "internal";
 #[must_use = "a clearance that is not spent is a private-repo check nothing acted on"]
 pub struct PushClearance {
     checked_at: DateTime<Utc>,
+    repo: RepoRef,
 }
 
-/// Permission to send a byte, and the only thing that carries it.
+/// Permission to send a byte **to one named repository**, and the only thing
+/// that carries it.
 ///
-/// Private field, no public constructor, no `Clone`: the sole way to hold one is
-/// [`PushClearance::spend`], which does the freshness arithmetic on the way
+/// Private fields, no public constructor, no `Clone`: the sole way to hold one
+/// is [`PushClearance::spend`], which does the freshness arithmetic on the way
 /// through. A write verb that takes a `Pushing` therefore cannot be reached
 /// without a check that was fresh at the call — not by discipline, and not by a
 /// method someone remembers to invoke.
+///
+/// # Why it names its subject
+///
+/// A permit proving only *when* a check happened proves nothing about *what* it
+/// was about: one minted against a private repo A would type-check against a
+/// write to repo B, and the design would hold only because every caller happens
+/// to thread the same `ctx.repo` through both. [`Pushing::covers`] makes the
+/// subject structural, matching the pattern `Root`'s AAD already uses — bind the
+/// identity rather than trusting that two call sites agree.
 #[derive(Debug)]
 #[must_use = "a Pushing is permission to upload; dropping one uploads nothing"]
-pub struct Pushing(());
+pub struct Pushing(RepoRef);
+
+impl Pushing {
+    /// Refuse a write to a repository this permit was not minted against.
+    ///
+    /// Called by every write verb in [`write`](super::write) before the request
+    /// is built, so the check cannot be skipped by adding a verb that forgets it
+    /// — the permit is the only way in, and this is the only way to read it.
+    pub(crate) fn covers(&self, repo: &RepoRef) -> Result<()> {
+        if self.0 == *repo {
+            return Ok(());
+        }
+        Err(AppError::Other(format!(
+            "REFUSING TO WRITE: the private-repo check was run against {}, but this request \
+             targets {repo}. A clearance proves one repository was private at one instant and \
+             says nothing about any other.",
+            self.0
+        )))
+    }
+}
 
 impl PushClearance {
     pub fn checked_at(&self) -> DateTime<Utc> {
@@ -241,7 +271,7 @@ impl PushClearance {
         let age = now.signed_duration_since(self.checked_at);
         let fresh = age >= TimeDelta::zero() && age.to_std().is_ok_and(|a| a <= MAX_CLEARANCE_AGE);
         if fresh {
-            return Ok(Pushing(()));
+            return Ok(Pushing(self.repo));
         }
         Err(AppError::Other(format!(
             "the private-repo check is {}s old (limit {}s) — re-run it immediately before \
@@ -380,7 +410,13 @@ pub fn assert_pushable(
         )));
     }
 
-    Ok((PushClearance { checked_at: now }, warnings))
+    Ok((
+        PushClearance {
+            checked_at: now,
+            repo: repo.clone(),
+        },
+        warnings,
+    ))
 }
 
 #[cfg(test)]
@@ -739,8 +775,7 @@ mod tests {
         const FORBIDDEN: [&str; 4] = ["/user/repos", "/orgs/", "/generate", "/forks"];
 
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files = Vec::new();
-        collect_rs(&root, &mut files);
+        let files = crate::sync::guard::rs_files(&root);
 
         let mut scanned = 0usize;
         let mut skipped = 0usize;
@@ -769,17 +804,6 @@ mod tests {
         // found nothing, would otherwise report green forever.
         assert_eq!(skipped, 1, "this file must be excluded exactly once");
         assert!(scanned > 50, "only {scanned} files walked under {root:?}");
-    }
-
-    fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                collect_rs(&path, out);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                out.push(path);
-            }
-        }
     }
 
     /// D-04's "immediately", enforceable rather than merely described — and
@@ -834,8 +858,52 @@ mod tests {
             !code.contains("fn assert_fresh"),
             "a &self freshness check is exactly the thing that had no callers"
         );
-        // `Pushing`'s field is private and unit-typed, so `Pushing(())` outside
-        // this module does not compile; the only literal is inside `spend`.
-        assert_eq!(code.matches("Ok(Pushing(()))").count(), 1, "one mint site");
+        // `Pushing`'s field is private, so `Pushing(..)` outside this module
+        // does not compile; the only construction is inside `spend`.
+        assert_eq!(code.matches("Ok(Pushing(").count(), 1, "one mint site");
+        assert_eq!(
+            code.matches("Pushing(").count(),
+            2,
+            "the declaration and the one mint site, and nothing else"
+        );
+    }
+
+    /// **F-6.** A permit proves *when* the check happened and *what it was
+    /// about*. Without the second half a clearance minted against a private repo
+    /// A type-checks against a write to repo B, and the design holds only
+    /// because every caller happens to thread one `ctx.repo` through both.
+    #[test]
+    fn a_permit_minted_for_one_repository_refuses_a_write_to_another() {
+        let permit = assert_pushable(&facts(true), &repo(), true, now())
+            .unwrap()
+            .0
+            .spend(now())
+            .unwrap();
+
+        assert!(permit.covers(&repo()).is_ok());
+
+        let elsewhere = RepoRef::parse("o/other").unwrap();
+        let err = permit
+            .covers(&elsewhere)
+            .expect_err("a permit is not transferable between repositories")
+            .to_string();
+        assert!(err.contains("o/n") && err.contains("o/other"), "{err}");
+
+        // Every write verb in `write.rs` consults it, so the check cannot be
+        // skipped by adding a verb that forgets to.
+        let write = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sync/github/write.rs"),
+        )
+        .unwrap();
+        let code = write.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+        assert_eq!(
+            code.matches("permit.covers(repo)?;").count(),
+            code.matches("permit: &Pushing,").count(),
+            "every verb taking a Pushing must check that it covers this repo"
+        );
+        assert!(
+            code.matches("permit: &Pushing,").count() >= 4,
+            "the four write verbs are still there"
+        );
     }
 }

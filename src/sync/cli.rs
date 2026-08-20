@@ -75,8 +75,11 @@ pub fn run_with(
     match action {
         SyncAction::Status => status(cfg, roots, endpoints, chain, now),
         SyncAction::Setup => setup(cfg, roots, endpoints, chain, now),
-        SyncAction::Push { dry_run: true } => dry_run(cfg, roots, now),
-        SyncAction::Push { dry_run: false } => push(cfg, roots, endpoints, chain, now),
+        SyncAction::Push { dry_run: true, .. } => dry_run(cfg, roots, now),
+        SyncAction::Push {
+            dry_run: false,
+            allow_rollback,
+        } => push(cfg, roots, endpoints, chain, *allow_rollback, now),
         SyncAction::Prune => prune(cfg, roots, endpoints, chain, now),
         SyncAction::Rekey => rekey(cfg, roots, endpoints, chain, now),
     }
@@ -530,6 +533,7 @@ fn push(
     roots: &SyncRoots,
     endpoints: &Endpoints,
     chain: &TokenChain,
+    allow_rollback: bool,
     now: DateTime<Utc>,
 ) -> i32 {
     let parts = match resolve(cfg, roots, endpoints, chain) {
@@ -537,7 +541,7 @@ fn push(
         Err(why) => return refuse(&why),
     };
     match local_keyfile(&keyfile_path(roots)) {
-        Ok(keyfile) => push_with_parts(cfg, roots, &parts, &keyfile, now),
+        Ok(keyfile) => push_with_parts(cfg, roots, &parts, &keyfile, allow_rollback, now),
         Err(why) => refuse(&why),
     }
 }
@@ -554,13 +558,15 @@ fn push_with_parts(
     roots: &SyncRoots,
     parts: &Resolved,
     keyfile: &LocalKeyfile,
+    allow_rollback: bool,
     now: DateTime<Utc>,
 ) -> i32 {
     let rt = match runtime() {
         Ok(rt) => rt,
         Err(why) => return refuse(&why),
     };
-    let ctx = context(cfg, roots, keyfile, parts, now);
+    let mut ctx = context(cfg, roots, keyfile, parts, now);
+    ctx.allow_rollback = allow_rollback;
     // A progress line on a terminal, plain completed-asset lines when piped.
     // `is_terminal` is read here rather than inside the reporter so tests can
     // pin either shape without a tty.
@@ -706,6 +712,10 @@ fn context<'a>(
         // Filled by `push::run` from the remote, after the gate. A caller that
         // populated it would have had to make a request before the gate.
         previous: None,
+        // Only `sync push` offers the escape; prune and rekey refuse a
+        // rolled-back pointer outright, because neither is a command a user
+        // reaches for when they mean to move the bundle backwards.
+        allow_rollback: false,
         now,
     }
 }
@@ -844,7 +854,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         assert_ne!(
             drive(
-                &SyncAction::Push { dry_run: false },
+                &SyncAction::Push {
+                    dry_run: false,
+                    allow_rollback: false,
+                },
                 &cfg_with_repo(None),
                 &dir,
                 "http://127.0.0.1:1",
@@ -1139,7 +1152,7 @@ mod tests {
             },
         )
         .expect("the fixture is configured and paired");
-        push_with_parts(cfg, roots, &parts, keyfile, NOW)
+        push_with_parts(cfg, roots, &parts, keyfile, false, NOW)
     }
 
     /// Every asset a fixture has accepted, in upload order: id `n` is index
@@ -1530,7 +1543,10 @@ mod tests {
     fn the_three_write_actions_dispatch_and_refuse_an_unconfigured_machine() {
         let dir = TempDir::new().unwrap();
         for action in [
-            SyncAction::Push { dry_run: false },
+            SyncAction::Push {
+                dry_run: false,
+                allow_rollback: false,
+            },
             SyncAction::Prune,
             SyncAction::Rekey,
         ] {

@@ -53,10 +53,16 @@ use super::{Pointer, PushCtx};
 ///
 /// Three exclusions are absolute, and each has its own test:
 ///
-/// - **The asset named by `pointer.keyfile`.** No snapshot's `packs` list names
-///   it, so the naive rule collects it — and the wrapped master key inside is
-///   the only route to the data, for every machine, permanently. This is the
-///   single worst thing this function could do.
+/// - **The asset named by `pointer.keyfile`, and this machine's own
+///   `local_keyfile`.** No snapshot's `packs` list names either, so the naive
+///   rule collects them — and the wrapped master key inside is the only route to
+///   the data, for every machine, permanently. This is the single worst thing
+///   this function could do, which is why the exclusion is not defined solely by
+///   the pointer: that value is untrusted plaintext carried forward from the
+///   remote by rebuild rule 3, so a pointer naming a keyfile that does not exist
+///   would make an honest machine sweep the real one as an orphan. The caller
+///   also holds a trustworthy local answer (`PushCtx::keyfile_asset`), and both
+///   are excluded.
 /// - **Anything younger than `grace`**, whatever the pointer says about it. Not
 ///   belt and braces: see [`PRUNE_GRACE`](super::PRUNE_GRACE) for the race it is
 ///   the only cover for.
@@ -77,6 +83,7 @@ use super::{Pointer, PushCtx};
 /// `ensure_release` — which *creates* a release — purely to run a delete.
 pub fn plan_deletions(
     pointer: &Pointer,
+    local_keyfile: &str,
     assets: &[Asset],
     keep: usize,
     now: DateTime<Utc>,
@@ -101,7 +108,7 @@ pub fn plan_deletions(
         .filter(|a| now - a.created_at > grace)
         .filter(|a| match asset_kind(&a.name) {
             Some(Kind::Pack(id)) => !live.contains(&id),
-            Some(Kind::Keyfile) => a.name != kept.keyfile,
+            Some(Kind::Keyfile) => a.name != kept.keyfile && a.name != local_keyfile,
             None => false,
         })
         .map(|a| a.id)
@@ -147,7 +154,14 @@ pub async fn run(
         .client
         .list_assets(ctx.repo, release_id, ctx.now)
         .await?;
-    let (_kept, doomed) = plan_deletions(landed, &assets, keep, ctx.now, super::PRUNE_GRACE);
+    let (_kept, doomed) = plan_deletions(
+        landed,
+        &ctx.keyfile_asset,
+        &assets,
+        keep,
+        ctx.now,
+        super::PRUNE_GRACE,
+    );
 
     // Sequential rather than concurrent, deliberately: the whole set is a
     // handful of requests, deletion is the one irreversible operation in this
@@ -227,6 +241,12 @@ pub async fn run_on_demand(ctx: &PushCtx<'_>, keep: usize) -> Result<usize> {
         return Ok(0);
     };
 
+    // The rollback anchor, before liveness is computed over this pointer. This
+    // is the path where a laundered rollback becomes irreversible:
+    // `plan_deletions` treats every pack the dropped snapshots alone referenced
+    // as unreferenced, and those packs are older than `PRUNE_GRACE`.
+    super::assert_no_rollback(ctx, Some(&current))?;
+
     let release_id = ctx
         .client
         .ensure_release(ctx.repo, super::RELEASE_TAG, &permit, ctx.now)
@@ -242,7 +262,15 @@ pub async fn run_on_demand(ctx: &PushCtx<'_>, keep: usize) -> Result<usize> {
                     .into(),
             )
         })?;
-        Ok(plan_deletions(arriving, &[], keep, ctx.now, super::PRUNE_GRACE).0)
+        Ok(plan_deletions(
+            arriving,
+            &ctx.keyfile_asset,
+            &[],
+            keep,
+            ctx.now,
+            super::PRUNE_GRACE,
+        )
+        .0)
     };
     let (landed, _sha) = super::pointer::commit(
         ctx.client,
@@ -264,6 +292,11 @@ mod tests {
     use crate::sync::crypto::ChunkId;
     use crate::sync::github::write::ASSET_STATE_UPLOADED;
     use crate::sync::push::{POINTER_VERSION, SnapshotRecord, keyfile_asset_name, pack_asset_name};
+
+    /// This machine's own keyfile asset — the trustworthy half of the exclusion
+    /// set. Deliberately a name no fixture below plants, so every existing case
+    /// still exercises the pointer's half; the one test that cares plants it.
+    const LOCAL_KEYFILE: &str = "keyfile-                                 0000000000000000000000000000000000000000000000000000000000000001                                 .json";
 
     /// Fixed. Nothing here reads a clock: `plan_deletions` takes `now`.
     pub(super) const NOW: DateTime<Utc> = match DateTime::from_timestamp(1_700_000_000, 0) {
@@ -327,7 +360,7 @@ mod tests {
             asset(4, &keyfile, OLD),
         ];
 
-        let (kept, doomed) = plan_deletions(&p, &assets, 10, NOW, GRACE);
+        let (kept, doomed) = plan_deletions(&p, LOCAL_KEYFILE, &assets, 10, NOW, GRACE);
 
         assert_eq!(doomed, vec![3], "only C");
         assert_eq!(kept.snapshots.len(), 2, "nothing to truncate at keep = 10");
@@ -346,7 +379,8 @@ mod tests {
             (GRACE + TimeDelta::seconds(1), vec![7]),
             (OLD, vec![7]),
         ] {
-            let (_, doomed) = plan_deletions(&p, &[pack(7, 0xcc, age)], 10, NOW, GRACE);
+            let (_, doomed) =
+                plan_deletions(&p, LOCAL_KEYFILE, &[pack(7, 0xcc, age)], 10, NOW, GRACE);
             assert_eq!(doomed, expected, "at age {age}");
         }
     }
@@ -359,7 +393,7 @@ mod tests {
             "keyfile-x.json",
             vec![snapshot(vec![id(0xaa)]), snapshot(vec![id(0xbb)])],
         );
-        let (_, doomed) = plan_deletions(&p, &[pack(1, 0xaa, OLD)], 10, NOW, GRACE);
+        let (_, doomed) = plan_deletions(&p, LOCAL_KEYFILE, &[pack(1, 0xaa, OLD)], 10, NOW, GRACE);
         assert!(doomed.is_empty(), "{doomed:?}");
     }
 
@@ -379,6 +413,7 @@ mod tests {
             // release: every reason the naive rule would have to collect it.
             let (_, doomed) = plan_deletions(
                 &p,
+                LOCAL_KEYFILE,
                 &[asset(1, &keyfile, TimeDelta::days(365))],
                 1,
                 NOW,
@@ -401,9 +436,32 @@ mod tests {
             asset(3, &keyfile_asset_name(&id(0xdd)), TimeDelta::hours(2)),
         ];
 
-        let (_, doomed) = plan_deletions(&p, &assets, 10, NOW, GRACE);
+        let (_, doomed) = plan_deletions(&p, LOCAL_KEYFILE, &assets, 10, NOW, GRACE);
 
         assert_eq!(doomed, vec![2], "the live one and the young one both stay");
+    }
+
+    /// **F-7.** `kept.keyfile` is untrusted plaintext carried forward from the
+    /// remote, and T-4-36 calls deleting the keyfile the single worst thing this
+    /// function can do. A pointer naming a keyfile that does not exist must not
+    /// make an honest machine sweep its own.
+    #[test]
+    fn a_lying_pointer_cannot_make_this_machine_sweep_its_own_keyfile() {
+        let mine = keyfile_asset_name(&id(0x11));
+        let p = pointer(
+            &keyfile_asset_name(&id(0xff)),
+            vec![snapshot(vec![id(0xaa)])],
+        );
+        let orphan = keyfile_asset_name(&id(0xee));
+        let assets = [asset(1, &mine, OLD), asset(2, &orphan, OLD)];
+
+        let (_, doomed) = plan_deletions(&p, &mine, &assets, 10, NOW, GRACE);
+
+        assert_eq!(
+            doomed,
+            vec![2],
+            "the local wrapper survives a pointer that does not name it"
+        );
     }
 
     /// A collector that deletes what it does not understand turns every format
@@ -429,7 +487,7 @@ mod tests {
             .map(|(i, name)| asset(i as u64 + 1, name, TimeDelta::days(365)))
             .collect();
 
-        let (_, doomed) = plan_deletions(&p, &assets, 10, NOW, GRACE);
+        let (_, doomed) = plan_deletions(&p, LOCAL_KEYFILE, &assets, 10, NOW, GRACE);
 
         assert!(doomed.is_empty(), "{doomed:?}");
     }
@@ -448,7 +506,7 @@ mod tests {
         );
         let assets = [pack(1, 0x01, OLD), pack(2, 0x02, OLD), pack(3, 0x03, OLD)];
 
-        let (kept, doomed) = plan_deletions(&p, &assets, 2, NOW, GRACE);
+        let (kept, doomed) = plan_deletions(&p, LOCAL_KEYFILE, &assets, 2, NOW, GRACE);
 
         assert_eq!(kept.snapshots, p.snapshots[1..], "oldest end only");
         assert_eq!(doomed, vec![1], "0x02 is still shared, 0x03 is the newest");
@@ -461,7 +519,7 @@ mod tests {
     fn a_pointer_with_no_snapshots_proposes_no_deletions() {
         let p = pointer("keyfile-x.json", vec![]);
         let assets = [pack(1, 0xaa, OLD), pack(2, 0xbb, OLD)];
-        let (kept, doomed) = plan_deletions(&p, &assets, 10, NOW, GRACE);
+        let (kept, doomed) = plan_deletions(&p, LOCAL_KEYFILE, &assets, 10, NOW, GRACE);
         assert!(doomed.is_empty(), "{doomed:?}");
         assert!(kept.snapshots.is_empty());
     }
@@ -475,7 +533,8 @@ mod tests {
             "keyfile-x.json",
             vec![snapshot(vec![id(0x01)]), snapshot(vec![id(0x02)])],
         );
-        let (kept, doomed) = plan_deletions(&p, &[pack(1, 0x01, OLD)], 0, NOW, GRACE);
+        let (kept, doomed) =
+            plan_deletions(&p, LOCAL_KEYFILE, &[pack(1, 0x01, OLD)], 0, NOW, GRACE);
         assert_eq!(kept.snapshots, p.snapshots[1..]);
         assert_eq!(doomed, vec![1]);
     }
@@ -597,6 +656,7 @@ mod delete_pass {
                 repo_id: "github:1".into(),
                 keyfile_asset: keyfile_asset_name(&id(0xff)),
                 previous: None,
+                allow_rollback: false,
                 now: NOW,
             }
         }
@@ -798,10 +858,13 @@ mod delete_pass {
 
         first.assert_async().await;
         second.assert_async().await;
-        let known = local.index.known_chunks(&[id(0x01), id(0x02), id(0x03)]);
-        assert!(!known.contains(&id(0x01)), "the deleted pack is forgotten");
-        assert!(known.contains(&id(0x02)), "a failed delete keeps its rows");
-        assert!(known.contains(&id(0x03)), "a live pack keeps its rows");
+        let known = local.index.chunk_locations(&[id(0x01), id(0x02), id(0x03)]);
+        assert!(
+            !known.contains_key(&id(0x01)),
+            "the deleted pack is forgotten"
+        );
+        assert!(known.contains_key(&id(0x02)), "a failed delete keeps rows");
+        assert!(known.contains_key(&id(0x03)), "a live pack keeps its rows");
     }
 
     /// T-4-35. `landed` is whatever `pointer::commit` returned, so a machine

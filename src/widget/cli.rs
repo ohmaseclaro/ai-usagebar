@@ -192,6 +192,15 @@ pub enum SyncAction {
         /// contacts no network.
         #[arg(long)]
         dry_run: bool,
+
+        /// Push onto a bundle whose snapshot counter went **backwards**.
+        ///
+        /// An older snapshot is authentic data replayed to hide a newer one, so
+        /// it is refused by default. Pass this only when you know why the remote
+        /// went back — you rebuilt the bundle from scratch, or you deliberately
+        /// restored an older one.
+        #[arg(long)]
+        allow_rollback: bool,
     },
 
     /// Delete remote data no kept snapshot still references.
@@ -504,7 +513,10 @@ mod tests {
         assert!(matches!(
             dry.command,
             Some(Command::Sync {
-                action: SyncAction::Push { dry_run: true }
+                action: SyncAction::Push {
+                    dry_run: true,
+                    allow_rollback: false
+                }
             })
         ));
 
@@ -513,7 +525,10 @@ mod tests {
         assert!(matches!(
             bare.command,
             Some(Command::Sync {
-                action: SyncAction::Push { dry_run: false }
+                action: SyncAction::Push {
+                    dry_run: false,
+                    allow_rollback: false
+                }
             })
         ));
 

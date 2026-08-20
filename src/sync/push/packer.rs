@@ -1,5 +1,6 @@
 //! `SyncPlan` to `PushBundle`: sealed chunks packed into remote-sized objects,
-//! plus the manifest, the index object and the snapshot root.
+//! plus the manifest and the index object. The snapshot root is sealed by
+//! [`root_for`], which the flip's rebuild closure calls on every attempt.
 //!
 //! This is the object that makes GitHub's 80-per-minute content-creation limit
 //! irrelevant: 5,000 chunks become a handful of 48 MiB assets rather than 5,000
@@ -50,7 +51,7 @@ use crate::sync::pack::{PackWriter, should_seal};
 use crate::sync::plan::SyncPlan;
 use crate::sync::{CHUNK_SIZE, SyncRoots};
 
-use super::{B64, BuiltPack, PushBundle, PushCtx, RemoteIndexEntry};
+use super::{B64, BuiltPack, Pointer, PushBundle, PushCtx, RemoteIndexEntry};
 
 /// Turn a plan into the bytes a push puts on the wire.
 ///
@@ -71,7 +72,10 @@ use super::{B64, BuiltPack, PushBundle, PushCtx, RemoteIndexEntry};
 ///    [`PushBundle::index_chunks`] exists as a plaintext bootstrap in the
 ///    pointer.
 ///
-/// The snapshot root comes last, naming the manifest's chunk ids in order.
+/// The snapshot root is **not** built here — see [`root_for`]. It carries the
+/// counter, which is a function of the pointer the flip actually lands against,
+/// so it is sealed inside the rebuild closure that reruns on a conflict. This
+/// returns the manifest's chunk ids in order for that closure to name.
 ///
 /// Nothing here seals a new *kind* of object: packs, manifests, index objects
 /// and roots are the four the format already defines, so Phase 1's deferred AAD
@@ -158,16 +162,13 @@ pub fn build(ctx: &PushCtx<'_>, plan: &SyncPlan) -> Result<PushBundle> {
         })
         .collect();
 
-    // 4. The root, naming the manifest's chunks in order.
-    let counter = next_counter(ctx)?;
-    let root = Root::new(
-        counter,
-        ctx.now,
-        ctx.repo_id.clone(),
-        manifest_chunks,
-        ctx.kdf,
-    )
-    .seal(ctx.keys)?;
+    // 4. **The root is not built here.** It carries the snapshot counter, and
+    //    the counter is a function of the pointer that the flip actually lands
+    //    against — which a lost race changes underneath this run. Sealing it now
+    //    would freeze a counter computed before the race and never recomputed
+    //    after it, which is how two machines publish two snapshots at the same
+    //    counter. `push::run`'s rebuild closure calls [`root_for`] instead, on
+    //    every attempt, and this bundle carries only the manifest's chunk ids.
 
     // 5. The local chunk table learns where everything this run packed landed —
     //    after `finish`, when the packs' content addresses exist.
@@ -191,10 +192,9 @@ pub fn build(ctx: &PushCtx<'_>, plan: &SyncPlan) -> Result<PushBundle> {
 
     Ok(PushBundle {
         packs: packs.done,
-        root,
+        manifest_chunks,
         index_chunks,
         referenced_packs,
-        counter,
     })
 }
 
@@ -354,33 +354,70 @@ fn supersedes(ctx: &PushCtx<'_>) -> Vec<ChunkId> {
         .unwrap_or_default()
 }
 
-/// One above the highest counter the pointer's snapshot roots carry, or 1 on a
-/// first push.
+/// The highest counter `pointer`'s snapshot roots carry, or 0 when there is no
+/// pointer at all.
 ///
 /// Read out of the sealed roots rather than off the pointer's shape, because
 /// position in `snapshots` is remote-controlled and the counter inside a root is
 /// not: a reader selects by counter, so the writer must too.
 ///
+/// This is also the value the local rollback anchor is compared against
+/// (`push::assert_no_rollback`), and there is deliberately **one** function for
+/// both: the audit's carry-forward is explicit that the push-side rollback check
+/// and the counter derivation must not be implemented twice differently.
+///
 /// Do **not** advance the local anchor from here. Phase 1's rule is that the
-/// anchor advances only after a snapshot verifies, and this code is producing
-/// one, not verifying it.
-fn next_counter(ctx: &PushCtx<'_>) -> Result<u64> {
-    let Some(previous) = ctx.previous.as_ref() else {
-        return Ok(1);
+/// anchor advances only after a snapshot verifies, and this module is producing
+/// one, not verifying it; [`super::run`] advances it after the flip lands.
+pub(crate) fn highest_counter(pointer: Option<&Pointer>, keys: &Keys, repo_id: &str) -> u64 {
+    let Some(pointer) = pointer else {
+        return 0;
     };
-    let highest = previous
+    pointer
         .snapshots
         .iter()
         .filter_map(|s| B64.decode(&s.root).ok())
-        .filter_map(|framed| Root::open(ctx.keys, &framed, &ctx.repo_id).ok())
+        .filter_map(|framed| Root::open(keys, &framed, repo_id).ok())
         .map(|root| root.counter)
         // A pointer whose roots this build cannot open — a damaged entry, or one
         // written by a format this build predates. The snapshot count is the
         // fallback the tracer used: monotone for this machine, and never a value
         // this bundle has already published.
         .max()
-        .unwrap_or(previous.snapshots.len() as u64);
-    Ok(highest + 1)
+        .unwrap_or(pointer.snapshots.len() as u64)
+}
+
+/// Seal this run's snapshot root against the pointer that is **actually
+/// arriving**, returning the framed root and the counter inside it.
+///
+/// Called from `push::run`'s rebuild closure rather than from [`build`], and
+/// that placement is the whole point. `build` runs once; the closure runs again
+/// on a 409. A counter derived where `build` runs is computed before the race
+/// and never recomputed after it, so two machines that both read a pointer at
+/// counter 6 both seal a root at 7 and the loser republishes its 7 alongside the
+/// winner's. Two distinct snapshots at one counter make "select the newest by
+/// counter" ambiguous, and `anchor::accept` reads an equal counter as a re-read
+/// of a snapshot already seen — so one of the two backups is silently dropped by
+/// the control that exists to protect backups.
+///
+/// The counter is the format's only ordering field and the rollback anchor's
+/// subject, so it stays monotonic and meaningful: strictly one above the highest
+/// counter the arriving pointer carries.
+pub(crate) fn root_for(
+    ctx: &PushCtx<'_>,
+    arriving: Option<&Pointer>,
+    manifest_chunks: &[ChunkId],
+) -> Result<(Vec<u8>, u64)> {
+    let counter = highest_counter(arriving, ctx.keys, &ctx.repo_id) + 1;
+    let root = Root::new(
+        counter,
+        ctx.now,
+        ctx.repo_id.clone(),
+        manifest_chunks.to_vec(),
+        ctx.kdf,
+    )
+    .seal(ctx.keys)?;
+    Ok((root, counter))
 }
 
 /// The root-prefixed relative encoding — see the module docs.
@@ -537,6 +574,7 @@ mod tests {
                 repo_id: REPO_ID.into(),
                 keyfile_asset: "keyfile-x.json".into(),
                 previous,
+                allow_rollback: false,
                 now: NOW,
             }
         }
@@ -586,13 +624,17 @@ mod tests {
 
     /// The pointer the flip would have published for `bundle` — which is what
     /// makes its packs reusable on the next push.
-    fn published(bundle: &PushBundle) -> Pointer {
+    ///
+    /// The root is sealed here, through the same [`root_for`] the flip's rebuild
+    /// closure calls, because the packer no longer produces one.
+    fn published(fx: &Fixture, bundle: &PushBundle) -> Pointer {
+        let (root, _) = root_for(&fx.ctx(None), None, &bundle.manifest_chunks).unwrap();
         Pointer {
             format: super::super::POINTER_VERSION,
             repo_id: REPO_ID.into(),
             keyfile: "keyfile-x.json".into(),
             snapshots: vec![SnapshotRecord {
-                root: B64.encode(&bundle.root),
+                root: B64.encode(&root),
                 index_chunks: bundle.index_chunks.clone(),
                 packs: bundle.referenced_packs.clone(),
             }],
@@ -823,7 +865,8 @@ mod tests {
         let plan = plan_of(vec![fx.seed("accounts/work/.credentials.json", &body)]);
 
         let bundle = build(&fx.ctx(None), &plan).unwrap();
-        assert_eq!(bundle.counter, 1, "a first push starts at one");
+        let (framed, counter) = root_for(&fx.ctx(None), None, &bundle.manifest_chunks).unwrap();
+        assert_eq!(counter, 1, "a first push starts at one");
 
         // The bootstrap: the index object's own chunks, named in the clear.
         assert!(!bundle.index_chunks.is_empty());
@@ -858,7 +901,7 @@ mod tests {
         )
         .unwrap();
 
-        let root = Root::open(&fx.keys, &bundle.root, REPO_ID).unwrap();
+        let root = Root::open(&fx.keys, &framed, REPO_ID).unwrap();
         assert_eq!(root.counter, 1);
         assert_eq!(root.kdf, CHEAP);
 
@@ -892,7 +935,7 @@ mod tests {
         for pack in &bundle.packs {
             assert!(!pack.bytes.windows(needle.len()).any(|w| w == needle));
         }
-        assert!(!bundle.root.windows(needle.len()).any(|w| w == needle));
+        assert!(!framed.windows(needle.len()).any(|w| w == needle));
     }
 
     /// **T-4-13.** A second push over an unchanged tree re-seals no data chunk,
@@ -905,7 +948,7 @@ mod tests {
         let plan = plan_of(vec![fx.seed("accounts/work/.credentials.json", &body)]);
 
         let first = build(&fx.ctx(None), &plan).unwrap();
-        let second = build(&fx.ctx(Some(published(&first))), &plan).unwrap();
+        let second = build(&fx.ctx(Some(published(&fx, &first))), &plan).unwrap();
 
         let data: HashSet<ChunkId> = plan.file_plans[0]
             .chunk_ids
@@ -927,7 +970,13 @@ mod tests {
         // Only the snapshot's own new objects were packed at all: the manifest,
         // and the index object in its own pack.
         assert_eq!(second.packs.len(), 2);
-        assert_eq!(second.counter, 2);
+        let published = published(&fx, &first);
+        assert_eq!(
+            root_for(&fx.ctx(None), Some(&published), &second.manifest_chunks)
+                .unwrap()
+                .1,
+            2
+        );
     }
 
     /// The gap `2-05-SUMMARY.md` recorded: a chunk shared with a file that
@@ -948,7 +997,7 @@ mod tests {
             .map(|raw| ChunkId::from_bytes(*raw))
             .collect();
         let second = build(
-            &fx.ctx(Some(published(&first))),
+            &fx.ctx(Some(published(&fx, &first))),
             &plan_of(vec![shared.clone()]),
         )
         .unwrap();
@@ -993,9 +1042,9 @@ mod tests {
         let stale = Pointer {
             snapshots: vec![SnapshotRecord {
                 packs: vec![ChunkId::from_bytes([0xaa; 32])],
-                ..published(&attempted).snapshots[0].clone()
+                ..published(&fx, &attempted).snapshots[0].clone()
             }],
-            ..published(&attempted)
+            ..published(&fx, &attempted)
         };
         let third = build(&fx.ctx(Some(stale)), &plan).unwrap();
         assert!(data.is_subset(&packed_ids(&third, &fx.keys)));
@@ -1004,10 +1053,13 @@ mod tests {
     /// One above the counter inside the newest *sealed root*, not one above the
     /// pointer's length: position in `snapshots` is remote-controlled and the
     /// counter is not.
+    ///
+    /// **And derived from the pointer that is passed in**, not from the one the
+    /// packer ran against — which is what makes the conflict path able to
+    /// recompute it after losing a race.
     #[test]
     fn the_counter_is_one_above_the_highest_the_pointers_roots_carry() {
         let fx = Fixture::new();
-        let plan = plan_of(vec![fx.seed("a.json", b"small")]);
 
         let sealed = |counter: u64| {
             B64.encode(
@@ -1029,6 +1081,20 @@ mod tests {
             keyfile: "keyfile-x.json".into(),
             snapshots: vec![record(sealed(7)), record(sealed(3))],
         };
-        assert_eq!(build(&fx.ctx(Some(pointer)), &plan).unwrap().counter, 8);
+        assert_eq!(highest_counter(Some(&pointer), &fx.keys, REPO_ID), 7);
+        // The ctx carries no pointer at all: the counter follows the argument,
+        // never the context the packer was built against.
+        assert_eq!(root_for(&fx.ctx(None), Some(&pointer), &[]).unwrap().1, 8);
+        assert_eq!(root_for(&fx.ctx(None), None, &[]).unwrap().1, 1);
+        assert_eq!(highest_counter(None, &fx.keys, REPO_ID), 0);
+
+        // A root this build cannot open falls back to the snapshot count rather
+        // than to zero: monotone for this machine, never a value already
+        // published.
+        let opaque = Pointer {
+            snapshots: vec![record("not base64 at all".into()); 3],
+            ..pointer
+        };
+        assert_eq!(highest_counter(Some(&opaque), &fx.keys, REPO_ID), 3);
     }
 }

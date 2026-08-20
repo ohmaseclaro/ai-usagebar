@@ -38,6 +38,9 @@ pub mod prune;
 pub mod rekey;
 pub mod upload;
 
+use std::cell::RefCell;
+use std::path::PathBuf;
+
 use base64::Engine;
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
@@ -45,6 +48,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::{SyncCategory, SyncConfig};
 use crate::error::{AppError, Result};
 use crate::sync::SyncRoots;
+use crate::sync::anchor;
 use crate::sync::crypto::{ChunkId, KdfParams, Keys};
 use crate::sync::github::{Client, RepoRef, gate, pairing};
 use crate::sync::index::Index;
@@ -180,7 +184,10 @@ pub struct SnapshotRecord {
 /// `repo_id` bound as associated data.
 ///
 /// Tampering therefore dead-ends rather than opening anything:
-/// - dropping entries is a rollback, which the local anchor's counter catches;
+/// - dropping entries is a rollback, which the local anchor's counter catches —
+///   read on this path by [`assert_no_rollback`], before anything carries the
+///   arriving records forward. That sentence used to be a claim about a control
+///   nothing invoked; it is now a call site;
 /// - reordering is inert, because a reader selects by the `counter` inside each
 ///   sealed root, not by position;
 /// - adding a fabricated entry fails the Poly1305 tag.
@@ -204,15 +211,19 @@ pub struct Pointer {
 }
 
 /// Everything one push has to put on the wire, produced by [`packer::build`].
+///
+/// **It carries no sealed root and no counter.** Both are functions of the
+/// pointer the flip actually lands against, and a 409 changes that pointer after
+/// the packer has finished; [`packer::root_for`] seals the root inside the
+/// rebuild closure, which is the only code that runs again after the race.
 #[derive(Debug)]
 pub struct PushBundle {
     pub packs: Vec<BuiltPack>,
-    /// The sealed snapshot root, framed.
-    pub root: Vec<u8>,
+    /// The manifest's chunk ids, in order — what the root names.
+    pub manifest_chunks: Vec<ChunkId>,
     pub index_chunks: Vec<RemoteIndexEntry>,
     /// Every pack the snapshot references, this run's and earlier runs' alike.
     pub referenced_packs: Vec<ChunkId>,
-    pub counter: u64,
 }
 
 /// What the orchestrator threads through five modules.
@@ -244,6 +255,11 @@ pub struct PushCtx<'a> {
     /// populated it would have had to make a request before the gate. Callers
     /// construct the context with `None`.
     pub previous: Option<Pointer>,
+    /// `--allow-rollback`. The escape [`anchor::accept`] names, plumbed to the
+    /// one place that can offer it: a user deliberately re-pointing at an older
+    /// bundle (or one rebuilt from scratch) needs a way through, and a refusal
+    /// whose message names a flag that does not exist is worse than no check.
+    pub allow_rollback: bool,
     pub now: DateTime<Utc>,
 }
 
@@ -284,6 +300,23 @@ pub async fn run(mut ctx: PushCtx<'_>, progress: &mut dyn Progress) -> Result<Pu
     let (previous, sha) = pointer::load(ctx.client, ctx.repo, &ctx.repo_id, ctx.now).await?;
     ctx.previous = previous.clone();
 
+    // 2a. The rollback anchor, before a byte is packed. An attacker with repo
+    //     write can replace the pointer with an authentic *older* copy: every
+    //     root in it opens, `repo_id` matches, nothing errors — and the next
+    //     honest push would carry those old records forward, append its own and
+    //     flip, laundering the rollback into a legitimately-written pointer.
+    //     Step 8 would then compute liveness over that laundered pointer and
+    //     delete every pack the rollback orphaned, which are older than
+    //     `PRUNE_GRACE` and so uncovered by it. Reversible tamper becomes
+    //     irreversible deletion, performed by the victim, exit 0.
+    assert_no_rollback(&ctx, previous.as_ref())?;
+
+    // 2b. And before the packer: if another machine rekeyed, this machine's
+    //     keyfile is the superseded wrapper and step 6b must not republish it.
+    //     Checked here as well as inside `ensure_keyfile` so the refusal costs
+    //     nothing rather than arriving after a full upload.
+    upload::assert_keyfile_is_current(&ctx)?;
+
     // 3. Plan, then pack. Both are local and neither touches the network.
     let plan =
         crate::sync::plan::build_with_keys(ctx.roots, ctx.cfg, ctx.index, ctx.now, ctx.keys)?;
@@ -297,14 +330,13 @@ pub async fn run(mut ctx: PushCtx<'_>, progress: &mut dyn Progress) -> Result<Pu
 
     // 5. Upload, and verify each asset is retrievable — D3's precondition for
     //    the flip. Nothing here is referenced by anything yet.
-    let (packs_uploaded, packs_skipped, bytes_uploaded) =
-        upload::run(&ctx, release_id, &bundle.packs, &permit, progress).await?;
+    let sent = upload::run(&ctx, release_id, &bundle.packs, &permit, progress).await?;
 
     // 6. Re-gate. A public read *here* is an incident, not a refusal.
     let permit = match gate_now(&ctx, credentials_in_bundle).await {
         Ok(permit) => permit,
         Err(why) => {
-            return Err(went_public_mid_push(&ctx, release_id, &bundle, &permit, why).await);
+            return Err(went_public_mid_push(&ctx, release_id, &sent.names, &permit, why).await);
         }
     };
 
@@ -320,28 +352,44 @@ pub async fn run(mut ctx: PushCtx<'_>, progress: &mut dyn Progress) -> Result<Pu
     upload::ensure_keyfile(&ctx, release_id, &permit).await?;
 
     // 7. **The only commit point.** Everything above is inert without it.
-    let record = SnapshotRecord {
-        root: B64.encode(&bundle.root),
-        index_chunks: bundle.index_chunks.clone(),
-        packs: bundle.referenced_packs.clone(),
-    };
     let keep = ctx.cfg.keep_snapshots as usize;
-    let repo_id = ctx.repo_id.clone();
-    let local_keyfile = ctx.keyfile_asset.clone();
 
-    // The rebuild closure. Three rules, each with a failure mode that destroys
+    // Every root this run has sealed. A `Fn` closure with one `RefCell` rather
+    // than a `FnMut`, because `pointer::commit` takes `Fn` — see rule 1b.
+    let mine: RefCell<Vec<String>> = RefCell::new(Vec::new());
+
+    // The rebuild closure. Four rules, each with a failure mode that destroys
     // data rather than erroring — plan 4-04 calls this a second time with a
     // competitor's pointer after a 409, and drives its own tests with a closure
-    // reproducing all three, so breaking one here fails there.
-    let rebuild = move |arriving: Option<&Pointer>| -> Result<Pointer> {
+    // reproducing them, so breaking one here fails there.
+    let rebuild = |arriving: Option<&Pointer>| -> Result<Pointer> {
+        // Rule 0: **the counter is derived here, not upstream.** `arriving` is
+        // the pointer this attempt is actually landing against, and on the retry
+        // it is the winner's — so the root is re-sealed one above whatever the
+        // winner published. Deriving it where the packer runs freezes a value
+        // computed before the race, and two machines that read counter 6 then
+        // both publish 7. The counter is the format's only ordering field and
+        // the rollback anchor's subject; it stays strictly monotonic.
+        let (root, _counter) = packer::root_for(&ctx, arriving, &bundle.manifest_chunks)?;
+        let record = SnapshotRecord {
+            root: B64.encode(&root),
+            index_chunks: bundle.index_chunks.clone(),
+            packs: bundle.referenced_packs.clone(),
+        };
+
         // Rule 1: carry forward every record this run did not produce. Dropping
         // a competitor's record makes its packs unreferenced, which makes the
         // next prune delete them, which strands its backup.
         let mut snapshots = arriving.map(|p| p.snapshots.clone()).unwrap_or_default();
-        // …and append rather than duplicate: `rebuild` runs again on a conflict,
-        // and the arriving pointer may already carry this run's own record.
-        snapshots.retain(|existing| existing.root != record.root);
-        snapshots.push(record.clone());
+        // Rule 1b: …and append rather than duplicate. `rebuild` runs again on a
+        // conflict and the arriving pointer may already carry this run's own
+        // record — from a `PUT` that landed and whose response was lost. Rule 0
+        // re-seals, so that record's root bytes are not this attempt's; the set
+        // of roots *this run* has produced is what identifies it.
+        let mut mine = mine.borrow_mut();
+        mine.push(record.root.clone());
+        snapshots.retain(|existing| !mine.contains(&existing.root));
+        snapshots.push(record);
 
         // Rule 2: truncate from the **oldest** end only. Doing it inside the
         // pointer being written is what makes D2's mandatory order structural —
@@ -357,11 +405,11 @@ pub async fn run(mut ctx: PushCtx<'_>, progress: &mut dyn Progress) -> Result<Pu
         // rekey has already deleted.
         let keyfile = arriving
             .map(|p| p.keyfile.clone())
-            .unwrap_or_else(|| local_keyfile.clone());
+            .unwrap_or_else(|| ctx.keyfile_asset.clone());
 
         Ok(Pointer {
             format: POINTER_VERSION,
-            repo_id: repo_id.clone(),
+            repo_id: ctx.repo_id.clone(),
             keyfile,
             snapshots,
         })
@@ -378,13 +426,19 @@ pub async fn run(mut ctx: PushCtx<'_>, progress: &mut dyn Progress) -> Result<Pu
     )
     .await?;
 
+    // 7b. The anchor advances only now — after a snapshot verified *and*
+    //     landed. Phase 1's rule stated the other way round: the counter this
+    //     machine will refuse to go below is one it has seen published, never
+    //     one it merely intended to publish.
+    advance_anchor(&ctx, &landed)?;
+
     // 8. Prune, against the pointer that actually **landed** — never the one
     //    this run built. If another machine won the flip, `landed` is *its*
     //    pointer and its packs are consequently live.
     let mut outcome = PushOutcome {
-        packs_uploaded,
-        packs_skipped,
-        bytes_uploaded,
+        packs_uploaded: sent.names.len(),
+        packs_skipped: sent.skipped,
+        bytes_uploaded: sent.bytes,
         snapshots_kept: landed.snapshots.len(),
         ..PushOutcome::default()
     };
@@ -413,38 +467,83 @@ pub(crate) async fn gate_now(
     clearance.spend(ctx.now)
 }
 
+/// Where this machine keeps its rollback high-water mark for one remote.
+///
+/// **Keyed on the locally-configured [`RepoRef`], never on the pointer's
+/// `repo_id`.** `anchor.rs`'s module doc is explicit about why: an anchor
+/// sharded by a remote-supplied identifier resolves to an absent file for any
+/// identifier this machine has not seen, `read_from` returns `Ok(None)`, and
+/// `accept` treats `None` as first contact *before* it compares anything — so
+/// the remote would manufacture its own amnesty. `owner/name` comes from
+/// `[sync] repo` in `config.toml`, and `RepoRef::parse` has already restricted
+/// both halves to `[A-Za-z0-9._-]` with `.`/`..` refused, so it is a filename.
+///
+/// The config directory, never the cache: a wiped anchor is a free rollback.
+pub fn anchor_path(roots: &SyncRoots, repo: &RepoRef) -> PathBuf {
+    roots
+        .config_dir
+        .join(format!("sync-anchor-{}-{}.json", repo.owner, repo.name))
+}
+
+/// Refuse a pointer whose highest snapshot counter is below what this machine
+/// has already seen published.
+///
+/// This is the control T-4-04's `accept` names — "a dropped entry is a rollback
+/// caught by the local anchor's counter" — actually on the path. It is the only
+/// defence against replay of an *authentic old snapshot*, the one attack that
+/// authenticates perfectly, and it must run before anything carries the
+/// arriving records forward.
+///
+/// The counter comes from [`packer::highest_counter`], the same function the
+/// snapshot counter is derived from, so the two cannot drift apart.
+pub(crate) fn assert_no_rollback(ctx: &PushCtx<'_>, arriving: Option<&Pointer>) -> Result<()> {
+    let local = anchor::read_from(&anchor_path(ctx.roots, ctx.repo))?;
+    let counter = packer::highest_counter(arriving, ctx.keys, &ctx.repo_id);
+    anchor::accept(local.as_ref(), &ctx.repo_id, counter, ctx.allow_rollback)
+}
+
+/// Record the counter that landed as this machine's new high-water mark.
+///
+/// Written unconditionally rather than clamped upward: a run that reached here
+/// with `--allow-rollback` deliberately accepted an older bundle, and leaving a
+/// stale higher mark behind would refuse every ordinary push after it.
+fn advance_anchor(ctx: &PushCtx<'_>, landed: &Pointer) -> Result<()> {
+    let counter = packer::highest_counter(Some(landed), ctx.keys, &ctx.repo_id);
+    anchor::write_to(
+        &anchor_path(ctx.roots, ctx.repo),
+        &anchor::Anchor {
+            repo_id: ctx.repo_id.clone(),
+            counter,
+        },
+    )
+}
+
 /// The re-gate said the repository is readable. Delete what this run uploaded,
 /// refuse the flip, and say what cannot be undone.
 ///
-/// The assets removed are exactly those that (a) carry a name this run's bundle
-/// produced and (b) were created at or after this run's clock — the intersection,
-/// because a pack this run *skipped* was uploaded by an earlier run and may be
-/// referenced by a live snapshot. Deleting one of those would be the very
-/// outcome `PRUNE_GRACE` exists to prevent, arriving through the incident path.
+/// `uploaded` is the set of names [`upload::run`] **observed itself sending** —
+/// not an inference from `created_at`. That field is the remote's clock against
+/// this machine's, and it fails in both directions: a local clock a few seconds
+/// fast makes the filter match nothing on an incremental push, and `created_at`
+/// is host-supplied so a hostile remote backdates it and turns the whole cleanup
+/// into a guaranteed no-op that reports success. A pack this run *skipped* is
+/// simply not in the set, which is what the timestamp leg was standing in for.
 ///
 /// Nothing is flipped and nothing is pruned. The old pointer, and every snapshot
 /// it names, is exactly as it was.
 async fn went_public_mid_push(
     ctx: &PushCtx<'_>,
     release_id: u64,
-    bundle: &PushBundle,
+    uploaded: &[String],
     permit: &gate::Pushing,
     why: AppError,
 ) -> AppError {
-    let ours: Vec<String> = bundle
-        .packs
-        .iter()
-        .map(|p| pack_asset_name(&p.id))
-        .collect();
     let mut removed = 0usize;
     let mut failed: Vec<String> = Vec::new();
 
     match ctx.client.list_assets(ctx.repo, release_id, ctx.now).await {
         Ok(assets) => {
-            for asset in assets
-                .iter()
-                .filter(|a| ours.contains(&a.name) && a.created_at >= ctx.now)
-            {
+            for asset in assets.iter().filter(|a| uploaded.contains(&a.name)) {
                 match ctx
                     .client
                     .delete_asset(ctx.repo, asset.id, permit, ctx.now)
@@ -551,5 +650,47 @@ mod tests {
     #[test]
     fn the_prune_grace_is_a_full_day() {
         assert_eq!(PRUNE_GRACE.num_hours(), 24);
+    }
+
+    /// `anchor.rs`'s standing precondition on its caller, pinned here because
+    /// here is where the caller lives.
+    ///
+    /// Sharding the anchor by the remote's claimed `repo_id` silently nullifies
+    /// the whole module: an id this machine has never seen resolves to an absent
+    /// file, `read_from` returns `Ok(None)`, and `accept` returns `Ok(())` for
+    /// `None` **before** it compares anything — so every rollback reads as first
+    /// contact. First contact is a property of this machine and that remote, and
+    /// nothing the remote says may manufacture it.
+    #[test]
+    fn the_anchor_is_named_after_the_remote_and_never_after_what_the_remote_claims() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let roots = SyncRoots::at(
+            dir.path().join("config.toml"),
+            dir.path().to_path_buf(),
+            dir.path().join("desktop"),
+            dir.path().join("profiles"),
+            dir.path().join("claude-home"),
+        );
+        let repo = RepoRef::parse("acme/backups").unwrap();
+        let path = anchor_path(&roots, &repo);
+
+        // Named after `[sync] repo`, and nothing else.
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert_eq!(name, "sync-anchor-acme-backups.json");
+        for claimed in ["github:1", "github:99999", "github:0"] {
+            assert!(
+                !name.contains(claimed.trim_start_matches("github:")),
+                "the remote's own {claimed:?} must not reach the path"
+            );
+        }
+        // The config directory, never the cache: `rm -rf ~/.cache/*` is a thing
+        // users and packagers do, and a wiped anchor is a free rollback.
+        assert_eq!(path.parent(), Some(roots.config_dir.as_path()));
+        assert_ne!(path.parent(), roots.index_file.parent());
+        // Two remotes never share a high-water mark.
+        assert_ne!(
+            path,
+            anchor_path(&roots, &RepoRef::parse("acme/other").unwrap())
+        );
     }
 }

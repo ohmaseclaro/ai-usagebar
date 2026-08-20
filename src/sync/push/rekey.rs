@@ -105,6 +105,11 @@ pub async fn run(
         write_local(&path, &body)?;
         return Ok(new_name);
     };
+    // A rekey carries every arriving snapshot record forward untouched, so a
+    // rolled-back pointer handed to it is republished with a fresh valid `sha` —
+    // laundered, exactly as on the push path, and the next prune executes it.
+    super::assert_no_rollback(ctx, Some(&previous))?;
+
     let old_name = previous.keyfile.clone();
 
     let release_id = ctx
@@ -359,6 +364,7 @@ mod tests {
                 repo_id: "github:1".into(),
                 keyfile_asset: "keyfile-local.json".into(),
                 previous: None,
+                allow_rollback: false,
                 now: NOW,
             }
         }
