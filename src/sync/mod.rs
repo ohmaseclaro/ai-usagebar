@@ -23,6 +23,9 @@
 //! - [`github`] — the GitHub transport: auth, the private-repo gate, and the
 //!   pairing record. The only module here that opens a socket — and in Phase 3
 //!   it can only `GET`.
+//! - [`push`] — the outbound path: packing, uploading, and the one
+//!   compare-and-swap that publishes a snapshot. The only module that can
+//!   *change* the remote.
 //! - [`report`] — the pure `sync status` model and its renderer.
 //! - [`cli`] — the `ai-usagebar sync …` entry point.
 //!
@@ -40,6 +43,7 @@ pub mod model;
 pub mod pack;
 pub mod passphrase;
 pub mod plan;
+pub mod push;
 pub mod report;
 pub mod scope;
 pub mod transcripts;

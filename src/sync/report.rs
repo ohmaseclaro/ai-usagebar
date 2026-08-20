@@ -799,6 +799,7 @@ mod tests {
             transcript_days: 30,
             transcript_max_bytes: 0,
             repo: None,
+            ..SyncConfig::default()
         };
         // Fixed, not the wall clock: `now` is only a reference point for the
         // transcript bounds, and a test that reads the clock is a test that can

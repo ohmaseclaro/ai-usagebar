@@ -192,6 +192,17 @@ pub struct SyncConfig {
     /// of secret from the read-only provider API keys `config.toml` is allowed
     /// to hold inline; it lives in the Keychain or a mode-0600 file.
     pub repo: Option<String>,
+    /// How many snapshots the remote pointer keeps (D1).
+    ///
+    /// Ten, because old snapshots share chunks: the realistic recovery need is
+    /// "undo the last few syncs", not archival history, and ten costs little
+    /// more than three while covering roughly a week of daily syncs. Config
+    /// rather than a constant, deliberately — a user syncing hourly wants a
+    /// different number than one syncing weekly.
+    ///
+    /// **Zero is refused at load.** It would mean the flip that publishes a
+    /// snapshot also drops it.
+    pub keep_snapshots: u32,
 }
 
 impl Default for SyncConfig {
@@ -206,6 +217,7 @@ impl Default for SyncConfig {
             transcript_days: 30,
             transcript_max_bytes: 2 * 1024 * 1024 * 1024,
             repo: None,
+            keep_snapshots: 10,
         }
     }
 }
@@ -1076,6 +1088,15 @@ impl Config {
             crate::sync::github::RepoRef::parse(repo)
                 .map_err(|e| AppError::Other(format!("[sync] repo — {e}")))?;
         }
+        // Zero would mean the flip that publishes a snapshot also drops it, so
+        // every push would leave the remote with nothing to restore from.
+        if self.sync.keep_snapshots == 0 {
+            return Err(AppError::Other(
+                "[sync] keep_snapshots must be at least 1 — at 0 the flip that publishes a \
+                 snapshot would also drop it, leaving nothing to restore"
+                    .into(),
+            ));
+        }
         let mut labels = HashSet::new();
         for account in &self.anthropic.accounts {
             validate_account_label(&account.label)?;
@@ -1240,6 +1261,22 @@ mod tests {
         assert_eq!(c.sync.transcript_max_bytes, 1024);
         // D-01: absent unless the user names it. There is no default.
         assert_eq!(c.sync.repo, None);
+    }
+
+    /// D1: ten, because old snapshots share chunks. Config rather than a
+    /// constant — and zero is refused, because at zero the flip that publishes a
+    /// snapshot also drops it.
+    #[test]
+    fn keep_snapshots_defaults_to_ten_round_trips_and_refuses_zero() {
+        let f = write_toml("[sync]\nrepo = \"o/n\"\n");
+        assert_eq!(Config::load_from(f.path()).unwrap().sync.keep_snapshots, 10);
+
+        let f = write_toml("[sync]\nkeep_snapshots = 3\n");
+        assert_eq!(Config::load_from(f.path()).unwrap().sync.keep_snapshots, 3);
+
+        let f = write_toml("[sync]\nkeep_snapshots = 0\n");
+        let err = Config::load_from(f.path()).expect_err("zero drops what it publishes");
+        assert!(err.to_string().contains("keep_snapshots"), "{err}");
     }
 
     #[test]

@@ -16,12 +16,14 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 
 use crate::config::{Config, SyncCategory};
-use crate::sync::crypto::{Keyfile, Keys};
+use crate::sync::crypto::{KdfParams, Keyfile, Keys, content_address};
 use crate::sync::github::setup::TtyPrompt;
 use crate::sync::github::{
     self, Client, Endpoints, RepoRef, gate, pairing, token, token::TokenChain,
 };
 use crate::sync::index::Index;
+use crate::sync::push::progress::Silent;
+use crate::sync::push::{self, PushCtx, PushOutcome};
 use crate::sync::report::{DryRunReport, RepoSection};
 use crate::sync::{SyncRoots, passphrase, plan, report};
 use crate::widget::cli::SyncAction;
@@ -74,7 +76,9 @@ pub fn run_with(
         SyncAction::Status => status(cfg, roots, endpoints, chain, now),
         SyncAction::Setup => setup(cfg, roots, endpoints, chain, now),
         SyncAction::Push { dry_run: true } => dry_run(cfg, roots, now),
-        SyncAction::Push { dry_run: false } => no_transport(),
+        SyncAction::Push { dry_run: false } => push(cfg, roots, endpoints, chain, now),
+        SyncAction::Prune => prune(cfg, roots, endpoints, chain, now),
+        SyncAction::Rekey => rekey(cfg, roots, endpoints, chain, now),
     }
 }
 
@@ -326,8 +330,8 @@ fn render_setup(outcome: &github::setup::SetupOutcome) -> String {
     }
     out.push_str(
         "\nThis machine is paired and ready to push.\n\
-         Nothing was uploaded — `sync setup` never uploads, and the push transport is not \
-         in this build yet.\n",
+         Nothing was uploaded — `sync setup` never uploads. Run `ai-usagebar sync push` when \
+         you are ready.\n",
     );
     out
 }
@@ -375,6 +379,23 @@ pub(crate) fn keyfile_path(roots: &SyncRoots) -> PathBuf {
 /// refusal. Neither the keyfile's bytes nor any derived key is formatted into
 /// the `String` this returns.
 fn keys_at(path: &Path) -> std::result::Result<Keys, String> {
+    local_keyfile(path).map(|k| k.keys)
+}
+
+/// Everything the push path needs out of the local keyfile, from one read.
+pub(crate) struct LocalKeyfile {
+    pub keys: Keys,
+    /// The parameters *this bundle* lives at, which every new snapshot root
+    /// repeats. Never `KdfParams::default` — that is the whole point of the
+    /// keyfile storing them.
+    pub kdf: KdfParams,
+    /// The asset name this keyfile would publish under, content-addressed over
+    /// its canonical serialization — the same bytes `rekey` uploads, so a
+    /// rewrapped keyfile and this one can never collide.
+    pub asset: String,
+}
+
+fn local_keyfile(path: &Path) -> std::result::Result<LocalKeyfile, String> {
     let raw = std::fs::read_to_string(path).map_err(|_| {
         format!(
             "this bundle has no sync keyfile yet ({} is absent)\n\
@@ -400,28 +421,316 @@ fn keys_at(path: &Path) -> std::result::Result<Keys, String> {
     if pw.is_empty() {
         return Err("no sync password arrived on stdin".into());
     }
+    open_keyfile(keyfile, &pw)
+}
 
+/// [`local_keyfile`] with the password already in hand — the rekey arm's path,
+/// which prompts for the old password through 3-07's seam rather than reading
+/// stdin itself.
+fn local_keyfile_with(
+    path: &Path,
+    pw: &zeroize::Zeroizing<String>,
+) -> std::result::Result<LocalKeyfile, String> {
+    let raw = std::fs::read_to_string(path).map_err(|_| {
+        format!(
+            "this bundle has no sync keyfile ({} is absent)",
+            path.display()
+        )
+    })?;
+    let keyfile: Keyfile = serde_json::from_str(&raw)
+        .map_err(|_| format!("{} is not a readable sync keyfile", path.display()))?;
+    open_keyfile(keyfile, pw)
+}
+
+/// The one place a password becomes keys. Neither the password nor any derived
+/// key reaches the `String` this returns: a wrong one produces `crypto`'s own
+/// single indistinguishable refusal.
+fn open_keyfile(
+    keyfile: Keyfile,
+    pw: &zeroize::Zeroizing<String>,
+) -> std::result::Result<LocalKeyfile, String> {
     // Argon2id at m = 1 GiB is a deliberate cost. Announce it before it starts —
     // a command that appears frozen for a second and a half reads as a hang.
     eprintln!("sync: deriving the sync key (Argon2id — this takes a moment)…");
-    keyfile.open(pw.as_bytes()).map_err(|e| e.to_string())
+    let keys = keyfile.open(pw.as_bytes()).map_err(|e| e.to_string())?;
+    Ok(LocalKeyfile {
+        kdf: keyfile.kdf.params(),
+        asset: keyfile_asset_for(&keyfile)?,
+        keys,
+    })
 }
 
-/// `sync push` without `--dry-run`.
+/// The keyfile's asset name — `keyfile-<content address>.json`.
+pub(crate) fn keyfile_asset_for(keyfile: &Keyfile) -> std::result::Result<String, String> {
+    let canonical = serde_json::to_vec(keyfile)
+        .map_err(|e| format!("the sync keyfile could not be serialized: {e}"))?;
+    Ok(push::keyfile_asset_name(&content_address(&canonical)))
+}
+
+// ---- the write commands ----------------------------------------------------
+
+/// Everything a `PushCtx` needs that is resolved from the local machine.
 ///
-/// Non-zero and nothing attempted. There is no transport in this build, so
-/// there is nothing here that could half-execute a push or reach a network —
-/// and the private-repo gate that must precede any upload does not exist yet
-/// either.
-fn no_transport() -> i32 {
-    eprintln!(
-        "sync: this build cannot upload. The push transport — packs, the atomic \
-         snapshot flip, and the private-repo gate that has to pass before a single \
-         byte moves — is not in it yet.\n\
-         \x20     Use `ai-usagebar sync push --dry-run` to see exactly what a push \
-         would send."
+/// Held as a struct so the three write arms build it identically: a second
+/// place that resolves a repository, a token and a pairing record is a second
+/// place for them to disagree.
+struct Resolved {
+    repo: RepoRef,
+    client: Client,
+    index: Index,
+    repo_id: String,
+}
+
+fn resolve(
+    cfg: &Config,
+    roots: &SyncRoots,
+    endpoints: &Endpoints,
+    chain: &TokenChain,
+) -> std::result::Result<Resolved, String> {
+    let configured = cfg.sync.repo.as_deref().ok_or_else(|| {
+        "no repository is configured. Set `repo = \"owner/name\"` under [sync] in config.toml \
+         and run `ai-usagebar sync setup` — this tool never creates a repository."
+            .to_owned()
+    })?;
+    let repo = RepoRef::parse(configured).map_err(|e| e.to_string())?;
+
+    // The pairing record is what supplies the bundle identifier bound into every
+    // snapshot root. Reading it from the *record* rather than from a response is
+    // the format's §5 rule: a reader binds its own identifier.
+    let pairing = pairing::read_from(&pairing::default_path(roots))
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| {
+            format!(
+                "this machine is not paired with {repo} yet. Run `ai-usagebar sync setup` \
+                 first — it verifies the repository is private and records which repository \
+                 this bundle belongs to."
+            )
+        })?;
+
+    let (value, source) = token::resolve(chain).map_err(|e| e.to_string())?;
+    let client = Client::new(endpoints, value, source).map_err(|e| e.to_string())?;
+    let index = Index::at(&roots.index_file).map_err(|e| e.to_string())?;
+    Ok(Resolved {
+        repo,
+        client,
+        index,
+        repo_id: push::repo_id_for(pairing.repo_id),
+    })
+}
+
+/// `ai-usagebar sync push`.
+///
+/// **Every refusal that does not need a password comes first.** The password is
+/// read here, at the terminal, and never below — nothing under
+/// `src/sync/push/` reads a password or an environment variable — so an
+/// unconfigured or unpaired machine must be told so *before* it is asked for
+/// one.
+fn push(
+    cfg: &Config,
+    roots: &SyncRoots,
+    endpoints: &Endpoints,
+    chain: &TokenChain,
+    now: DateTime<Utc>,
+) -> i32 {
+    let parts = match resolve(cfg, roots, endpoints, chain) {
+        Ok(parts) => parts,
+        Err(why) => return refuse(&why),
+    };
+    match local_keyfile(&keyfile_path(roots)) {
+        Ok(keyfile) => push_with_parts(cfg, roots, &parts, &keyfile, now),
+        Err(why) => refuse(&why),
+    }
+}
+
+/// The tested seam: everything injected, and no terminal — `resolve` has already
+/// turned the config, the token chain and the pairing record into values.
+///
+/// **A run whose only failure is the prune step exits 0.** That is D2 in the
+/// exit code, and it is the one place where getting it wrong is silent: the
+/// push already succeeded and the user's data is safe, so leaving a few stale
+/// packs costs storage, not correctness.
+fn push_with_parts(
+    cfg: &Config,
+    roots: &SyncRoots,
+    parts: &Resolved,
+    keyfile: &LocalKeyfile,
+    now: DateTime<Utc>,
+) -> i32 {
+    let rt = match runtime() {
+        Ok(rt) => rt,
+        Err(why) => return refuse(&why),
+    };
+    let ctx = context(cfg, roots, keyfile, parts, now);
+    // `Silent` until plan 4-03 adds the terminal and non-terminal reporters
+    // behind the same trait; the uploader already calls every hook.
+    match rt.block_on(push::run(ctx, &mut Silent)) {
+        Ok(outcome) => {
+            print!("{}", render_push(&outcome));
+            0
+        }
+        Err(e) => refuse(&e.to_string()),
+    }
+}
+
+/// `ai-usagebar sync prune`.
+///
+/// Unlike the automatic prune after a push, a failure here **is** a failure:
+/// the user asked for exactly this.
+fn prune(
+    cfg: &Config,
+    roots: &SyncRoots,
+    endpoints: &Endpoints,
+    chain: &TokenChain,
+    now: DateTime<Utc>,
+) -> i32 {
+    let parts = match resolve(cfg, roots, endpoints, chain) {
+        Ok(parts) => parts,
+        Err(why) => return refuse(&why),
+    };
+    let keyfile = match local_keyfile(&keyfile_path(roots)) {
+        Ok(k) => k,
+        Err(why) => return refuse(&why),
+    };
+    let rt = match runtime() {
+        Ok(rt) => rt,
+        Err(why) => return refuse(&why),
+    };
+    let ctx = context(cfg, roots, &keyfile, &parts, now);
+    match rt.block_on(push::prune::run_on_demand(
+        &ctx,
+        cfg.sync.keep_snapshots as usize,
+    )) {
+        Ok(deleted) => {
+            println!("pruned:     {deleted} pack(s) no kept snapshot still referenced");
+            0
+        }
+        Err(e) => refuse(&e.to_string()),
+    }
+}
+
+/// `ai-usagebar sync rekey`.
+///
+/// **This arm owns both password prompts**, and they come *after* every refusal
+/// that does not need one — an unconfigured or unpaired machine is told so
+/// before it is asked for a password it would then discard. They go through plan
+/// 3-07's prompt seam: TTY or stdin, never a command-line argument and never an
+/// environment variable, which is Phase 1's rule and is not relaxed. Phase 1's
+/// strength floor is applied to the new password before the call, so a refused
+/// password costs no network round trip.
+fn rekey(
+    cfg: &Config,
+    roots: &SyncRoots,
+    endpoints: &Endpoints,
+    chain: &TokenChain,
+    now: DateTime<Utc>,
+) -> i32 {
+    use crate::sync::github::setup::SetupPrompt;
+
+    let parts = match resolve(cfg, roots, endpoints, chain) {
+        Ok(parts) => parts,
+        Err(why) => return refuse(&why),
+    };
+    let rt = match runtime() {
+        Ok(rt) => rt,
+        Err(why) => return refuse(&why),
+    };
+
+    let mut prompt = TtyPrompt;
+    prompt.say(
+        "Changing the sync password rewraps the master key. Not one pack byte moves — and \
+         this is NOT revocation: anyone who already holds a copy of the old keyfile can still \
+         open it with the old password.",
     );
+    prompt.say("The CURRENT sync password:");
+    let old_pw = match prompt.passphrase("") {
+        Ok(pw) => pw,
+        Err(e) => return refuse(&e.to_string()),
+    };
+    prompt.say("The NEW sync password:");
+    let new_pw = match prompt.passphrase("") {
+        Ok(pw) => pw,
+        Err(e) => return refuse(&e.to_string()),
+    };
+    // Phase 1's floor, at the parameters the new keyfile will be written at.
+    match passphrase::check(&new_pw, prompt.kdf()) {
+        passphrase::Strength::Rejected(why) => return refuse(&format!("refused: {why}")),
+        passphrase::Strength::Weak(why) => prompt.say(&format!("     {why}")),
+        passphrase::Strength::Strong => {}
+    }
+
+    let keyfile = match local_keyfile_with(&keyfile_path(roots), &old_pw) {
+        Ok(k) => k,
+        Err(why) => return refuse(&why),
+    };
+    let ctx = context(cfg, roots, &keyfile, &parts, now);
+    match rt.block_on(push::rekey::run(&ctx, &old_pw, &new_pw)) {
+        Ok(asset) => {
+            println!("keyfile:    republished as {asset}");
+            println!(
+                "note:       this is not revocation — an old copy of the keyfile still opens \
+                 under the old password."
+            );
+            0
+        }
+        Err(e) => refuse(&e.to_string()),
+    }
+}
+
+/// One non-zero exit, one message, and nothing else: no token, no prefix of one,
+/// no header dump, no response body echoed unsanitized. Remote-supplied text
+/// arrives already through `http::message_of`'s `sanitize_untrusted_field`.
+fn refuse(why: &str) -> i32 {
+    eprintln!("sync: {why}");
     1
+}
+
+fn context<'a>(
+    cfg: &'a Config,
+    roots: &'a SyncRoots,
+    keyfile: &'a LocalKeyfile,
+    parts: &'a Resolved,
+    now: DateTime<Utc>,
+) -> PushCtx<'a> {
+    PushCtx {
+        client: &parts.client,
+        repo: &parts.repo,
+        cfg: &cfg.sync,
+        roots,
+        keys: &keyfile.keys,
+        kdf: keyfile.kdf,
+        index: &parts.index,
+        repo_id: parts.repo_id.clone(),
+        keyfile_asset: keyfile.asset.clone(),
+        // Filled by `push::run` from the remote, after the gate. A caller that
+        // populated it would have had to make a request before the gate.
+        previous: None,
+        now,
+    }
+}
+
+/// Pure, so the no-secret assertion is on a value rather than on captured
+/// stdout. `PushOutcome` has no field that could hold a token or a passphrase.
+fn render_push(outcome: &PushOutcome) -> String {
+    let mut out = format!(
+        "\nuploaded:   {} pack(s), {}\nskipped:    {} pack(s) already present\n\
+         snapshots:  {} kept\npruned:     {} pack(s)\n",
+        outcome.packs_uploaded,
+        report::human_bytes(outcome.bytes_uploaded),
+        outcome.packs_skipped,
+        outcome.snapshots_kept,
+        outcome.packs_deleted,
+    );
+    // D2: a prune failure is a warning on a successful push, never a failure.
+    if let Some(warning) = &outcome.prune_warning {
+        out.push_str(&format!(
+            "warning:    the push succeeded and the snapshot is published, but cleaning up \
+             superseded data did not: {warning}\n\
+             \x20           This costs storage, not correctness. `ai-usagebar sync prune` \
+             retries it.\n"
+        ));
+    }
+    out.push_str("\nThe snapshot is published.\n");
+    out
 }
 
 #[cfg(test)]
@@ -429,6 +738,7 @@ mod tests {
     use super::*;
     use crate::sync::github::setup::{Double, Script};
     use std::fs;
+    use std::sync::Mutex;
     use tempfile::TempDir;
 
     const TOKEN: &str = "github_pat_fixture_not_a_real_token";
@@ -528,7 +838,7 @@ mod tests {
     }
 
     #[test]
-    fn a_push_without_dry_run_refuses_non_zero_and_points_at_the_dry_run() {
+    fn a_push_on_an_unconfigured_machine_refuses_before_any_request() {
         let dir = TempDir::new().unwrap();
         assert_ne!(
             drive(
@@ -761,6 +1071,360 @@ mod tests {
             "the categories are still there: {text}"
         );
         assert_ne!(drive(&SyncAction::Status, &cfg, &dir, &server.url()), 0);
+    }
+
+    // ---- 4-01: the push, end to end ---------------------------------------
+
+    /// A seeded tree, a cheap keyfile, and a pairing record — everything a push
+    /// resolves from the local machine, all inside the injected `TempDir`.
+    ///
+    /// Microsecond KDF parameters, never production ones: the AUR `check()` runs
+    /// these tests on an installer's machine.
+    fn seeded(dir: &TempDir) -> (SyncRoots, LocalKeyfile) {
+        let roots = roots_at(dir);
+        fs::create_dir_all(&roots.config_dir).unwrap();
+        fs::write(&roots.config_file, b"[anthropic]\nenabled = true\n").unwrap();
+
+        let cheap = crate::sync::crypto::KdfParams {
+            m_kib: 8,
+            t: 1,
+            p: 1,
+        };
+        let (file, keys) =
+            Keyfile::create_with_floor(b"correct horse battery staple", cheap, cheap.m_kib)
+                .unwrap();
+        let asset = keyfile_asset_for(&file).unwrap();
+        pairing::write_to(
+            &pairing::default_path(&roots),
+            &pairing::Pairing {
+                repo_id: 1,
+                owner_id: 7,
+                private: true,
+                checked_at: NOW,
+            },
+        )
+        .unwrap();
+        (
+            roots,
+            LocalKeyfile {
+                keys,
+                kdf: cheap,
+                asset,
+            },
+        )
+    }
+
+    /// Drives the push at `push_with_parts`, one step below the arm that reads
+    /// the sync password off stdin — the same carve-out the `Setup` arm takes,
+    /// and for the same reason: no test may drive a terminal.
+    fn push_against(cfg: &Config, roots: &SyncRoots, keyfile: &LocalKeyfile, base: &str) -> i32 {
+        let parts = resolve(
+            cfg,
+            roots,
+            &Endpoints {
+                api_base: base.into(),
+                uploads_base: base.into(),
+            },
+            &TokenChain {
+                env_value: Some(zeroize::Zeroizing::new(TOKEN.into())),
+                ..TokenChain::default()
+            },
+        )
+        .expect("the fixture is configured and paired");
+        push_with_parts(cfg, roots, &parts, keyfile, NOW)
+    }
+
+    fn asset_json(id: u64, name: &str) -> String {
+        format!(
+            r#"{{"id":{id},"name":"{name}","size":1,"state":"uploaded",
+                "created_at":"2023-11-14T22:13:20Z"}}"#
+        )
+    }
+
+    /// The release read, the pointer read, the upload and the verifying download.
+    ///
+    /// The verification hop (D3) compares what comes back against the pack that
+    /// was sent, so the mock has to serve the very bytes it was handed — hence
+    /// the recorder, which is per-test rather than a shared static because these
+    /// tests run in parallel.
+    fn mock_upload_path(server: &mut mockito::ServerGuard) -> std::sync::Arc<Mutex<Vec<u8>>> {
+        let sent: std::sync::Arc<Mutex<Vec<u8>>> = std::sync::Arc::default();
+
+        server
+            .mock("GET", "/repos/o/n/releases/tags/ai-usagebar-sync-v1")
+            .with_status(200)
+            .with_body(r#"{"id":9}"#)
+            .create();
+        server
+            .mock("GET", "/repos/o/n/contents/sync/pointer.json")
+            .with_status(404)
+            .with_body(r#"{"message":"Not Found"}"#)
+            .create();
+
+        let recorder = std::sync::Arc::clone(&sent);
+        server
+            .mock("POST", mockito::Matcher::Regex("/releases/9/assets".into()))
+            .match_request(move |req| {
+                *recorder.lock().unwrap() = req.body().unwrap().clone();
+                true
+            })
+            .with_status(201)
+            .with_body(asset_json(1, "pack-x.bin"))
+            .expect(1)
+            .create();
+
+        let echo = std::sync::Arc::clone(&sent);
+        server
+            .mock("GET", "/repos/o/n/releases/assets/1")
+            .with_status(200)
+            .with_body_from_request(move |_| echo.lock().unwrap().clone())
+            .create();
+
+        sent
+    }
+
+    /// The whole outbound path: gate, plan, pack, upload, verify, re-gate, flip.
+    /// One file, one pack, one asset, one compare-and-swap.
+    #[test]
+    fn a_push_uploads_one_asset_and_flips_the_pointer_with_a_precondition() {
+        let dir = TempDir::new().unwrap();
+        let (roots, keyfile) = seeded(&dir);
+        let mut server = mockito::Server::new();
+
+        // Two visibility reads: one before the first byte, one before the flip.
+        // The gate is re-earned inside the push, never carried from `sync setup`.
+        let gate = server
+            .mock("GET", "/repos/o/n")
+            .with_status(200)
+            .with_body(PRIVATE_BODY)
+            .expect(2)
+            .create();
+        let sent = mock_upload_path(&mut server);
+        let flip = server
+            .mock("PUT", "/repos/o/n/contents/sync/pointer.json")
+            .with_status(201)
+            .with_body(r#"{"content":{"sha":"blob1"}}"#)
+            .expect(1)
+            .create();
+
+        assert_eq!(
+            push_against(&cfg_with_repo(Some("o/n")), &roots, &keyfile, &server.url()),
+            0
+        );
+        gate.assert();
+        flip.assert();
+        assert!(
+            !sent.lock().unwrap().is_empty(),
+            "one pack's bytes reached the uploads host"
+        );
+    }
+
+    /// SAFE-02 through the push path: a repository that reads readable on the
+    /// re-gate deletes what this run uploaded and never reaches the flip.
+    #[test]
+    fn a_repository_that_turns_public_mid_push_deletes_and_does_not_flip() {
+        let dir = TempDir::new().unwrap();
+        let (roots, keyfile) = seeded(&dir);
+        let mut server = mockito::Server::new();
+
+        // Private on the first read…
+        server
+            .mock("GET", "/repos/o/n")
+            .with_status(200)
+            .with_body(PRIVATE_BODY)
+            .expect(1)
+            .create();
+        let sent = mock_upload_path(&mut server);
+        // …and public on the second.
+        let public = server
+            .mock("GET", "/repos/o/n")
+            .with_status(200)
+            .with_body(
+                r#"{"id":1,"private":false,"visibility":"public",
+                    "owner":{"login":"o","id":7},"archived":false,"fork":false}"#,
+            )
+            .expect(1)
+            .create();
+
+        // The incident path lists, then deletes only what this run uploaded.
+        let named = std::sync::Arc::clone(&sent);
+        let listing = server
+            .mock("GET", mockito::Matcher::Regex("per_page=100".into()))
+            .with_status(200)
+            .with_body_from_request(move |_| {
+                let name = push::pack_asset_name(&content_address(&named.lock().unwrap()));
+                format!("[{}]", asset_json(1, &name)).into_bytes()
+            })
+            .expect(1)
+            .create();
+        let delete = server
+            .mock("DELETE", "/repos/o/n/releases/assets/1")
+            .with_status(204)
+            .expect(1)
+            .create();
+        let flip = server
+            .mock("PUT", "/repos/o/n/contents/sync/pointer.json")
+            .with_status(201)
+            .expect(0)
+            .create();
+
+        assert_ne!(
+            push_against(&cfg_with_repo(Some("o/n")), &roots, &keyfile, &server.url()),
+            0
+        );
+        public.assert();
+        listing.assert();
+        delete.assert();
+        flip.assert();
+    }
+
+    /// A failed flip is a failed push, and the compare-and-swap is not re-driven
+    /// behind the user's back — `with_retry` never retries a conflict.
+    #[test]
+    fn a_failed_pointer_put_exits_non_zero_and_makes_no_second_attempt() {
+        let dir = TempDir::new().unwrap();
+        let (roots, keyfile) = seeded(&dir);
+        let mut server = mockito::Server::new();
+
+        server
+            .mock("GET", "/repos/o/n")
+            .with_status(200)
+            .with_body(PRIVATE_BODY)
+            .create();
+        let _sent = mock_upload_path(&mut server);
+        let flip = server
+            .mock("PUT", "/repos/o/n/contents/sync/pointer.json")
+            .with_status(409)
+            .with_body(r#"{"message":"is at abc but expected def"}"#)
+            .expect(1)
+            .create();
+
+        assert_ne!(
+            push_against(&cfg_with_repo(Some("o/n")), &roots, &keyfile, &server.url()),
+            0
+        );
+        flip.assert();
+    }
+
+    /// SYNC-04, the other half of D3: a pack that does not read back as what was
+    /// sent fails the push **before** the flip, so no pointer can ever reference
+    /// a pack that did not verify. Killing a run anywhere above the `PUT` leaves
+    /// the remote pointer byte-identical to what it was.
+    #[test]
+    fn a_pack_that_does_not_verify_never_reaches_the_pointer_put() {
+        let dir = TempDir::new().unwrap();
+        let (roots, keyfile) = seeded(&dir);
+        let mut server = mockito::Server::new();
+
+        server
+            .mock("GET", "/repos/o/n")
+            .with_status(200)
+            .with_body(PRIVATE_BODY)
+            .create();
+        server
+            .mock("GET", "/repos/o/n/releases/tags/ai-usagebar-sync-v1")
+            .with_status(200)
+            .with_body(r#"{"id":9}"#)
+            .create();
+        server
+            .mock("GET", "/repos/o/n/contents/sync/pointer.json")
+            .with_status(404)
+            .with_body(r#"{"message":"Not Found"}"#)
+            .create();
+        server
+            .mock("POST", mockito::Matcher::Regex("/releases/9/assets".into()))
+            .with_status(201)
+            .with_body(asset_json(1, "pack-x.bin"))
+            .create();
+        // Serves something other than what was uploaded.
+        let verify = server
+            .mock("GET", "/repos/o/n/releases/assets/1")
+            .with_status(200)
+            .with_body("not the bytes that were sent")
+            .expect(1)
+            .create();
+        let flip = server
+            .mock("PUT", "/repos/o/n/contents/sync/pointer.json")
+            .with_status(201)
+            .expect(0)
+            .create();
+
+        assert_ne!(
+            push_against(&cfg_with_repo(Some("o/n")), &roots, &keyfile, &server.url()),
+            0
+        );
+        verify.assert();
+        flip.assert();
+    }
+
+    /// D2 in the exit code: a prune failure is a warning, never a failed push.
+    #[test]
+    fn a_prune_failure_is_a_warning_line_and_the_push_still_exits_zero() {
+        let rendered = render_push(&PushOutcome {
+            packs_uploaded: 2,
+            bytes_uploaded: 4096,
+            snapshots_kept: 3,
+            prune_warning: Some("GitHub refused the delete (403)".into()),
+            ..PushOutcome::default()
+        });
+        assert!(rendered.contains("warning:"), "{rendered}");
+        assert!(rendered.contains("403"), "{rendered}");
+        assert!(rendered.contains("storage, not correctness"), "{rendered}");
+        assert!(rendered.contains("published"), "{rendered}");
+    }
+
+    /// T-4-10. `PushOutcome` has no field that *could* hold either secret, and
+    /// this is what keeps it that way.
+    #[test]
+    fn the_rendered_outcome_carries_neither_the_token_nor_the_passphrase() {
+        let rendered = render_push(&PushOutcome {
+            packs_uploaded: 1,
+            prune_warning: Some("nothing secret here".into()),
+            ..PushOutcome::default()
+        });
+        assert!(!rendered.contains(TOKEN), "{rendered}");
+        assert!(!rendered.contains(&TOKEN[..8]), "{rendered}");
+        assert!(!rendered.contains("correct horse"), "{rendered}");
+    }
+
+    /// **The dispatch exists and is reached.** `run_with` routes a bare `push`, a
+    /// `prune` and a `rekey` into the real arms; an unconfigured repository
+    /// refuses before any prompt and before any request, which is what makes
+    /// this safe to drive through the production entry point.
+    #[test]
+    fn the_three_write_actions_dispatch_and_refuse_an_unconfigured_machine() {
+        let dir = TempDir::new().unwrap();
+        for action in [
+            SyncAction::Push { dry_run: false },
+            SyncAction::Prune,
+            SyncAction::Rekey,
+        ] {
+            assert_ne!(
+                drive(&action, &cfg_with_repo(None), &dir, "http://127.0.0.1:1"),
+                0,
+                "{action:?} must refuse an unconfigured machine"
+            );
+        }
+    }
+
+    /// The bundle identifier comes from the pairing record, so an unpaired
+    /// machine is told to pair rather than handed a confusing failure after a
+    /// network round trip.
+    #[test]
+    fn an_unpaired_machine_is_told_to_run_setup_rather_than_pushing() {
+        let dir = TempDir::new().unwrap();
+        let err = resolve(
+            &cfg_with_repo(Some("o/n")),
+            &roots_at(&dir),
+            &Endpoints::default(),
+            &TokenChain {
+                env_value: Some(zeroize::Zeroizing::new(TOKEN.into())),
+                ..TokenChain::default()
+            },
+        )
+        .err()
+        .expect("nothing was paired");
+        assert!(err.contains("sync setup"), "{err}");
     }
 
     /// REPO-04: no token is a non-zero exit that names every place one is

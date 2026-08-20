@@ -2,7 +2,7 @@
 
 The sync feature will back up your usage history and configuration to a private GitHub
 repository, encrypted with a password only you hold. **This release pairs with the
-repository and verifies it; it does not upload anything yet** — see "What this release
+repository and verifies it; `sync push` is what uploads** — see "What this release
 does" below. This guide covers repository creation, token setup, and what the tool
 checks before it will touch your data.
 
@@ -103,7 +103,7 @@ This is not optional. If you backed up credentials before you made the repositor
 
 ## What `sync setup` does and does not do
 
-`sync setup` authenticates, resolves the repository, and verifies it is private. It performs **zero uploads** in this release.
+`sync setup` authenticates, resolves the repository, and verifies it is private. It performs **zero uploads** — pairing and pushing are separate commands, so verifying the pairing never costs bandwidth.
 
 It is a guided, five-step flow:
 
@@ -113,7 +113,9 @@ It is a guided, five-step flow:
 4. **The size.** Runs the same planner `sync push --dry-run` runs and shows its figures — files, raw bytes, and what a first push would actually send — then asks you to confirm.
 5. **Everything that persists.** Writes the keyfile at mode 0600, saves your category choices back into `config.toml` with comments and key order preserved, stores the token where only you can read it (the Keychain on macOS, the mode-0600 file elsewhere), and records the pairing. Nothing before this point writes anything, so declining at step 4 leaves the machine exactly as it was and the command can simply be re-run.
 
-Pushing to the repository arrives in a later release. If you need to back up your data today, this phase verifies the foundation is in place; it does not yet upload anything.
+Once setup succeeds, `ai-usagebar sync push` uploads. It re-checks that the repository is private before the first byte and again before publishing, uploads the encrypted packs as release assets, verifies each one reads back correctly, and only then publishes the snapshot pointer with a compare-and-swap precondition. **Interrupting a push before that last step leaves the previous snapshot exactly as it was** — the uploaded packs are referenced by nothing and are collected later.
+
+Two more commands round it out: `ai-usagebar sync prune` deletes remote data no kept snapshot still references (nothing younger than a day, so it cannot race another machine's in-flight push), and `ai-usagebar sync rekey` changes the sync password. A password change rewraps the master key and moves no pack bytes — and it is **not revocation**: anyone who already holds a copy of the old keyfile can still open it with the old password.
 
 Check the status of your pairing with:
 

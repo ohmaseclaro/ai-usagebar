@@ -5,9 +5,14 @@
 //! repository reports itself private — nothing more. That is what makes the
 //! safety gate provably *prior to* the first byte rather than merely sequenced
 //! before it: [`Client`] exposes exactly one request method, a `GET`, and there
-//! is no type in this module that can carry a request body. Phase 4 adds the
-//! write verbs in its own `github/write.rs`, so the guard test at the bottom of
-//! this file keeps passing.
+//! is no type in this module that can carry a request body.
+//!
+//! **Phase 4 changed what is true, so it changed what the guard proves.**
+//! [`Client`] now has six body-carrying methods — they live in [`write`], in an
+//! inherent `impl` block a sibling module is allowed to open. The guard at the
+//! bottom of this file therefore no longer claims `Client` cannot send a body;
+//! it claims that every request body in this directory lives in `write.rs`, and
+//! it fails on a body call site in any other file here.
 //!
 //! Layout — one file per plan, so parallel work never collides:
 //! - [`http`] — the frozen [`GithubError`](http::GithubError) taxonomy, the
@@ -18,6 +23,9 @@
 //!   the [`PushClearance`](gate::PushClearance) it alone can mint (plan 3-04).
 //! - [`pairing`] — the mode-0600 record and the drift check (plan 3-04).
 //! - [`setup`] — the `ai-usagebar sync setup` flow (plan 3-07).
+//! - [`write`] — the six write verbs and the shared retry helper (plan 4-01).
+//!   The **only** file in the crate that sends a request body, and the only one
+//!   that can delete remote data.
 
 pub mod gate;
 pub mod http;
@@ -26,6 +34,7 @@ pub mod keychain;
 pub mod pairing;
 pub mod setup;
 pub mod token;
+pub mod write;
 
 use std::fmt;
 
@@ -45,6 +54,9 @@ const UA: &str = concat!("ai-usagebar/", env!("CARGO_PKG_VERSION"));
 /// The API version this code was written against. Pinning it means a future
 /// default cannot silently reshape a response we assert on.
 const API_VERSION: &str = "2022-11-28";
+/// The `Accept` every JSON endpoint takes. `write.rs` uses it for five of its
+/// six verbs; the asset download is the one that asks for bytes instead.
+pub(crate) const ACCEPT_JSON: HeaderValue = HeaderValue::from_static("application/vnd.github+json");
 
 /// Both GitHub hosts, injected so a test can point them at one mockito server.
 #[derive(Debug, Clone)]
@@ -127,12 +139,20 @@ impl fmt::Display for RepoRef {
     }
 }
 
-/// An authenticated, **read-only** GitHub client.
+/// An authenticated GitHub client.
 ///
-/// There is no `post`, `put`, `patch`, or multipart method here and no call site
-/// that hands this type a request body. That absence *is* D-05 — the type itself
-/// cannot upload — and it is enforced by a test in this file rather than by
-/// review, so a write verb added here fails the suite instead of shipping.
+/// Its **read** verb is [`get_json`](Client::get_json), here. Its six **write**
+/// verbs live in [`write`], in an inherent `impl` block that module opens, and
+/// each one takes a [`gate::Pushing`] by reference — a capability minted only by
+/// spending a fresh [`PushClearance`](gate::PushClearance), so a write cannot be
+/// reached without a visibility check that was fresh at the call. The guard test
+/// at the bottom of this file is what keeps those verbs from growing anywhere
+/// else in this directory.
+///
+/// `Clone` because plan 4-03 uploads four packs concurrently and each task takes
+/// an owned client; the inner `reqwest::Client` is an `Arc` handle, so a clone
+/// shares one connection pool rather than opening a second.
+#[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
     endpoints: Endpoints,
@@ -179,34 +199,55 @@ impl Client {
         &self.endpoints
     }
 
-    /// The single outbound call site for the whole phase.
+    /// **The one place the bearer token becomes a header value**, for every
+    /// request the crate makes — reads here, writes in [`write`].
     ///
-    /// `path` is absolute and already validated — every caller builds it from a
-    /// parsed [`RepoRef`]. The body is capped at
-    /// [`MAX_BODY_BYTES`](crate::vendor::MAX_BODY_BYTES): every response in this
-    /// phase is a few kilobytes of JSON (T-3-06). `Vec<u8>` because that is what
-    /// [`read_body_capped`](crate::vendor::read_body_capped) returns.
-    pub async fn get_json(&self, path: &str) -> Result<(reqwest::StatusCode, HeaderMap, Vec<u8>)> {
-        let url = format!("{}{}", self.endpoints.api_base.trim_end_matches('/'), path);
+    /// The header is marked sensitive, so `reqwest`'s own `Debug` redacts it.
+    /// `url` is fully built by the caller; nothing interpolated into it comes
+    /// from a remote response.
+    ///
+    /// It returns a builder rather than sending, which is what lets `write.rs`
+    /// attach a body without a second copy of this. The guard test below is what
+    /// keeps that body from being attached anywhere else.
+    ///
+    /// `accept` is a parameter rather than a constant because
+    /// [`reqwest::RequestBuilder::header`] *appends*: a caller that wanted
+    /// `application/octet-stream` and set it afterwards would send two `Accept`
+    /// headers, and the asset-download endpoint answers the first one.
+    fn authed(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        accept: HeaderValue,
+    ) -> Result<reqwest::RequestBuilder> {
         let mut auth = HeaderValue::from_str(&Zeroizing::new(format!("Bearer {}", &*self.token)))
             .map_err(|_| {
             AppError::Credentials("the stored sync token is not a valid HTTP header value".into())
         })?;
         auth.set_sensitive(true);
-
-        let resp = self
+        Ok(self
             .http
-            .get(&url)
+            .request(method, url)
             .header(AUTHORIZATION, auth)
-            .header(
-                ACCEPT,
-                HeaderValue::from_static("application/vnd.github+json"),
-            )
+            .header(ACCEPT, accept)
             .header(
                 "X-GitHub-Api-Version",
                 HeaderValue::from_static(API_VERSION),
             )
-            .header(USER_AGENT, HeaderValue::from_static(UA))
+            .header(USER_AGENT, HeaderValue::from_static(UA)))
+    }
+
+    /// The single **read** call site for the whole crate.
+    ///
+    /// `path` is absolute and already validated — every caller builds it from a
+    /// parsed [`RepoRef`]. The body is capped at
+    /// [`MAX_BODY_BYTES`](crate::vendor::MAX_BODY_BYTES): every response on this
+    /// path is a few kilobytes of JSON (T-3-06). `Vec<u8>` because that is what
+    /// [`read_body_capped`](crate::vendor::read_body_capped) returns.
+    pub async fn get_json(&self, path: &str) -> Result<(reqwest::StatusCode, HeaderMap, Vec<u8>)> {
+        let url = format!("{}{}", self.endpoints.api_base.trim_end_matches('/'), path);
+        let resp = self
+            .authed(reqwest::Method::GET, &url, ACCEPT_JSON)?
             .send()
             .await
             .map_err(|e| AppError::from(http::from_transport(&e)))?;
@@ -234,27 +275,158 @@ mod tests {
         .unwrap()
     }
 
-    /// D-05, enforced rather than reviewed. Phase 4's write verbs go in
-    /// `github/write.rs`; adding one *here* fails this test.
+    /// **Every request body in this directory lives in `write.rs`, and no second
+    /// HTTP client is built anywhere under `src/sync/`.**
+    ///
+    /// This replaces plan 3-01's guard, which read `include_str!("mod.rs")` and
+    /// proved that [`Client`] had no body-carrying method. Rust lets a sibling
+    /// module open an inherent `impl Client`, so plan 4-01 gave `Client` six
+    /// such methods *next door* and 3-01's guard stayed green while the sentence
+    /// it was named for stopped being true. A green test making a false claim is
+    /// worse than no test, so the claim moved rather than the code.
+    ///
+    /// What it buys, now that bytes do leave the machine: an upload or a delete
+    /// added anywhere in this directory but `write.rs` fails the suite. That
+    /// matters because `write.rs` is the file reviewed *as* the outbound path —
+    /// it is where the retry discipline, the body caps and the one destructive
+    /// verb are, and a seventh write verb grown quietly in `gate.rs` would
+    /// inherit none of it. The second half closes the way around the first: a
+    /// bare `reqwest::Client` built elsewhere under `src/sync/` would carry
+    /// neither the same-origin redirect policy nor the request timeout, and
+    /// could send anything it liked without ever touching this directory.
+    ///
+    /// **The needles are assembled at runtime, and the scan covers whole files
+    /// rather than a production/test split.** Both details are load-bearing, and
+    /// both were learned by watching this guard pass on a violation. Spelling a
+    /// needle out as a literal is what forced 3-01's guard to skip the half of
+    /// the file it lives in; and the marker it skipped to also occurs inside a
+    /// doc comment in `pairing.rs`, which silently truncated that file's scanned
+    /// region to its first 76 lines. A guard that stops looking where it happens
+    /// to find a string is not a guard. Assembling the needles removes the
+    /// reason to skip anything, so nothing is skipped.
+    ///
+    /// A directory walk rather than a per-file `include_str!`, so a file added
+    /// to this module later is covered without anyone remembering. Reading the
+    /// crate's own source is hermetic: `CARGO_MANIFEST_DIR` is a compile-time
+    /// constant, so this passes inside `makepkg`'s `check()` and depends on no
+    /// working directory.
     #[test]
-    fn the_client_exposes_no_method_that_can_carry_a_request_body() {
-        // Everything before the test module is the shipped surface.
-        let production = include_str!("mod.rs").split("#[cfg(test)]").next().unwrap();
-        // Without this the whole assertion could pass vacuously on an empty
-        // slice, which is exactly how a guard test quietly stops guarding.
-        assert!(
-            production.contains("pub async fn get_json"),
-            "the production half of this file was not located; the guard below \
-             would pass on nothing"
+    fn every_request_body_in_this_directory_lives_in_write_rs() {
+        // Assembled, never written out: a literal here is a needle in the very
+        // file being scanned. "delete" is in the list even though a DELETE
+        // carries no body — it is the crate's only destructive remote verb and
+        // belongs beside the uploads for the same reason.
+        let needles: Vec<String> = [
+            "post",
+            "put",
+            "patch",
+            "delete",
+            "body",
+            "multipart",
+            "json",
+        ]
+        .iter()
+        .map(|verb| format!(".{verb}("))
+        .collect();
+
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sync/github");
+        let mut scanned = 0usize;
+        let mut skipped = 0usize;
+        let mut saw_mod = false;
+
+        for entry in std::fs::read_dir(&dir).expect("src/sync/github must exist") {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            if path.file_name().is_some_and(|n| n == "write.rs") {
+                skipped += 1;
+                continue;
+            }
+            scanned += 1;
+            let text = std::fs::read_to_string(&path).unwrap();
+            saw_mod |= text.contains("pub async fn get_json");
+            for needle in &needles {
+                assert!(
+                    !text.contains(needle.as_str()),
+                    "REQUEST BODIES LIVE ONLY IN write.rs: `{needle}` appeared in {}. \
+                     Every outbound body and every remote delete goes through \
+                     src/sync/github/write.rs, which is where the retry discipline (D7), \
+                     the response-size caps, and the token-free redirect hop are. A write \
+                     path grown anywhere else inherits none of that and will not be \
+                     reviewed as one. Move it into write.rs.",
+                    path.display()
+                );
+            }
+        }
+
+        // Non-vacuity, both ways: a guard that asserts an absence must prove it
+        // looked at something, and that the one file it excludes was there to
+        // exclude. Without these a renamed directory reports green forever.
+        assert_eq!(
+            skipped, 1,
+            "write.rs must be present and excluded exactly once"
         );
-        for needle in [".post(", ".put(", ".patch(", ".body(", ".multipart("] {
-            assert!(
-                !production.contains(needle),
-                "ZERO BYTES LEAVE THE MACHINE IN PHASE 3 (D-05): `{needle}` appeared in \
-                 src/sync/github/mod.rs. A request body here defeats the private-repo gate, \
-                 which is only structurally prior to the first byte because this type cannot \
-                 send one. Phase 4's write verbs belong in src/sync/github/write.rs."
-            );
+        assert!(scanned >= 5, "only {scanned} files walked under {dir:?}");
+        assert!(saw_mod, "the client's read verb was not located");
+    }
+
+    /// The second half, and the one that keeps the first from being routed
+    /// around: exactly two HTTP clients exist under `src/sync/`.
+    ///
+    /// [`Client::new`] builds the authenticated one, with the same-origin
+    /// redirect policy that stops a bearer token following a 302 (T-3-02), and
+    /// `write::follow_unauthenticated` builds the deliberately token-free one
+    /// that completes an asset download (T-4-01). A third would be a request
+    /// path with neither property.
+    #[test]
+    fn no_third_http_client_is_built_under_src_sync() {
+        let needle = format!("reqwest::{}::", "Client");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sync");
+        let mut files = Vec::new();
+        collect_rs(&root, &mut files);
+
+        // Shipped code only, and the marker is the whole `mod tests` header
+        // rather than the bare attribute: the bare form also occurs inside a doc
+        // comment in `pairing.rs`, and splitting on it there would truncate that
+        // file to its first 76 lines.
+        const TEST_MODULE: &str = "\n#[cfg(test)]\nmod tests";
+        let mut sites: Vec<String> = Vec::new();
+        let mut split_files = 0usize;
+        for path in &files {
+            let text = std::fs::read_to_string(path).unwrap();
+            if text.contains(TEST_MODULE) {
+                split_files += 1;
+            }
+            for line in text.split(TEST_MODULE).next().unwrap().lines() {
+                // The type named in a field or a doc comment is not a
+                // construction, so match the path-and-associated-item form.
+                if line.contains(&needle) {
+                    sites.push(format!("{}: {}", path.display(), line.trim()));
+                }
+            }
+        }
+        assert!(
+            split_files > 5,
+            "only {split_files} files carried a test module; the split marker has drifted"
+        );
+        assert_eq!(
+            sites.len(),
+            2,
+            "exactly two HTTP clients may be built under src/sync/ — the \
+             authenticated one in github/mod.rs and the token-free storage one in \
+             github/write.rs. Found: {sites:#?}"
+        );
+    }
+
+    fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect_rs(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
         }
     }
 
