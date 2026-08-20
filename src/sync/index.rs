@@ -703,4 +703,163 @@ mod tests {
         index.record(&e, 1, &ids(1)).unwrap();
         assert!(index.lookup(&e).is_some());
     }
+
+    // ---- the chunk table ----------------------------------------------
+
+    fn cid(byte: u8) -> ChunkId {
+        ChunkId::from_bytes([byte; 32])
+    }
+
+    fn open(dir: &TempDir) -> Index {
+        Index::at(&dir.path().join("index.sqlite3")).unwrap()
+    }
+
+    #[test]
+    fn a_recorded_chunk_is_known_and_locatable() {
+        let dir = TempDir::new().unwrap();
+        let index = open(&dir);
+        assert_eq!(
+            index.record_chunks(&[(cid(1), cid(9), 0, 4112, 4096)]).unwrap(),
+            1
+        );
+
+        assert_eq!(index.known_chunks(&[cid(1), cid(2)]), [cid(1)].into());
+        assert_eq!(
+            index.chunk_locations(&[cid(1)]).get(&cid(1)),
+            Some(&ChunkLocation {
+                pack: cid(9),
+                offset: 0,
+                clen: 4112,
+                plen: 4096,
+            })
+        );
+    }
+
+    #[test]
+    fn re_recording_an_id_moves_it_rather_than_duplicating_it() {
+        let dir = TempDir::new().unwrap();
+        let index = open(&dir);
+        index.record_chunks(&[(cid(1), cid(9), 0, 10, 8)]).unwrap();
+        index.record_chunks(&[(cid(1), cid(8), 64, 10, 8)]).unwrap();
+
+        let rows: i64 = index
+            .conn
+            .query_row("SELECT count(*) FROM chunk", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "a repack moves a chunk, it does not clone it");
+        assert_eq!(index.chunk_locations(&[cid(1)])[&cid(1)].pack, cid(8));
+    }
+
+    /// One query, batched under SQLite's variable limit — a first push asks
+    /// about thousands of ids at once and a statement per id is the difference
+    /// between a second and a minute.
+    #[test]
+    fn membership_is_answered_for_more_ids_than_sqlite_takes_parameters() {
+        let dir = TempDir::new().unwrap();
+        let index = open(&dir);
+        let many: Vec<ChunkId> = (0..2_500u32)
+            .map(|i| {
+                let mut raw = [0u8; 32];
+                raw[..4].copy_from_slice(&i.to_le_bytes());
+                ChunkId::from_bytes(raw)
+            })
+            .collect();
+        let rows: Vec<_> = many
+            .iter()
+            .take(2_000)
+            .map(|id| (*id, cid(9), 0u64, 10u32, 8u32))
+            .collect();
+        assert_eq!(index.record_chunks(&rows).unwrap(), 2_000);
+
+        let known = index.known_chunks(&many);
+        assert_eq!(known.len(), 2_000);
+        assert!(known.contains(&many[1_999]));
+        assert!(!known.contains(&many[2_000]));
+    }
+
+    #[test]
+    fn forgetting_a_pack_leaves_no_row_pointing_at_it() {
+        let dir = TempDir::new().unwrap();
+        let index = open(&dir);
+        index
+            .record_chunks(&[
+                (cid(1), cid(9), 0, 10, 8),
+                (cid(2), cid(9), 16, 10, 8),
+                (cid(3), cid(8), 0, 10, 8),
+            ])
+            .unwrap();
+
+        assert_eq!(index.forget_chunks(&[cid(9)]).unwrap(), 2);
+        assert_eq!(index.known_chunks(&[cid(1), cid(2), cid(3)]), [cid(3)].into());
+    }
+
+    /// The module's rule, applied to the new table: every malformed shape is
+    /// **absence**, which costs a re-upload of bytes that are already there and
+    /// never a wrong "already present".
+    #[test]
+    fn a_malformed_row_reads_as_absent_rather_than_being_materialised() {
+        for damage in [
+            "UPDATE chunk SET \"offset\" = -1",
+            "UPDATE chunk SET clen = -1",
+            "UPDATE chunk SET plen = -1",
+            "UPDATE chunk SET pack = substr(pack, 1, 31)",
+            "UPDATE chunk SET id = substr(id, 1, 31)",
+        ] {
+            let dir = TempDir::new().unwrap();
+            let index = open(&dir);
+            index.record_chunks(&[(cid(1), cid(9), 0, 10, 8)]).unwrap();
+            index.conn.execute(damage, []).unwrap();
+            assert!(
+                index.known_chunks(&[cid(1)]).is_empty(),
+                "{damage} must read as absent"
+            );
+            assert!(index.chunk_locations(&[cid(1)]).is_empty(), "{damage}");
+        }
+    }
+
+    /// A chunk table this build cannot read must be thrown away at **open**,
+    /// where the answer can still be "discard" — never mid-push, where it
+    /// cannot.
+    #[test]
+    fn a_chunk_table_with_the_wrong_columns_is_discarded_at_open() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("index.sqlite3");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE chunk (id BLOB PRIMARY KEY, junk TEXT)")
+                .unwrap();
+        }
+        let index = Index::at(&path).unwrap();
+        assert!(index.was_rebuilt());
+        // …and both halves work on the rebuilt file, rather than erroring.
+        index.record_chunks(&[(cid(1), cid(9), 0, 10, 8)]).unwrap();
+        assert_eq!(index.known_chunks(&[cid(1)]), [cid(1)].into());
+    }
+
+    #[test]
+    fn a_missing_chunk_table_reads_as_nothing_known() {
+        let dir = TempDir::new().unwrap();
+        let index = open(&dir);
+        index.record_chunks(&[(cid(1), cid(9), 0, 10, 8)]).unwrap();
+        index.conn.execute("DROP TABLE chunk", []).unwrap();
+        assert!(index.known_chunks(&[cid(1)]).is_empty());
+        assert!(index.chunk_locations(&[cid(1)]).is_empty());
+    }
+
+    /// Stamped with the run's generation in the same statement, exactly as
+    /// `record` and `touch` are, so `evict_unseen` ages a chunk row on the same
+    /// clock as a file row.
+    #[test]
+    fn chunk_rows_are_stamped_with_the_current_generation() {
+        let dir = TempDir::new().unwrap();
+        let index = open(&dir);
+        index.bump_generation().unwrap();
+        index.record_chunks(&[(cid(1), cid(9), 0, 10, 8)]).unwrap();
+
+        assert_eq!(index.evict_unseen(1).unwrap(), 0, "written this generation");
+        index.bump_generation().unwrap();
+        index.bump_generation().unwrap();
+        assert_eq!(index.evict_unseen(1).unwrap(), 1);
+        assert!(index.known_chunks(&[cid(1)]).is_empty());
+    }
 }
