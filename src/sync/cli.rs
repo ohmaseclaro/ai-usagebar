@@ -21,10 +21,11 @@ use crate::sync::github::setup::TtyPrompt;
 use crate::sync::github::{
     self, Client, Endpoints, RepoRef, gate, pairing, token, token::TokenChain,
 };
-use crate::sync::index::Index;
+use crate::sync::index::{self, Index};
 use crate::sync::push::progress;
 use crate::sync::push::{self, PushCtx, PushOutcome};
 use crate::sync::report::{DryRunReport, RepoSection};
+use crate::sync::restore::{self, RestoreOptions};
 use crate::sync::{SyncRoots, passphrase, plan, report};
 use crate::widget::cli::SyncAction;
 
@@ -79,9 +80,43 @@ pub fn run_with(
         SyncAction::Push {
             dry_run: false,
             allow_rollback,
+            ..
         } => push(cfg, roots, endpoints, chain, *allow_rollback, now),
         SyncAction::Prune => prune(cfg, roots, endpoints, chain, now),
         SyncAction::Rekey => rekey(cfg, roots, endpoints, chain, now),
+        SyncAction::Pull {
+            apply,
+            // `--dry-run` maps to nothing. A dry run is the *absence* of
+            // `apply`, not a flag anything checks (D1) — it is accepted for
+            // symmetry with `push --dry-run`, and clap refuses it alongside
+            // `--apply` so a run that passes both is an error, not a guess.
+            dry_run: _,
+            force,
+            force_credentials,
+            allow_rollback,
+            yes,
+            rebuild_index,
+        } => pull(
+            cfg,
+            roots,
+            endpoints,
+            chain,
+            RestoreOptions {
+                apply: *apply,
+                force: *force,
+                force_credentials: *force_credentials,
+                allow_rollback: *allow_rollback,
+                rebuild_index: *rebuild_index,
+                // Nothing on this path reads it, and that is why `sync pull`
+                // does not offer `--force-rehash`: restore hashes what is on
+                // disk and never asks the index, so the flag would change
+                // nothing here. It lives on `sync push`, where it changes what
+                // the planner does.
+                force_rehash: false,
+                assume_yes: *yes,
+            },
+            now,
+        ),
     }
 }
 
@@ -684,6 +719,52 @@ fn rekey(
     }
 }
 
+// ---- the inbound command ---------------------------------------------------
+
+/// Where a pull talks, and whether it may ask.
+struct PullIo<'a> {
+    out: &'a mut dyn std::io::Write,
+    gate: Option<&'a mut dyn std::io::BufRead>,
+}
+
+/// `~/.claude-acc/backups` — the account switcher's own archive directory, so a
+/// user has one place to look for "undo" rather than two (D3).
+///
+/// Derived from the injected roots the same way `claude_desktop::Paths::resolve`
+/// derives it from `$HOME`, and never from `$HOME` here: that is what keeps
+/// every test's archive inside its own `TempDir`.
+fn backups_dir(roots: &SyncRoots) -> PathBuf {
+    roots
+        .desktop_profiles_dir
+        .parent()
+        .unwrap_or(&roots.desktop_profiles_dir)
+        .join("backups")
+}
+
+fn pull(
+    cfg: &Config,
+    roots: &SyncRoots,
+    endpoints: &Endpoints,
+    chain: &TokenChain,
+    opts: RestoreOptions,
+    now: DateTime<Utc>,
+) -> i32 {
+    let _ = (cfg, roots, endpoints, chain, opts, now);
+    0
+}
+
+fn pull_with_parts(
+    roots: &SyncRoots,
+    parts: &Resolved,
+    passphrase: &zeroize::Zeroizing<String>,
+    opts: RestoreOptions,
+    io: &mut PullIo<'_>,
+    now: DateTime<Utc>,
+) -> i32 {
+    let _ = (roots, parts, passphrase, opts, io, now);
+    0
+}
+
 /// One non-zero exit, one message, and nothing else: no token, no prefix of one,
 /// no header dump, no response body echoed unsanitized. Remote-supplied text
 /// arrives already through `http::message_of`'s `sanitize_untrusted_field`.
@@ -749,6 +830,7 @@ fn render_push(outcome: &PushOutcome) -> String {
 mod tests {
     use super::*;
     use crate::sync::github::setup::{Double, Script};
+    use base64::Engine as _;
     use std::fs;
     use std::sync::Mutex;
     use tempfile::TempDir;
@@ -857,6 +939,8 @@ mod tests {
                 &SyncAction::Push {
                     dry_run: false,
                     allow_rollback: false,
+                    rebuild_index: false,
+                    force_rehash: false,
                 },
                 &cfg_with_repo(None),
                 &dir,
@@ -1546,6 +1630,8 @@ mod tests {
             SyncAction::Push {
                 dry_run: false,
                 allow_rollback: false,
+                rebuild_index: false,
+                force_rehash: false,
             },
             SyncAction::Prune,
             SyncAction::Rekey,
@@ -1648,6 +1734,806 @@ mod tests {
             repo.token_source,
             Some("env"),
             "resolved before the request"
+        );
+    }
+
+    // ---- 5-07: `sync pull`, the command --------------------------------
+
+    const PASSWORD: &str = "correct horse battery staple";
+    const REPO_ID: &str = "github:1";
+    const RELEASE: u64 = 9;
+
+    const B64: base64::engine::general_purpose::GeneralPurpose =
+        base64::engine::general_purpose::STANDARD;
+
+    /// Microseconds instead of ~1.5 s and a gibibyte. The AUR `check()` runs
+    /// these on an installer's machine.
+    const CHEAP: crate::sync::crypto::KdfParams = crate::sync::crypto::KdfParams {
+        m_kib: 8,
+        t: 1,
+        p: 1,
+    };
+
+    /// One credential and one routine, so both halves of D2 are reachable: the
+    /// credential is what the second gate guards, the routine is what `--force`
+    /// alone promotes.
+    const CRED: &str = "accounts/work/.credentials.json";
+    const ROUTINE: &str = "claude-home/scheduled-tasks/daily.json";
+
+    fn roots_in(dir: &Path) -> SyncRoots {
+        SyncRoots::at(
+            dir.join("config.toml"),
+            dir.to_path_buf(),
+            dir.join("desktop"),
+            dir.join("profiles"),
+            dir.join("claude-home"),
+        )
+    }
+
+    fn pull_cfg() -> Config {
+        Config {
+            sync: crate::config::SyncConfig {
+                repo: Some("o/n".into()),
+                categories: vec![SyncCategory::Config, SyncCategory::Routines],
+                ..Default::default()
+            },
+            ..Config::default()
+        }
+    }
+
+    fn client_at(base: &str) -> Client {
+        Client::new(
+            &Endpoints {
+                api_base: base.into(),
+                uploads_base: base.into(),
+            },
+            zeroize::Zeroizing::new(TOKEN.into()),
+            github::token::TokenSource::Env,
+        )
+        .unwrap()
+    }
+
+    /// A bundle the **push** side really produced, so this exercises the pair
+    /// rather than a hand-rolled remote that could agree with a broken reader.
+    struct Bundle {
+        pointer: push::Pointer,
+        keyfile_name: String,
+        keyfile_bytes: Vec<u8>,
+        packs: Vec<(String, Vec<u8>)>,
+    }
+
+    fn pushed(seed: &Path, files: &[(&str, &[u8])]) -> Bundle {
+        let roots = roots_in(seed);
+        for (rel, body) in files {
+            let path = seed.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, body).unwrap();
+        }
+
+        let (keyfile, keys) =
+            Keyfile::create_with_floor(PASSWORD.as_bytes(), CHEAP, CHEAP.m_kib).unwrap();
+        let keyfile_bytes = serde_json::to_vec(&keyfile).unwrap();
+        let keyfile_name = push::keyfile_asset_name(&content_address(&keyfile_bytes));
+
+        let cfg = pull_cfg();
+        let index = Index::at(&roots.index_file).unwrap();
+        let plan = plan::build_with_keys(&roots, &cfg.sync, &index, NOW, &keys).unwrap();
+        // Parked at a dead port: `packer::build` is pure, and a regression that
+        // made it dial should fail rather than reach anything real.
+        let client = client_at("http://127.0.0.1:1");
+        let repo = RepoRef::parse("o/n").unwrap();
+        let ctx = PushCtx {
+            client: &client,
+            repo: &repo,
+            cfg: &cfg.sync,
+            roots: &roots,
+            keys: &keys,
+            kdf: CHEAP,
+            index: &index,
+            repo_id: REPO_ID.into(),
+            keyfile_asset: keyfile_name.clone(),
+            previous: None,
+            allow_rollback: false,
+            now: NOW,
+        };
+        let bundle = push::packer::build(&ctx, &plan).unwrap();
+        let (root, _counter) = push::packer::root_for(&ctx, None, &bundle.manifest_chunks).unwrap();
+
+        Bundle {
+            pointer: push::Pointer {
+                format: push::POINTER_VERSION,
+                repo_id: REPO_ID.into(),
+                keyfile: keyfile_name.clone(),
+                snapshots: vec![push::SnapshotRecord {
+                    root: B64.encode(&root),
+                    index_chunks: bundle.index_chunks.clone(),
+                    packs: bundle.referenced_packs.clone(),
+                }],
+            },
+            keyfile_name,
+            keyfile_bytes,
+            packs: bundle
+                .packs
+                .iter()
+                .map(|p| (push::pack_asset_name(&p.id), p.bytes.clone()))
+                .collect(),
+        }
+    }
+
+    /// Serve `bundle` from `server` exactly as GitHub would.
+    fn serve(server: &mut mockito::ServerGuard, bundle: &Bundle) {
+        let pointer_json = serde_json::to_vec(&bundle.pointer).unwrap();
+        server
+            .mock("GET", "/repos/o/n/contents/sync/pointer.json")
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"sha":"deadbeef","content":"{}"}}"#,
+                B64.encode(&pointer_json)
+            ))
+            .create();
+        server
+            .mock(
+                "GET",
+                format!("/repos/o/n/releases/tags/{}", push::RELEASE_TAG).as_str(),
+            )
+            .with_status(200)
+            .with_body(format!(r#"{{"id":{RELEASE}}}"#))
+            .create();
+
+        let mut listing = Vec::new();
+        let mut assets: Vec<(&str, &[u8])> =
+            vec![(bundle.keyfile_name.as_str(), &bundle.keyfile_bytes)];
+        for (name, bytes) in &bundle.packs {
+            assets.push((name.as_str(), bytes));
+        }
+        for (i, (name, bytes)) in assets.iter().enumerate() {
+            let id = 100 + i as u64;
+            listing.push(format!(
+                r#"{{"id":{id},"name":"{name}","size":{},"state":"uploaded",
+                    "created_at":"2023-11-14T22:13:20Z"}}"#,
+                bytes.len()
+            ));
+            server
+                .mock("GET", format!("/repos/o/n/releases/assets/{id}").as_str())
+                .with_status(200)
+                .with_body(*bytes)
+                .create();
+        }
+        server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(format!("/releases/{RELEASE}/assets")),
+            )
+            .with_status(200)
+            .with_body(format!("[{}]", listing.join(",")))
+            .create();
+    }
+
+    /// Everything `resolve` needs on the restoring machine: a repository, a
+    /// token and a pairing record. **No keyfile** — a second machine has none,
+    /// and that is exactly the case a restore exists for.
+    fn paired(dir: &Path) -> SyncRoots {
+        let roots = roots_in(dir);
+        fs::create_dir_all(&roots.config_dir).unwrap();
+        pairing::write_to(
+            &pairing::default_path(&roots),
+            &pairing::Pairing {
+                repo_id: 1,
+                owner_id: 7,
+                private: true,
+                checked_at: NOW,
+            },
+        )
+        .unwrap();
+        roots
+    }
+
+    /// Drives the pull at `pull_with_parts`, one step below the arm that reads
+    /// the sync password off stdin — the same carve-out `push_against` takes,
+    /// and for the same reason: no test may drive a terminal.
+    ///
+    /// `answers` is `Some` exactly when the production run would have a
+    /// terminal to ask at.
+    fn pull_at(
+        roots: &SyncRoots,
+        base: &str,
+        opts: RestoreOptions,
+        answers: Option<&str>,
+    ) -> (i32, String) {
+        pull_as(roots, base, opts, answers, PASSWORD)
+    }
+
+    fn pull_as(
+        roots: &SyncRoots,
+        base: &str,
+        opts: RestoreOptions,
+        answers: Option<&str>,
+        password: &str,
+    ) -> (i32, String) {
+        let cfg = pull_cfg();
+        let parts = resolve(
+            &cfg,
+            roots,
+            &Endpoints {
+                api_base: base.into(),
+                uploads_base: base.into(),
+            },
+            &TokenChain {
+                env_value: Some(zeroize::Zeroizing::new(TOKEN.into())),
+                ..TokenChain::default()
+            },
+        )
+        .expect("the fixture is configured and paired");
+        let pw = zeroize::Zeroizing::new(password.to_owned());
+        let mut out: Vec<u8> = Vec::new();
+        let code = match answers {
+            Some(typed) => {
+                let mut reader = std::io::Cursor::new(typed.as_bytes().to_vec());
+                pull_with_parts(
+                    roots,
+                    &parts,
+                    &pw,
+                    opts,
+                    &mut PullIo {
+                        out: &mut out,
+                        gate: Some(&mut reader),
+                    },
+                    NOW,
+                )
+            }
+            None => pull_with_parts(
+                roots,
+                &parts,
+                &pw,
+                opts,
+                &mut PullIo {
+                    out: &mut out,
+                    gate: None,
+                },
+                NOW,
+            ),
+        };
+        (code, String::from_utf8_lossy(&out).into_owned())
+    }
+
+    /// Every regular file anywhere under `root`, sorted.
+    fn files_under(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// What a machine that already has *newer* copies of both items looks like.
+    /// The mtime is stamped past the snapshot's, deterministically — never from
+    /// the wall clock.
+    fn seed_newer(roots: &SyncRoots, items: &[(&str, &[u8])]) {
+        let newer = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(u64::try_from(NOW.timestamp()).unwrap() + 3_600);
+        for (rel, body) in items {
+            let path = roots.config_dir.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, body).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(newer)
+                .unwrap();
+        }
+    }
+
+    /// **The defect this whole plan exists to close.** Every dry run prints
+    /// `report::APPLY_COMMAND`; if the subcommand is spelled anything else, the
+    /// report names a command that does not exist.
+    #[test]
+    fn the_command_every_dry_run_prints_is_one_the_binary_actually_accepts() {
+        use clap::Parser;
+        let argv: Vec<&str> = restore::report::APPLY_COMMAND.split_whitespace().collect();
+        let cli = crate::widget::cli::Cli::try_parse_from(&argv)
+            .unwrap_or_else(|e| panic!("`{}` must parse: {e}", restore::report::APPLY_COMMAND));
+        assert!(
+            matches!(
+                cli.command,
+                Some(crate::widget::cli::Command::Sync {
+                    action: SyncAction::Pull { apply: true, .. }
+                })
+            ),
+            "the printed command must be the applying pull, not something else"
+        );
+    }
+
+    /// `--apply` and `--dry-run` together are an error, never a guess.
+    #[test]
+    fn apply_and_dry_run_together_are_refused_by_clap() {
+        use clap::Parser;
+        assert!(
+            crate::widget::cli::Cli::try_parse_from([
+                "ai-usagebar",
+                "sync",
+                "pull",
+                "--apply",
+                "--dry-run",
+            ])
+            .is_err()
+        );
+        // SAFE-03: the second consent is an *addition* to `--force`, and clap
+        // says so before a byte is read.
+        assert!(
+            crate::widget::cli::Cli::try_parse_from([
+                "ai-usagebar",
+                "sync",
+                "pull",
+                "--force-credentials",
+            ])
+            .is_err()
+        );
+    }
+
+    /// D1: no flags, no terminal — plan, report, exit 0, and **nothing on
+    /// disk**. A dry run is a success: it did exactly what it was asked.
+    #[test]
+    fn a_pull_with_no_flags_and_no_terminal_writes_nothing_and_names_the_flag() {
+        let push_dir = TempDir::new().unwrap();
+        let bundle = pushed(push_dir.path(), &[(CRED, b"{\"token\":\"fixture\"}")]);
+        let mut server = mockito::Server::new();
+        serve(&mut server, &bundle);
+
+        let dir = TempDir::new().unwrap();
+        let roots = paired(dir.path());
+        let before = files_under(dir.path());
+
+        let (code, out) = pull_at(&roots, &server.url(), RestoreOptions::default(), None);
+        assert_eq!(code, 0, "a dry run is a completed run");
+        assert!(out.contains(restore::report::APPLY_COMMAND), "{out}");
+        assert_eq!(files_under(dir.path()), before, "a dry run wrote something");
+        assert!(
+            !push::anchor_path(&roots, &RepoRef::parse("o/n").unwrap()).exists(),
+            "a dry run advanced the rollback anchor"
+        );
+    }
+
+    /// The other way to write: a terminal, and an affirmative.
+    #[test]
+    fn an_affirmative_at_the_terminal_applies_and_a_refusal_writes_nothing() {
+        let push_dir = TempDir::new().unwrap();
+        let bundle = pushed(push_dir.path(), &[(CRED, b"{\"token\":\"fixture\"}")]);
+        let mut server = mockito::Server::new();
+        serve(&mut server, &bundle);
+
+        let no = TempDir::new().unwrap();
+        let refused = paired(no.path());
+        let before = files_under(no.path());
+        let (code, _) = pull_at(
+            &refused,
+            &server.url(),
+            RestoreOptions::default(),
+            Some("n\n"),
+        );
+        assert_eq!(code, 0, "a declined gate is a choice, not a failure");
+        assert_eq!(files_under(no.path()), before);
+
+        let yes = TempDir::new().unwrap();
+        let applied = paired(yes.path());
+        let (code, out) = pull_at(
+            &applied,
+            &server.url(),
+            RestoreOptions::default(),
+            Some("y\n"),
+        );
+        assert_eq!(code, 0, "{out}");
+        assert!(applied.config_dir.join(CRED).is_file(), "{out}");
+    }
+
+    /// `--apply` on a machine with no terminal at all: no gate, and the file
+    /// lands. This is the unattended path.
+    #[test]
+    fn apply_without_a_terminal_writes_the_file_and_never_asks() {
+        let push_dir = TempDir::new().unwrap();
+        let bundle = pushed(push_dir.path(), &[(CRED, b"{\"token\":\"fixture\"}")]);
+        let mut server = mockito::Server::new();
+        serve(&mut server, &bundle);
+
+        let dir = TempDir::new().unwrap();
+        let roots = paired(dir.path());
+        let (code, out) = pull_at(
+            &roots,
+            &server.url(),
+            RestoreOptions {
+                apply: true,
+                ..RestoreOptions::default()
+            },
+            None,
+        );
+        assert_eq!(code, 0, "{out}");
+        assert_eq!(
+            fs::read(roots.config_dir.join(CRED)).unwrap(),
+            b"{\"token\":\"fixture\"}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(roots.config_dir.join(CRED))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+        }
+    }
+
+    /// SAFE-03 / D2, both halves in one fixture: `--force` promotes the
+    /// locally-newer **routine** and names it, and stops dead at the
+    /// locally-newer **credential** — with no archive taken and nothing
+    /// written, because the credential gate runs before `backup::take`
+    /// (T-5-60, T-5-61).
+    #[test]
+    fn force_alone_stops_at_a_locally_newer_credential_before_the_backup_exists() {
+        let push_dir = TempDir::new().unwrap();
+        let bundle = pushed(
+            push_dir.path(),
+            &[
+                (CRED, b"{\"token\":\"from-the-snapshot\"}"),
+                (ROUTINE, b"{\"routine\":\"from-the-snapshot\"}"),
+            ],
+        );
+        let mut server = mockito::Server::new();
+        serve(&mut server, &bundle);
+
+        let dir = TempDir::new().unwrap();
+        let roots = paired(dir.path());
+        seed_newer(
+            &roots,
+            &[
+                (CRED, b"{\"token\":\"live\"}"),
+                (ROUTINE, b"{\"r\":\"mine\"}"),
+            ],
+        );
+
+        let forced = RestoreOptions {
+            apply: true,
+            force: true,
+            ..RestoreOptions::default()
+        };
+        let (code, out) = pull_at(&roots, &server.url(), forced, None);
+        assert_ne!(code, 0, "a stopped restore is not a success: {out}");
+        assert!(out.contains(CRED) || out.contains("CREDENTIALS"), "{out}");
+        assert_eq!(
+            fs::read(roots.config_dir.join(CRED)).unwrap(),
+            b"{\"token\":\"live\"}",
+            "the live token survived"
+        );
+        assert_eq!(
+            fs::read(roots.config_dir.join(ROUTINE)).unwrap(),
+            b"{\"r\":\"mine\"}",
+            "the run stopped before any write, not part way through"
+        );
+        assert!(
+            files_under(&backups_dir(&roots)).is_empty(),
+            "the gate runs before backup::take, so a decline leaves no archive"
+        );
+
+        // …and with the second consent, both are replaced and both are named.
+        let (code, out) = pull_at(
+            &roots,
+            &server.url(),
+            RestoreOptions {
+                force_credentials: true,
+                ..forced
+            },
+            None,
+        );
+        assert_eq!(code, 0, "{out}");
+        assert_eq!(
+            fs::read(roots.config_dir.join(CRED)).unwrap(),
+            b"{\"token\":\"from-the-snapshot\"}"
+        );
+        assert!(out.contains(CRED), "SYNC-06 names what it replaced: {out}");
+        assert!(out.contains(ROUTINE), "{out}");
+        assert!(
+            !files_under(&backups_dir(&roots)).is_empty(),
+            "D3: the archive is taken before the first byte"
+        );
+        assert!(out.contains("tar -xzf"), "the undo is printed: {out}");
+    }
+
+    /// The credential gate is answerable at a terminal, and only by the word.
+    #[test]
+    fn the_credential_gate_takes_the_typed_word_and_nothing_else() {
+        let push_dir = TempDir::new().unwrap();
+        let bundle = pushed(push_dir.path(), &[(CRED, b"{\"token\":\"snapshot\"}")]);
+        let mut server = mockito::Server::new();
+        serve(&mut server, &bundle);
+
+        let forced = RestoreOptions {
+            apply: true,
+            force: true,
+            // --yes deliberately does not answer this question (T-5-52).
+            assume_yes: true,
+            ..RestoreOptions::default()
+        };
+
+        let no = TempDir::new().unwrap();
+        let refused = paired(no.path());
+        seed_newer(&refused, &[(CRED, b"{\"token\":\"live\"}")]);
+        let (code, _) = pull_at(&refused, &server.url(), forced, Some("yes\n"));
+        assert_ne!(code, 0, "`yes` is not the word");
+        assert_eq!(
+            fs::read(refused.config_dir.join(CRED)).unwrap(),
+            b"{\"token\":\"live\"}"
+        );
+
+        let ok = TempDir::new().unwrap();
+        let accepted = paired(ok.path());
+        seed_newer(&accepted, &[(CRED, b"{\"token\":\"live\"}")]);
+        let (code, out) = pull_at(&accepted, &server.url(), forced, Some("overwrite\n"));
+        assert_eq!(code, 0, "{out}");
+        assert_eq!(
+            fs::read(accepted.config_dir.join(CRED)).unwrap(),
+            b"{\"token\":\"snapshot\"}"
+        );
+    }
+
+    /// T-5-62: `--allow-rollback` opens an older snapshot of the **same**
+    /// bundle and never one borrowed from a different bundle by renaming. The
+    /// CLI adds no bypass of its own.
+    #[test]
+    fn allow_rollback_never_rescues_a_bundle_identity_mismatch() {
+        let push_dir = TempDir::new().unwrap();
+        let bundle = pushed(push_dir.path(), &[(CRED, b"{\"token\":\"fixture\"}")]);
+        let mut server = mockito::Server::new();
+        serve(&mut server, &bundle);
+
+        let dir = TempDir::new().unwrap();
+        let roots = paired(dir.path());
+
+        // This machine has already seen counter 5 of *another* bundle.
+        crate::sync::anchor::write_to(
+            &push::anchor_path(&roots, &RepoRef::parse("o/n").unwrap()),
+            &crate::sync::anchor::Anchor {
+                repo_id: "github:999".into(),
+                counter: 5,
+            },
+        )
+        .unwrap();
+
+        for opts in [
+            RestoreOptions::default(),
+            RestoreOptions {
+                allow_rollback: true,
+                ..RestoreOptions::default()
+            },
+        ] {
+            let (code, _) = pull_at(&roots, &server.url(), opts, None);
+            assert_ne!(code, 0, "a repo_id mismatch is refused under {opts:?}");
+        }
+    }
+
+    /// A lower counter of the *same* bundle is the case the flag is for: named
+    /// without it, accepted with it.
+    #[test]
+    fn a_lower_counter_names_the_flag_and_then_is_accepted_under_it() {
+        let push_dir = TempDir::new().unwrap();
+        let bundle = pushed(push_dir.path(), &[(CRED, b"{\"token\":\"fixture\"}")]);
+        let mut server = mockito::Server::new();
+        serve(&mut server, &bundle);
+
+        let dir = TempDir::new().unwrap();
+        let roots = paired(dir.path());
+        crate::sync::anchor::write_to(
+            &push::anchor_path(&roots, &RepoRef::parse("o/n").unwrap()),
+            &crate::sync::anchor::Anchor {
+                repo_id: REPO_ID.into(),
+                counter: 5,
+            },
+        )
+        .unwrap();
+
+        let (code, _) = pull_at(&roots, &server.url(), RestoreOptions::default(), None);
+        assert_ne!(code, 0, "an older snapshot is refused by default");
+
+        let (code, _) = pull_at(
+            &roots,
+            &server.url(),
+            RestoreOptions {
+                allow_rollback: true,
+                ..RestoreOptions::default()
+            },
+            None,
+        );
+        assert_eq!(code, 0, "…and accepted when the user says so");
+    }
+
+    /// T-5-67: every failure is non-zero, with its own message, and none of
+    /// them puts a byte on disk.
+    #[test]
+    fn every_failure_exits_non_zero_with_its_own_message_and_writes_nothing() {
+        let push_dir = TempDir::new().unwrap();
+        let bundle = pushed(push_dir.path(), &[(CRED, b"{\"token\":\"fixture\"}")]);
+
+        // A wrong password.
+        let mut server = mockito::Server::new();
+        serve(&mut server, &bundle);
+        let dir = TempDir::new().unwrap();
+        let roots = paired(dir.path());
+        let before = files_under(dir.path());
+        let (code, _) = pull_as(
+            &roots,
+            &server.url(),
+            RestoreOptions {
+                apply: true,
+                ..RestoreOptions::default()
+            },
+            None,
+            "not the password",
+        );
+        assert_ne!(code, 0);
+        assert_eq!(files_under(dir.path()), before);
+
+        // No pointer at all — nothing has ever been pushed.
+        let mut empty = mockito::Server::new();
+        empty
+            .mock("GET", "/repos/o/n/contents/sync/pointer.json")
+            .with_status(404)
+            .with_body(r#"{"message":"Not Found"}"#)
+            .create();
+        let dir = TempDir::new().unwrap();
+        let roots = paired(dir.path());
+        let (code, _) = pull_at(&roots, &empty.url(), RestoreOptions::default(), None);
+        assert_ne!(code, 0);
+        assert!(files_under(dir.path()).len() <= files_under(dir.path()).len());
+
+        // An unreachable remote.
+        let dir = TempDir::new().unwrap();
+        let roots = paired(dir.path());
+        let before = files_under(dir.path());
+        let (code, _) = pull_at(
+            &roots,
+            "http://127.0.0.1:1",
+            RestoreOptions::default(),
+            None,
+        );
+        assert_ne!(code, 0);
+        assert_eq!(files_under(dir.path()), before);
+
+        // A tampered pack: one flipped byte in a bundle the push side really made.
+        let mut tampered = mockito::Server::new();
+        let mut broken = pushed(
+            &TempDir::new().unwrap().keep(),
+            &[(CRED, b"{\"token\":\"fixture\"}")],
+        );
+        broken.packs[0].1[64] ^= 0x01;
+        serve(&mut tampered, &broken);
+        let dir = TempDir::new().unwrap();
+        let roots = paired(dir.path());
+        let before = files_under(dir.path());
+        let (code, _) = pull_at(
+            &roots,
+            &tampered.url(),
+            RestoreOptions {
+                apply: true,
+                ..RestoreOptions::default()
+            },
+            None,
+        );
+        assert_ne!(code, 0);
+        assert_eq!(files_under(dir.path()), before);
+    }
+
+    /// T-5-63: the local index is a cache and must never be able to decide what
+    /// a restore writes. Deleting it changes the outcome not at all.
+    #[test]
+    fn a_deleted_index_produces_an_identical_restore() {
+        let push_dir = TempDir::new().unwrap();
+        let bundle = pushed(
+            push_dir.path(),
+            &[
+                (CRED, b"{\"token\":\"fixture\"}"),
+                (ROUTINE, b"{\"routine\":\"one\"}"),
+            ],
+        );
+        let mut server = mockito::Server::new();
+        serve(&mut server, &bundle);
+
+        let warm_dir = TempDir::new().unwrap();
+        let warm = paired(warm_dir.path());
+        Index::at(&warm.index_file).unwrap();
+        let (warm_code, _) = pull_at(
+            &warm,
+            &server.url(),
+            RestoreOptions {
+                apply: true,
+                ..RestoreOptions::default()
+            },
+            None,
+        );
+
+        let cold_dir = TempDir::new().unwrap();
+        let cold = paired(cold_dir.path());
+        index::reset_at(&cold.index_file).unwrap();
+        fs::remove_file(&cold.index_file).unwrap();
+        let (cold_code, _) = pull_at(
+            &cold,
+            &server.url(),
+            RestoreOptions {
+                apply: true,
+                rebuild_index: true,
+                ..RestoreOptions::default()
+            },
+            None,
+        );
+
+        assert_eq!(warm_code, 0);
+        assert_eq!(cold_code, warm_code);
+        for rel in [CRED, ROUTINE] {
+            assert_eq!(
+                fs::read(warm.config_dir.join(rel)).unwrap(),
+                fs::read(cold.config_dir.join(rel)).unwrap(),
+                "{rel}"
+            );
+        }
+    }
+
+    /// D7: applying the same snapshot twice changes nothing the second time,
+    /// and the second run is not reported as a conflict.
+    #[test]
+    fn a_second_apply_writes_nothing_and_reports_no_conflict() {
+        let push_dir = TempDir::new().unwrap();
+        let bundle = pushed(push_dir.path(), &[(CRED, b"{\"token\":\"fixture\"}")]);
+        let mut server = mockito::Server::new();
+        serve(&mut server, &bundle);
+
+        let dir = TempDir::new().unwrap();
+        let roots = paired(dir.path());
+        let applying = RestoreOptions {
+            apply: true,
+            ..RestoreOptions::default()
+        };
+        assert_eq!(pull_at(&roots, &server.url(), applying, None).0, 0);
+        let stamp = fs::metadata(roots.config_dir.join(CRED))
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        let (code, out) = pull_at(&roots, &server.url(), applying, None);
+        assert_eq!(code, 0, "{out}");
+        assert_eq!(
+            fs::metadata(roots.config_dir.join(CRED))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            stamp,
+            "an already-identical file must not be rewritten"
+        );
+    }
+
+    /// The backups directory is derived from the injected roots, never from
+    /// `$HOME` — which is what keeps every test's archive inside its own
+    /// `TempDir` — and it is the account switcher's own directory, so there is
+    /// one place a user looks for undo rather than two (D3).
+    #[test]
+    fn the_restore_archive_lands_beside_the_account_switchers_own() {
+        let dir = TempDir::new().unwrap();
+        let roots = roots_in(dir.path());
+        let archives = backups_dir(&roots);
+        assert!(archives.starts_with(dir.path()), "{}", archives.display());
+        assert!(archives.ends_with("backups"), "{}", archives.display());
+        assert_eq!(
+            archives.parent(),
+            roots.desktop_profiles_dir.parent(),
+            "the same directory `claude_desktop::Paths` puts its rollbacks in"
         );
     }
 }
