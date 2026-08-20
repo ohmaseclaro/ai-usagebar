@@ -109,3 +109,226 @@ pub async fn run_on_demand(ctx: &PushCtx<'_>, keep: usize) -> Result<usize> {
     .await?;
     Ok(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sync::crypto::ChunkId;
+    use crate::sync::github::write::ASSET_STATE_UPLOADED;
+    use crate::sync::push::{POINTER_VERSION, SnapshotRecord, keyfile_asset_name, pack_asset_name};
+
+    /// Fixed. Nothing here reads a clock: `plan_deletions` takes `now`.
+    const NOW: DateTime<Utc> = match DateTime::from_timestamp(1_700_000_000, 0) {
+        Some(t) => t,
+        None => panic!("a fixed timestamp"),
+    };
+
+    fn id(byte: u8) -> ChunkId {
+        ChunkId::from_bytes([byte; 32])
+    }
+
+    /// `age` is how long before [`NOW`] the remote created it — the only input
+    /// the grace window reads.
+    fn asset(asset_id: u64, name: &str, age: TimeDelta) -> Asset {
+        Asset {
+            id: asset_id,
+            name: name.to_owned(),
+            size: 9,
+            state: ASSET_STATE_UPLOADED.to_owned(),
+            created_at: NOW - age,
+            digest: None,
+        }
+    }
+
+    fn pack(asset_id: u64, byte: u8, age: TimeDelta) -> Asset {
+        asset(asset_id, &pack_asset_name(&id(byte)), age)
+    }
+
+    fn snapshot(packs: Vec<ChunkId>) -> SnapshotRecord {
+        SnapshotRecord {
+            root: format!("root-{}", packs.len()),
+            index_chunks: Vec::new(),
+            packs,
+        }
+    }
+
+    fn pointer(keyfile: &str, snapshots: Vec<SnapshotRecord>) -> Pointer {
+        Pointer {
+            format: POINTER_VERSION,
+            repo_id: "github:1".into(),
+            keyfile: keyfile.to_owned(),
+            snapshots,
+        }
+    }
+
+    const OLD: TimeDelta = TimeDelta::hours(48);
+    const GRACE: TimeDelta = TimeDelta::hours(24);
+
+    /// The base case: two surviving snapshots name A and B, C is nobody's.
+    #[test]
+    fn only_a_pack_no_surviving_snapshot_names_is_deleted() {
+        let keyfile = keyfile_asset_name(&id(0xff));
+        let p = pointer(
+            &keyfile,
+            vec![snapshot(vec![id(0xaa)]), snapshot(vec![id(0xaa), id(0xbb)])],
+        );
+        let assets = [
+            pack(1, 0xaa, OLD),
+            pack(2, 0xbb, OLD),
+            pack(3, 0xcc, OLD),
+            asset(4, &keyfile, OLD),
+        ];
+
+        let (kept, doomed) = plan_deletions(&p, &assets, 10, NOW, GRACE);
+
+        assert_eq!(doomed, vec![3], "only C");
+        assert_eq!(kept.snapshots.len(), 2, "nothing to truncate at keep = 10");
+    }
+
+    /// Both sides of the boundary. An unreferenced pack uploaded by a machine
+    /// that has not flipped yet is indistinguishable from garbage; the age floor
+    /// is the only thing that tells them apart.
+    #[test]
+    fn an_asset_younger_than_the_grace_window_survives_being_unreferenced() {
+        let p = pointer("keyfile-x.json", vec![snapshot(vec![id(0xaa)])]);
+
+        for (age, expected) in [
+            (TimeDelta::hours(1), vec![]),
+            (GRACE, vec![]),
+            (GRACE + TimeDelta::seconds(1), vec![7]),
+            (OLD, vec![7]),
+        ] {
+            let (_, doomed) = plan_deletions(&p, &[pack(7, 0xcc, age)], 10, NOW, GRACE);
+            assert_eq!(doomed, expected, "at age {age}");
+        }
+    }
+
+    /// Sharing is what makes ten snapshots cheap. A pack only the oldest
+    /// *surviving* record names is still live.
+    #[test]
+    fn a_pack_only_the_oldest_surviving_snapshot_names_is_retained() {
+        let p = pointer(
+            "keyfile-x.json",
+            vec![snapshot(vec![id(0xaa)]), snapshot(vec![id(0xbb)])],
+        );
+        let (_, doomed) = plan_deletions(&p, &[pack(1, 0xaa, OLD)], 10, NOW, GRACE);
+        assert!(doomed.is_empty(), "{doomed:?}");
+    }
+
+    /// **The worst thing this function could do.** No snapshot's `packs` list
+    /// names the keyfile, so the naive rule deletes it — and the wrapped master
+    /// key is the only route to the data, for every machine, permanently.
+    #[test]
+    fn the_keyfile_the_pointer_names_is_never_deleted() {
+        let keyfile = keyfile_asset_name(&id(0xff));
+        for snapshots in [
+            vec![],
+            vec![snapshot(vec![])],
+            vec![snapshot(vec![id(0xaa)]), snapshot(vec![id(0xbb)])],
+        ] {
+            let p = pointer(&keyfile, snapshots);
+            // Ancient, unreferenced by any `packs` list, and alone in the
+            // release: every reason the naive rule would have to collect it.
+            let (_, doomed) = plan_deletions(
+                &p,
+                &[asset(1, &keyfile, TimeDelta::days(365))],
+                1,
+                NOW,
+                GRACE,
+            );
+            assert!(doomed.is_empty(), "{doomed:?}");
+        }
+    }
+
+    /// 4-06's gap: an interrupted first push, or a local-only rekey, can leave a
+    /// keyfile asset no pointer names. Same grace window, same landed pointer.
+    #[test]
+    fn an_orphan_keyfile_no_pointer_names_is_swept_like_a_pack() {
+        let live = keyfile_asset_name(&id(0xff));
+        let orphan = keyfile_asset_name(&id(0xee));
+        let p = pointer(&live, vec![snapshot(vec![id(0xaa)])]);
+        let assets = [
+            asset(1, &live, OLD),
+            asset(2, &orphan, OLD),
+            asset(3, &keyfile_asset_name(&id(0xdd)), TimeDelta::hours(2)),
+        ];
+
+        let (_, doomed) = plan_deletions(&p, &assets, 10, NOW, GRACE);
+
+        assert_eq!(doomed, vec![2], "the live one and the young one both stay");
+    }
+
+    /// A collector that deletes what it does not understand turns every format
+    /// addition into a data-loss bug.
+    #[test]
+    fn an_asset_this_build_does_not_recognise_is_never_deleted() {
+        let p = pointer("keyfile-x.json", vec![snapshot(vec![id(0xaa)])]);
+        let hex = "aa".repeat(32);
+        let strangers = [
+            "manifest-v2.bin".to_owned(),
+            format!("pack-{hex}"),                   // no extension
+            format!("pack-{hex}.bin.bak"),           // trailing junk
+            format!("pack-{}.bin", "zz".repeat(32)), // not hex
+            format!("pack-{}.bin", "aa".repeat(16)), // too short
+            "pack-.bin".to_owned(),
+            format!("keyfile-{}.json", "zz".repeat(32)),
+            "keyfile.json".to_owned(),
+            "README.md".to_owned(),
+        ];
+        let assets: Vec<Asset> = strangers
+            .iter()
+            .enumerate()
+            .map(|(i, name)| asset(i as u64 + 1, name, TimeDelta::days(365)))
+            .collect();
+
+        let (_, doomed) = plan_deletions(&p, &assets, 10, NOW, GRACE);
+
+        assert!(doomed.is_empty(), "{doomed:?}");
+    }
+
+    /// The packs freed by truncation are exactly what this pass exists to
+    /// collect.
+    #[test]
+    fn truncation_drops_the_oldest_records_and_frees_their_packs() {
+        let p = pointer(
+            "keyfile-x.json",
+            vec![
+                snapshot(vec![id(0x01)]),
+                snapshot(vec![id(0x02)]),
+                snapshot(vec![id(0x03), id(0x02)]),
+            ],
+        );
+        let assets = [pack(1, 0x01, OLD), pack(2, 0x02, OLD), pack(3, 0x03, OLD)];
+
+        let (kept, doomed) = plan_deletions(&p, &assets, 2, NOW, GRACE);
+
+        assert_eq!(kept.snapshots, p.snapshots[1..], "oldest end only");
+        assert_eq!(doomed, vec![1], "0x02 is still shared, 0x03 is the newest");
+    }
+
+    /// The union of an empty set is empty, which read naively says "everything
+    /// is garbage". A first-push race or a hand-edited pointer would then wipe
+    /// the release.
+    #[test]
+    fn a_pointer_with_no_snapshots_proposes_no_deletions() {
+        let p = pointer("keyfile-x.json", vec![]);
+        let assets = [pack(1, 0xaa, OLD), pack(2, 0xbb, OLD)];
+        let (kept, doomed) = plan_deletions(&p, &assets, 10, NOW, GRACE);
+        assert!(doomed.is_empty(), "{doomed:?}");
+        assert!(kept.snapshots.is_empty());
+    }
+
+    /// Config refuses `keep_snapshots = 0`, but this function's truncated
+    /// pointer is *published*, so a zero arriving any other way must not empty
+    /// the snapshot list.
+    #[test]
+    fn keep_of_zero_still_leaves_the_newest_record() {
+        let p = pointer(
+            "keyfile-x.json",
+            vec![snapshot(vec![id(0x01)]), snapshot(vec![id(0x02)])],
+        );
+        let (kept, doomed) = plan_deletions(&p, &[pack(1, 0x01, OLD)], 0, NOW, GRACE);
+        assert_eq!(kept.snapshots, p.snapshots[1..]);
+        assert_eq!(doomed, vec![1]);
+    }
+}
