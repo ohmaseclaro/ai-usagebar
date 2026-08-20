@@ -47,6 +47,7 @@ use crate::config::{SyncCategory, SyncConfig};
 use crate::error::{AppError, Result};
 use crate::sync::crypto::Keys;
 use crate::sync::index::{FileRecord, Index};
+use crate::sync::keystore;
 use crate::sync::scope::{self, FileEntry};
 use crate::sync::{CHUNK_SIZE, SyncRoots, chunk};
 
@@ -222,6 +223,39 @@ pub fn build<F: Fn(&[u8]) -> [u8; 32]>(
             plan.file_plans.push(file_plan);
         }
 
+        // Pass three: the machine-bound credential stores, which are not files.
+        // Under `credentials` and nowhere else, so switching that category off
+        // leaves them behind exactly as it leaves the profile store behind.
+        let mut store_files = 0usize;
+        let mut store_raw_bytes = 0u64;
+        //
+        // `cfg.includes` again, and it is load-bearing rather than belt-and-
+        // braces: `scope::collect` is what enforces the switch for *files*, and
+        // it returns early before this loop body ever sees the category. A
+        // store read that trusted the loop alone would carry a live OAuth token
+        // into a bundle whose owner had switched credentials off.
+        if category == SyncCategory::Credentials && cfg.includes(category) {
+            for store in keystore::Store::ALL {
+                // A read failure is an error, not an empty result: a locked
+                // Keychain must stop the push, because a bundle that silently
+                // omitted the credential is the defect this exists to end.
+                let Some(value) = roots.stores.read(store)? else {
+                    continue;
+                };
+                if value.is_empty() {
+                    continue; // an empty credential is not a credential
+                }
+                let file_plan = plan_store(store, value.as_bytes(), &chunk_id, &mut known)?;
+                store_files += 1;
+                store_raw_bytes = store_raw_bytes.saturating_add(value.len() as u64);
+                new_bytes += file_plan.new_bytes;
+                new_stored_bytes += file_plan.new_stored_bytes;
+                plan.new_chunk_ids
+                    .extend(file_plan.new_chunk_ids.iter().copied());
+                plan.file_plans.push(file_plan);
+            }
+        }
+
         // The two passes emit cached files first and changed files last, so the
         // order depends on *what was cached* rather than on what is on disk. The
         // manifest is built from this list and rides inside a pack, so an
@@ -235,15 +269,18 @@ pub fn build<F: Fn(&[u8]) -> [u8; 32]>(
 
         plan.categories.push(CategoryPlan {
             category,
-            files: scan.files.len(),
-            raw_bytes: scan.bytes,
+            files: scan.files.len() + store_files,
+            raw_bytes: scan.bytes.saturating_add(store_raw_bytes),
             new_bytes,
             new_stored_bytes,
             excluded_files: scan.excluded_files,
             excluded_bytes: scan.excluded_bytes,
             capped: scan.walk_capped,
         });
-        plan.total_raw_bytes = plan.total_raw_bytes.saturating_add(scan.bytes);
+        plan.total_raw_bytes = plan
+            .total_raw_bytes
+            .saturating_add(scan.bytes)
+            .saturating_add(store_raw_bytes);
         plan.total_new_bytes = plan.total_new_bytes.saturating_add(new_bytes);
         plan.total_new_stored_bytes = plan.total_new_stored_bytes.saturating_add(new_stored_bytes);
     }
@@ -283,6 +320,50 @@ pub fn build_with_keys(
     }
     build(roots, cfg, index, now, |bytes| {
         *keys.chunk_id(bytes).as_bytes()
+    })
+}
+
+/// Chunk one machine-bound store's value, which is held in memory and never on
+/// disk.
+///
+/// No `File`, so [`Counters::files_opened`] is untouched and SYNC-02's
+/// "a no-op sync opens nothing" evidence stays exactly what it claims to be.
+///
+/// **Deliberately no index row and no D5 short-circuit.** A store has no
+/// `(size, mtime_ns, inode)` key, and the nearest thing — the value's length —
+/// would declare a *rotated* OAuth token unchanged, since a fresh token is the
+/// same shape as the one it replaced. That is the one mistake that would make
+/// this whole path pointless, so a store is re-read and re-hashed on every run.
+/// The cost is a few hundred bytes; the packer still de-duplicates against what
+/// the remote already holds, so an unchanged credential re-uploads nothing.
+fn plan_store<F: Fn(&[u8]) -> [u8; 32]>(
+    store: keystore::Store,
+    value: &[u8],
+    chunk_id: &F,
+    known: &mut HashSet<[u8; 32]>,
+) -> Result<FilePlan> {
+    let mut chunk_ids = Vec::new();
+    let mut new_chunk_ids = Vec::new();
+    let mut new_bytes = 0u64;
+    let mut new_stored_bytes = 0u64;
+    for block in value.chunks(CHUNK_BYTES as usize) {
+        let id = chunk_id(block);
+        chunk_ids.push(id);
+        if known.insert(id) {
+            new_chunk_ids.push(id);
+            new_bytes = new_bytes.saturating_add(block.len() as u64);
+            new_stored_bytes =
+                new_stored_bytes.saturating_add(chunk::frame(block)?.len() as u64 + SEAL_OVERHEAD);
+        }
+    }
+    Ok(FilePlan {
+        path: PathBuf::from(store.manifest_path()),
+        sealed_chunks: chunk::sealed_chunk_count(value.len() as u64),
+        chunk_ids,
+        new_chunk_ids,
+        new_bytes,
+        new_stored_bytes,
+        reused: false,
     })
 }
 
@@ -530,6 +611,127 @@ mod tests {
 
     fn write_fixture(path: &Path, len: usize, seed: u64) {
         fs::write(path, pseudo(len, seed)).unwrap();
+    }
+
+    // ---- the machine-bound stores (6-10) ----------------------------------
+
+    /// `credentials` on, and a store with something in it.
+    fn creds_cfg() -> SyncConfig {
+        SyncConfig {
+            categories: vec![SyncCategory::Credentials],
+            ..cfg()
+        }
+    }
+
+    fn with_login(dir: &Path, value: &str) -> SyncRoots {
+        let roots = roots_at(dir);
+        roots
+            .stores
+            .edit()
+            .set(keystore::Store::ClaudeCodeOauth, value);
+        roots
+    }
+
+    /// The whole point: a credential that is not a file still reaches the plan,
+    /// under its own wire name and never under a filesystem path.
+    #[test]
+    fn a_keychain_login_is_planned_under_the_stores_wire_name() {
+        let dir = TempDir::new().unwrap();
+        let roots = with_login(dir.path(), r#"{"claudeAiOauth":{"accessToken":"a"}}"#);
+        let index = index_at(dir.path());
+
+        let plan = build(&roots, &creds_cfg(), &index, now(), toy_id).unwrap();
+
+        let entry = plan
+            .file_plans
+            .iter()
+            .find(|f| f.path == Path::new("keystore/claude-code-oauth"))
+            .expect("the store is in the plan");
+        assert!(!entry.chunk_ids.is_empty());
+        assert!(!entry.reused);
+        assert!(
+            !entry.path.is_absolute(),
+            "a store's plan entry must never look like a path on this disk"
+        );
+        // Not one file was opened to produce it, so SYNC-02's counter still
+        // means what it says.
+        assert_eq!(plan.files_opened, 0);
+
+        let credentials = plan
+            .categories
+            .iter()
+            .find(|c| c.category == SyncCategory::Credentials)
+            .unwrap();
+        assert_eq!(credentials.files, 1);
+        assert_eq!(credentials.raw_bytes, 37);
+    }
+
+    /// D-04 and the opt-in, together: with `credentials` switched off the
+    /// store is never even read, so a bundle cannot carry it by accident.
+    #[test]
+    fn switching_credentials_off_carries_no_store_at_all() {
+        let dir = TempDir::new().unwrap();
+        let roots = with_login(dir.path(), "a-live-token");
+        let index = index_at(dir.path());
+
+        // `cfg()` is config-only: credentials is off.
+        let plan = build(&roots, &cfg(), &index, now(), toy_id).unwrap();
+
+        assert!(
+            plan.file_plans
+                .iter()
+                .all(|f| f.path != Path::new("keystore/claude-code-oauth")),
+            "a store reached a bundle whose owner switched credentials off"
+        );
+    }
+
+    /// The failure that would make the whole path pointless: an OAuth token
+    /// rotates to a *same-length* replacement, and a length-keyed change
+    /// detector would call it unchanged and ship the stale one forever.
+    #[test]
+    fn a_rotated_token_of_identical_length_is_planned_as_new_bytes() {
+        let dir = TempDir::new().unwrap();
+        let roots = with_login(dir.path(), "sk-ant-oat01-AAAAAAAAAAAA");
+        let index = index_at(dir.path());
+
+        let first = build(&roots, &creds_cfg(), &index, now(), toy_id).unwrap();
+        let before = first
+            .file_plans
+            .iter()
+            .find(|f| f.path == Path::new("keystore/claude-code-oauth"))
+            .unwrap()
+            .chunk_ids
+            .clone();
+
+        roots.stores.edit().set(
+            keystore::Store::ClaudeCodeOauth,
+            "sk-ant-oat01-BBBBBBBBBBBB",
+        );
+        let second = build(&roots, &creds_cfg(), &index, now(), toy_id).unwrap();
+        let after = second
+            .file_plans
+            .iter()
+            .find(|f| f.path == Path::new("keystore/claude-code-oauth"))
+            .unwrap()
+            .chunk_ids
+            .clone();
+
+        assert_ne!(before, after, "the rotated token hashed to the old ids");
+        assert!(!second.new_chunk_ids.is_empty());
+    }
+
+    /// An empty store is no credential, and a machine that has never logged in
+    /// contributes nothing rather than a zero-byte manifest entry.
+    #[test]
+    fn a_machine_with_no_login_contributes_no_entry() {
+        let dir = TempDir::new().unwrap();
+        let index = index_at(dir.path());
+        let empty = build(&roots_at(dir.path()), &creds_cfg(), &index, now(), toy_id).unwrap();
+        assert!(empty.file_plans.is_empty());
+
+        let roots = with_login(dir.path(), "");
+        let blank = build(&roots, &creds_cfg(), &index_at(dir.path()), now(), toy_id).unwrap();
+        assert!(blank.file_plans.is_empty());
     }
 
     /// Chunk a file with no cached row: the from-scratch answer.
