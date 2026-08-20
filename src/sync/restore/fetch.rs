@@ -697,8 +697,7 @@ mod tests {
         // the pointer this push is racing against, inside the rebuild closure,
         // so two machines that both read counter 6 no longer both publish 7.
         // A fixture builds against no arriving pointer, which is a first push.
-        let (root, _counter) =
-            push::packer::root_for(&ctx, None, &bundle.manifest_chunks).unwrap();
+        let (root, _counter) = push::packer::root_for(&ctx, None, &bundle.manifest_chunks).unwrap();
 
         Bundle {
             pointer: Pointer {
