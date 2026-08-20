@@ -1448,7 +1448,10 @@ mod tests {
             assert!(!item.disposition.writes());
             assert!(item.dest.is_none(), "a refusal keeps no destination");
 
-            let rendered = report::render_plan(&plan);
+            // `false`: this asserts the refusal is *named*, which is the dry
+            // run's whole job — the user sees it before the run that would
+            // otherwise have written over a working login.
+            let rendered = report::render_plan(&plan, false);
             assert!(
                 rendered.contains(CACHE),
                 "the refusal is not named:\n{rendered}"
