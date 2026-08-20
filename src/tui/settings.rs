@@ -1856,4 +1856,190 @@ enabled = true
         assert_eq!(s.focus, Focus::SyncCategory(0));
         assert!(!s.sync_dirty, "moving focus is not an edit");
     }
+
+    // ─── Sync section: persistence ─────────────────────────────────────────
+
+    /// A state whose sync rows have been edited, so the writer engages.
+    fn toggled_sync_state(cfg: &Config, flip: SyncCategory) -> SettingsState {
+        let mut s = SettingsState::from_config(cfg);
+        s.primary_choices = VendorId::all().to_vec();
+        let i = SyncCategory::ALL.iter().position(|c| *c == flip).unwrap();
+        s.focus = Focus::SyncCategory(i);
+        handle_key(&mut s, KeyCode::Char(' '), KeyModifiers::NONE);
+        s
+    }
+
+    fn written_categories(path: &Path) -> Vec<SyncCategory> {
+        Config::load_from(path).unwrap().sync.categories
+    }
+
+    #[test]
+    fn toggling_transcripts_on_writes_all_five_labels_and_off_writes_four() {
+        let cfg = Config::default();
+        let (_dir, path) = temp_config(Some("[sync]\ncategories = [\"config\"]\n"));
+
+        let on = toggled_sync_state(&cfg, SyncCategory::Transcripts);
+        save_to_path(&on, &path).unwrap();
+        assert_eq!(written_categories(&path), SyncCategory::ALL.to_vec());
+        // The labels are the enum's own spelling, not re-typed in the writer.
+        let text = std::fs::read_to_string(&path).unwrap();
+        for cat in SyncCategory::ALL {
+            assert!(text.contains(cat.label()), "{cat:?} missing from {text}");
+        }
+
+        // The overlay reopened on the file it just wrote, and flipped back.
+        let reopened = Config::load_from(&path).unwrap();
+        let off = toggled_sync_state(&reopened, SyncCategory::Transcripts);
+        save_to_path(&off, &path).unwrap();
+        assert_eq!(written_categories(&path).len(), 4);
+        assert!(
+            !Config::load_from(&path)
+                .unwrap()
+                .sync
+                .includes(SyncCategory::Transcripts)
+        );
+    }
+
+    #[test]
+    fn the_sync_write_inherits_the_overlays_chmod() {
+        // The point of extending `save_to_path` instead of adding a writer:
+        // mode 0600 and the waybar signal come with it. This pins the mode;
+        // `save_to_config_default` is the only thing that signals, and it
+        // still calls straight through here.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let cfg = Config::default();
+            let (_dir, path) = temp_config(Some("[sync]\ncategories = [\"config\"]\n"));
+            let s = toggled_sync_state(&cfg, SyncCategory::Transcripts);
+            save_to_path(&s, &path).unwrap();
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn every_category_off_writes_an_empty_array_that_reloads_as_syncing_nothing() {
+        // "sync nothing" must stay distinguishable from "never chose" (T-6-22).
+        let mut cfg = Config::default();
+        cfg.sync.categories.clear();
+        let mut s = SettingsState::from_config(&cfg);
+        s.sync_dirty = true;
+
+        let (_dir, path) = temp_config(Some("[sync]\ncategories = [\"config\"]\n"));
+        save_to_path(&s, &path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("categories = []"), "{text}");
+        let reloaded = Config::load_from(&path).unwrap();
+        assert!(reloaded.sync.categories.is_empty());
+        for cat in SyncCategory::ALL {
+            assert!(!reloaded.sync.includes(cat), "{cat:?} came back");
+        }
+    }
+
+    #[test]
+    fn save_preserves_a_hand_written_commented_sync_section() {
+        // A comment beside the sync keys may carry anything the user put
+        // there; toml_edit must not relocate it (T-6-24).
+        let original = "\
+# how much leaves this machine
+[sync]
+# transcripts are gigabytes — left off on purpose
+categories = [\"config\"]
+transcript_days = 7        # two weeks was too much
+keep_snapshots = 3
+repo = \"me/private-backup\"
+";
+        let (_dir, path) = temp_config(Some(original));
+        let cfg = Config::load_from(&path).unwrap();
+        let s = toggled_sync_state(&cfg, SyncCategory::Credentials);
+        save_to_path(&s, &path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        for kept in [
+            "# how much leaves this machine",
+            "# transcripts are gigabytes — left off on purpose",
+            "transcript_days = 7",
+            "# two weeks was too much",
+            "keep_snapshots = 3",
+            "repo = \"me/private-backup\"",
+        ] {
+            assert!(text.contains(kept), "lost {kept:?} from:\n{text}");
+        }
+        let reloaded = Config::load_from(&path).unwrap();
+        assert_eq!(reloaded.sync.keep_snapshots, 3);
+        assert_eq!(reloaded.sync.repo.as_deref(), Some("me/private-backup"));
+        assert!(reloaded.sync.includes(SyncCategory::Credentials));
+    }
+
+    #[test]
+    fn save_creates_a_sync_section_when_the_file_has_none() {
+        let (_dir, path) = temp_config(Some("[zai]\nenabled = true\n"));
+        let cfg = Config::default();
+        let s = toggled_sync_state(&cfg, SyncCategory::Transcripts);
+        save_to_path(&s, &path).unwrap();
+
+        assert_eq!(written_categories(&path), SyncCategory::ALL.to_vec());
+        // and the section it did not own is still there.
+        assert!(std::fs::read_to_string(&path).unwrap().contains("[zai]"));
+    }
+
+    #[test]
+    fn a_section_the_overlay_does_not_own_survives_byte_for_byte() {
+        // `[context]` belongs to the context monitor, not to this overlay.
+        // (The plan named `[ui]`; the overlay does own `ui.primary`, so the
+        // honest fixture is a section it has no key in at all.)
+        let original = "\
+[context]
+enabled = true
+layout = \"split\"   # trailing comment
+
+[sync]
+categories = [\"config\"]
+";
+        let (_dir, path) = temp_config(Some(original));
+        let cfg = Config::load_from(&path).unwrap();
+        let s = toggled_sync_state(&cfg, SyncCategory::Routines);
+        save_to_path(&s, &path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let context_block = "[context]\nenabled = true\nlayout = \"split\"   # trailing comment\n";
+        assert!(
+            text.contains(context_block),
+            "[context] was rewritten:\n{text}"
+        );
+    }
+
+    #[test]
+    fn an_untouched_save_never_invents_a_sync_section() {
+        // Opening Settings to paste one API key must not also commit the user
+        // to a persisted sync selection they never made.
+        let (_dir, path) = temp_config(Some("[zai]\nenabled = true\n"));
+        let s = state_with("zk", "ok", VendorId::Zai);
+        assert!(!s.sync_dirty);
+        save_to_path(&s, &path).unwrap();
+        assert!(
+            !std::fs::read_to_string(&path).unwrap().contains("[sync]"),
+            "an untouched save wrote a sync section"
+        );
+    }
+
+    #[test]
+    fn re_saving_the_same_state_leaves_the_file_byte_identical() {
+        let (_dir, path) = temp_config(Some(
+            "[sync]\ncategories = [\"config\"]\nkeep_snapshots = 3\n",
+        ));
+        let cfg = Config::load_from(&path).unwrap();
+        let s = toggled_sync_state(&cfg, SyncCategory::Transcripts);
+
+        save_to_path(&s, &path).unwrap();
+        let first = std::fs::read(&path).unwrap();
+        save_to_path(&s, &path).unwrap();
+        assert_eq!(
+            first,
+            std::fs::read(&path).unwrap(),
+            "save is not idempotent"
+        );
+    }
 }
