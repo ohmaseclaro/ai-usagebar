@@ -3,6 +3,7 @@
 //! into a fallback `⚠` JSON / pretty line so Waybar never hides the module.
 
 use std::io::Write;
+use std::path::Path;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -45,8 +46,7 @@ pub async fn run(cli: Cli) -> i32 {
     if let Some(secs) = cli.watch {
         return run_watch(cli, secs).await;
     }
-    run_once(&cli, &mut std::io::stdout()).await;
-    0
+    run_once(&cli, &mut std::io::stdout(), None).await
 }
 
 /// Cycle to the next/prev enabled vendor and signal waybar to refresh.
@@ -103,7 +103,7 @@ async fn run_watch(cli: Cli, secs: u64) -> i32 {
             print!("\x1b[2J\x1b[H");
         }
         let _ = std::io::stdout().flush();
-        run_once(&cli, &mut std::io::stdout()).await;
+        run_once(&cli, &mut std::io::stdout(), None).await;
         println!();
         eprintln!("(re-rendering every {secs}s — press Ctrl-C to exit)");
         tokio::select! {
@@ -113,8 +113,12 @@ async fn run_watch(cli: Cli, secs: u64) -> i32 {
     }
 }
 
-async fn run_once(cli: &Cli, out: &mut impl Write) {
-    let output = match build_output(cli).await {
+/// Renders and returns the process exit code. The code is the point: Waybar
+/// hides a module whose exec exits non-zero, so returning the constant 0 from
+/// the function under test is what lets a test fail if anyone ever makes it
+/// conditional.
+async fn run_once(cli: &Cli, out: &mut impl Write, config_path: Option<&Path>) -> i32 {
+    let output = match build_output(cli, config_path).await {
         Ok(o) => o,
         Err(e) => fallback(&e, cli),
     };
@@ -125,13 +129,17 @@ async fn run_once(cli: &Cli, out: &mut impl Write) {
         let _ = print_pretty(out, &output);
     }
     let _ = out.flush();
+    0
 }
 
-async fn build_output(cli: &Cli) -> Result<WaybarOutput> {
+async fn build_output(cli: &Cli, config_path: Option<&Path>) -> Result<WaybarOutput> {
     // A broken config is reported through the `⚠` fallback (still exit 0)
     // rather than silently reverting to the default vendor set — otherwise a
     // typo'd section shows another account's usage with no diagnostic.
-    let config = Config::load()?;
+    let config = match config_path {
+        Some(path) => Config::load_from(path)?,
+        None => Config::load()?,
+    };
     let vendor = cli.resolved_vendor(&config);
     if !dispatch_is_eligible(cli, &config, vendor) {
         return Err(AppError::Other(format!(
