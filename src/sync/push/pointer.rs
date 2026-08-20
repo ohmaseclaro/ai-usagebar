@@ -145,6 +145,7 @@ mod tests {
     use crate::sync::github::token::TokenSource;
     use crate::sync::github::{Endpoints, gate::RepoFacts};
     use crate::sync::push::{POINTER_VERSION, SnapshotRecord};
+    use std::sync::{Arc, Mutex};
     use zeroize::Zeroizing;
 
     const NOW: DateTime<Utc> = match DateTime::from_timestamp(1_700_000_000, 0) {
@@ -290,8 +291,6 @@ mod tests {
     /// `put_contents` — a first push must send no `sha` at all.
     #[tokio::test]
     async fn a_first_flip_sends_no_sha_and_a_later_one_sends_the_loaded_sha() {
-        use std::sync::{Arc, Mutex};
-
         let mut server = mockito::Server::new_async().await;
         let seen: Arc<Mutex<Vec<String>>> = Arc::default();
         let recorder = Arc::clone(&seen);
@@ -405,5 +404,315 @@ mod tests {
         let once = rebuild_like_the_orchestrator(None, "new", 10);
         let twice = rebuild_like_the_orchestrator(Some(&once), "new", 10);
         assert_eq!(twice.snapshots.len(), 1);
+    }
+
+    // ---- the bounded, merging compare-and-swap ----------------------------
+
+    /// Where every pointer request in these tests goes.
+    const PATH: &str = "/repos/o/n/contents/sync/pointer.json";
+
+    /// Records every `PUT` body the server sees, in order, so the `sha` each
+    /// attempt carried can be asserted from the wire. A matcher that asserted
+    /// `sha` would also *select* on it, and a wrong `sha` would then arrive as
+    /// an unmatched-request 501 instead of as a failed assertion.
+    fn recorder(sink: Arc<Mutex<Vec<String>>>) -> impl Fn(&mockito::Request) -> bool + 'static {
+        move |req: &mockito::Request| {
+            sink.lock()
+                .unwrap()
+                .push(req.utf8_lossy_body().unwrap().into_owned());
+            true
+        }
+    }
+
+    /// The pointer as it actually went out, decoded back out of a recorded body.
+    fn sent(body: &str) -> Pointer {
+        use base64::Engine;
+        let doc: serde_json::Value = serde_json::from_str(body).unwrap();
+        let raw = super::super::B64
+            .decode(doc["content"].as_str().expect("a content field"))
+            .unwrap();
+        serde_json::from_slice(&raw).unwrap()
+    }
+
+    fn roots_of(p: &Pointer) -> Vec<&str> {
+        p.snapshots.iter().map(|r| r.root.as_str()).collect()
+    }
+
+    /// A 409 costs exactly one re-read and exactly one further `PUT`, the retry
+    /// carries the `sha` the re-read returned, and the competing machine's
+    /// snapshot record — one this run never saw — survives into what lands
+    /// (T-4-28, T-4-29).
+    #[tokio::test]
+    async fn a_conflict_re_reads_once_rebuilds_on_the_winner_and_retries_once() {
+        let mut server = mockito::Server::new_async().await;
+        let bodies: Arc<Mutex<Vec<String>>> = Arc::default();
+
+        let refused = server
+            .mock("PUT", PATH)
+            .with_status(409)
+            .with_body(r#"{"message":"sync/pointer.json does not match blob1"}"#)
+            .match_request(recorder(Arc::clone(&bodies)))
+            .expect(1)
+            .create_async()
+            .await;
+        let accepted = server
+            .mock("PUT", PATH)
+            .with_status(200)
+            .with_body(r#"{"content":{"sha":"blob3"}}"#)
+            .match_request(recorder(Arc::clone(&bodies)))
+            .expect(1)
+            .create_async()
+            .await;
+        let reread = server
+            .mock("GET", PATH)
+            .with_status(200)
+            .with_body(contents_body(&pointer(&["a", "competitor"]), "blob2"))
+            .expect(1)
+            .create_async()
+            .await;
+
+        let (landed, sha) = commit(
+            &client_at(&server.url()),
+            &repo(),
+            Some(&pointer(&["a"])),
+            Some("blob1"),
+            |arriving| Ok(rebuild_like_the_orchestrator(arriving, "new", 10)),
+            &permit(),
+            NOW,
+        )
+        .await
+        .expect("the retry lands");
+
+        refused.assert_async().await;
+        accepted.assert_async().await;
+        reread.assert_async().await;
+
+        assert_eq!(sha, "blob3");
+        // The pointer returned is the one that *went to the remote*. Prune is
+        // handed this; deleting against the local candidate instead would strand
+        // the competitor's packs.
+        assert_eq!(roots_of(&landed), vec!["a", "competitor", "new"]);
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "exactly two PUTs");
+        assert!(bodies[0].contains(r#""sha":"blob1""#), "{}", bodies[0]);
+        assert!(bodies[1].contains(r#""sha":"blob2""#), "{}", bodies[1]);
+        assert_eq!(
+            roots_of(&sent(&bodies[1])),
+            vec!["a", "competitor", "new"],
+            "the competitor is not erased on the wire either"
+        );
+    }
+
+    /// Rule 2 survives the retry: the rebuilt pointer is still oldest-first and
+    /// still no longer than `keep_snapshots`, and the truncation is in the body
+    /// that is written — so the record is dropped by the flip itself, strictly
+    /// before any pack is deleted, because deletion happens after `commit`
+    /// returns (D2).
+    #[tokio::test]
+    async fn the_retried_pointer_is_still_oldest_first_and_still_capped_at_keep() {
+        let mut server = mockito::Server::new_async().await;
+        let bodies: Arc<Mutex<Vec<String>>> = Arc::default();
+
+        let _refused = server
+            .mock("PUT", PATH)
+            .with_status(409)
+            .with_body(r#"{"message":"stale"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let _accepted = server
+            .mock("PUT", PATH)
+            .with_status(200)
+            .with_body(r#"{"content":{"sha":"blob3"}}"#)
+            .match_request(recorder(Arc::clone(&bodies)))
+            .expect(1)
+            .create_async()
+            .await;
+        let _reread = server
+            .mock("GET", PATH)
+            .with_status(200)
+            .with_body(contents_body(&pointer(&["a", "b", "c"]), "blob2"))
+            .expect(1)
+            .create_async()
+            .await;
+
+        let (landed, _) = commit(
+            &client_at(&server.url()),
+            &repo(),
+            Some(&pointer(&["a"])),
+            Some("blob1"),
+            |arriving| Ok(rebuild_like_the_orchestrator(arriving, "new", 2)),
+            &permit(),
+            NOW,
+        )
+        .await
+        .expect("the retry lands");
+
+        assert_eq!(roots_of(&landed), vec!["c", "new"]);
+        assert_eq!(
+            roots_of(&sent(&bodies.lock().unwrap()[0])),
+            vec!["c", "new"],
+            "already truncated as it went out"
+        );
+    }
+
+    /// D3's bound: two machines retrying against each other without limit is a
+    /// livelock that burns the content-creation budget and never converges, so
+    /// the second conflict reports and the human re-run is the backoff (T-4-30).
+    #[tokio::test]
+    async fn a_second_conflict_names_another_machine_and_makes_no_third_attempt() {
+        let mut server = mockito::Server::new_async().await;
+
+        let puts = server
+            .mock("PUT", PATH)
+            .with_status(409)
+            .with_body(r#"{"message":"stale"}"#)
+            .expect(2)
+            .create_async()
+            .await;
+        let reread = server
+            .mock("GET", PATH)
+            .with_status(200)
+            .with_body(contents_body(&pointer(&["a", "competitor"]), "blob2"))
+            .expect(1)
+            .create_async()
+            .await;
+
+        let err = commit(
+            &client_at(&server.url()),
+            &repo(),
+            Some(&pointer(&["a"])),
+            Some("blob1"),
+            |arriving| Ok(rebuild_like_the_orchestrator(arriving, "new", 10)),
+            &permit(),
+            NOW,
+        )
+        .await
+        .expect_err("two collisions in a row");
+
+        puts.assert_async().await;
+        reread.assert_async().await;
+        assert!(err.to_string().contains("another machine"), "{err}");
+        assert!(err.to_string().contains("re-run"), "{err}");
+    }
+
+    /// A `sha`-less `PUT` against a path that already exists answers 422, not
+    /// 409. `write::put_contents` maps it onto a `Conflict` at the one call site
+    /// that knows it omitted the `sha`, so it arrives here as one and takes the
+    /// same single re-read-and-rebuild path a 409 takes.
+    #[tokio::test]
+    async fn a_422_on_a_sha_less_put_takes_the_same_re_read_and_retry_path() {
+        let mut server = mockito::Server::new_async().await;
+        let bodies: Arc<Mutex<Vec<String>>> = Arc::default();
+
+        let refused = server
+            .mock("PUT", PATH)
+            .with_status(422)
+            .with_body(r#"{"message":"Invalid request. sha wasn't supplied."}"#)
+            .match_request(recorder(Arc::clone(&bodies)))
+            .expect(1)
+            .create_async()
+            .await;
+        let accepted = server
+            .mock("PUT", PATH)
+            .with_status(201)
+            .with_body(r#"{"content":{"sha":"blob3"}}"#)
+            .match_request(recorder(Arc::clone(&bodies)))
+            .expect(1)
+            .create_async()
+            .await;
+        let reread = server
+            .mock("GET", PATH)
+            .with_status(200)
+            .with_body(contents_body(&pointer(&["a"]), "blob2"))
+            .expect(1)
+            .create_async()
+            .await;
+
+        // A first push as far as this machine knows: no `current`, no `sha`.
+        let (landed, _) = commit(
+            &client_at(&server.url()),
+            &repo(),
+            None,
+            None,
+            |arriving| Ok(rebuild_like_the_orchestrator(arriving, "new", 10)),
+            &permit(),
+            NOW,
+        )
+        .await
+        .expect("the retry lands");
+
+        refused.assert_async().await;
+        accepted.assert_async().await;
+        reread.assert_async().await;
+        assert_eq!(roots_of(&landed), vec!["a", "new"], "nothing was erased");
+
+        let bodies = bodies.lock().unwrap();
+        assert!(!bodies[0].contains("sha"), "first attempt: {}", bodies[0]);
+        assert!(bodies[1].contains(r#""sha":"blob2""#), "{}", bodies[1]);
+    }
+
+    /// Phase 3's `classify` already produced the right variant and `actionable`
+    /// already has the right text, so these are returned unchanged. Re-reading
+    /// after a 401 is just a slower failure, and a second layer of
+    /// interpretation here would make two messages for one failure.
+    #[tokio::test]
+    async fn a_401_403_or_404_is_returned_unchanged_and_never_re_read() {
+        for (status, needle) in [
+            (401_usize, "Bad credentials"),
+            (403, "Resource not accessible by personal access token"),
+            (404, "Not Found"),
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let put = server
+                .mock("PUT", PATH)
+                .with_status(status)
+                .with_body(format!(r#"{{"message":"{needle}"}}"#))
+                .expect(1)
+                .create_async()
+                .await;
+            let never = server
+                .mock("GET", PATH)
+                .with_status(200)
+                .with_body(contents_body(&pointer(&["a"]), "blob2"))
+                .expect(0)
+                .create_async()
+                .await;
+
+            let err = commit(
+                &client_at(&server.url()),
+                &repo(),
+                Some(&pointer(&["a"])),
+                Some("blob1"),
+                |arriving| Ok(rebuild_like_the_orchestrator(arriving, "new", 10)),
+                &permit(),
+                NOW,
+            )
+            .await
+            .expect_err("a 401, 403 or 404 at the flip is terminal");
+
+            assert!(err.to_string().contains(needle), "{status}: {err}");
+            put.assert_async().await;
+            never.assert_async().await;
+        }
+    }
+
+    /// SYNC-04 as a fact about this file: a losing race costs one extra round
+    /// trip, never remote data. The needles are assembled at runtime so the
+    /// scan covers the whole file, this test included, rather than skipping the
+    /// half it lives in.
+    #[test]
+    fn nothing_in_this_file_issues_a_delete_request() {
+        let source = include_str!("pointer.rs");
+        for needle in [
+            format!("delete{}asset", "_"),
+            format!("Method::{}", "DELETE"),
+        ] {
+            assert!(
+                !source.contains(&needle),
+                "`{needle}` appears in pointer.rs"
+            );
+        }
     }
 }
