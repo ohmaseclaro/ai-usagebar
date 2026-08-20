@@ -57,11 +57,16 @@ const B64: base64::engine::general_purpose::GeneralPurpose =
 
 /// Snapshot records this build will walk in one pointer.
 ///
-/// `keep_snapshots` defaults to 10 (see `config.rs`) and the monthly retention
-/// tail adds a dozen more, so a legitimate pointer is *tens* of records. 256 is
-/// an order of magnitude past that, and it is checked before a single asset is
-/// fetched — the pointer is plaintext, so every list in it is a length the
+/// `keep_snapshots` defaults to 10 and prune truncates the published list to it
+/// (see `config.rs` and `push::prune::plan_deletions`), so a legitimate pointer
+/// holds ten records, plus whatever a machine mid-flip has appended. 256 is more
+/// than an order of magnitude past that, and it is checked before a single asset
+/// is fetched — the pointer is plaintext, so every list in it is a length the
 /// remote chose (T-5-12).
+///
+/// There is no monthly retention tail. An earlier version of this comment said
+/// there was, and `grep -rn monthly src/sync/` finds nothing: the ceiling was
+/// right, its stated reason was invented.
 const MAX_SNAPSHOTS_IN_POINTER: usize = 256;
 
 /// Chunks the ordered manifest chunk list inside a snapshot root may name.

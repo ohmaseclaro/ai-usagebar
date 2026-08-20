@@ -245,6 +245,7 @@ Then:
 - `ai-usagebar sync status` — what would be sent, and the state of the pairing
 - `ai-usagebar sync push` — upload the encrypted bundle; `--dry-run` measures one without sending it
 - `ai-usagebar sync prune` — delete remote data no kept snapshot still references (this also runs automatically after every successful push)
+- `ai-usagebar sync pull` — restore this machine from the snapshot on the remote. **A dry run by default**: it prints what would change, per item, and writes nothing without `--apply`. An item whose local copy is newer is skipped and named, never silently replaced; a locally-newer *credential* needs `--force` and `--force-credentials` together. Everything about to be overwritten is archived first, and the command that puts it back is printed at the end
 - `ai-usagebar sync rekey` — change the sync password, which is **not** revocation
 
 See [GitHub sync setup](docs/sync-github.md) for what each command does, retention, and the acceptable-use note, and [bundle format](docs/sync-format.md) for the specification.
