@@ -1306,6 +1306,57 @@ mod tests {
         flip.assert();
     }
 
+    /// SYNC-04, the other half of D3: a pack that does not read back as what was
+    /// sent fails the push **before** the flip, so no pointer can ever reference
+    /// a pack that did not verify. Killing a run anywhere above the `PUT` leaves
+    /// the remote pointer byte-identical to what it was.
+    #[test]
+    fn a_pack_that_does_not_verify_never_reaches_the_pointer_put() {
+        let dir = TempDir::new().unwrap();
+        let (roots, keyfile) = seeded(&dir);
+        let mut server = mockito::Server::new();
+
+        server
+            .mock("GET", "/repos/o/n")
+            .with_status(200)
+            .with_body(PRIVATE_BODY)
+            .create();
+        server
+            .mock("GET", "/repos/o/n/releases/tags/ai-usagebar-sync-v1")
+            .with_status(200)
+            .with_body(r#"{"id":9}"#)
+            .create();
+        server
+            .mock("GET", "/repos/o/n/contents/sync/pointer.json")
+            .with_status(404)
+            .with_body(r#"{"message":"Not Found"}"#)
+            .create();
+        server
+            .mock("POST", mockito::Matcher::Regex("/releases/9/assets".into()))
+            .with_status(201)
+            .with_body(asset_json(1, "pack-x.bin"))
+            .create();
+        // Serves something other than what was uploaded.
+        let verify = server
+            .mock("GET", "/repos/o/n/releases/assets/1")
+            .with_status(200)
+            .with_body("not the bytes that were sent")
+            .expect(1)
+            .create();
+        let flip = server
+            .mock("PUT", "/repos/o/n/contents/sync/pointer.json")
+            .with_status(201)
+            .expect(0)
+            .create();
+
+        assert_ne!(
+            push_against(&cfg_with_repo(Some("o/n")), &roots, &keyfile, &server.url()),
+            0
+        );
+        verify.assert();
+        flip.assert();
+    }
+
     /// D2 in the exit code: a prune failure is a warning, never a failed push.
     #[test]
     fn a_prune_failure_is_a_warning_line_and_the_push_still_exits_zero() {
