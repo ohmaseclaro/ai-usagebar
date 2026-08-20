@@ -199,12 +199,9 @@ impl Stores {
     /// bundle pushed from a Mac is refused rather than failing a restore
     /// part-way through.
     pub fn writable(&self, store: Store) -> bool {
-        match (self, store) {
-            (Stores::Fixture(_), _) => true,
-            #[cfg(target_os = "macos")]
-            (Stores::Machine, Store::ClaudeCodeOauth) => true,
-            #[cfg(not(target_os = "macos"))]
-            (Stores::Machine, Store::ClaudeCodeOauth) => false,
+        match self {
+            Stores::Fixture(_) => true,
+            Stores::Machine => machine_writable(store),
         }
     }
 
@@ -251,6 +248,19 @@ impl Stores {
             Stores::Machine => machine_safe_key(),
         }
     }
+}
+
+/// The platform half of [`Stores::writable`], named rather than inlined so a
+/// test can assert it without constructing a [`Stores::Machine`] — which it may
+/// not, and which is the whole hermeticity rule of this module.
+#[cfg(target_os = "macos")]
+fn machine_writable(_store: Store) -> bool {
+    true
+}
+
+#[cfg(not(target_os = "macos"))]
+fn machine_writable(_store: Store) -> bool {
+    false
 }
 
 #[cfg(target_os = "macos")]
@@ -368,6 +378,19 @@ mod tests {
         let rendered = format!("{stores:?}");
         assert!(!rendered.contains("NEVER-PRINT-ME"), "{rendered}");
         assert!(!rendered.contains("sk-ant"), "{rendered}");
+    }
+
+    /// Only where Claude Code keeps its credential in a Keychain. Elsewhere it
+    /// writes `~/.claude/.credentials.json`, which `scope` collects as an
+    /// ordinary file — so a store arriving there is refused in the planner
+    /// rather than failing part-way through a restore.
+    #[test]
+    fn a_store_is_writable_exactly_where_this_platform_has_one() {
+        for store in Store::ALL {
+            assert_eq!(machine_writable(store), cfg!(target_os = "macos"));
+        }
+        // A fixture always is; that is what makes the seam usable.
+        assert!(Stores::fixture().writable(Store::ClaudeCodeOauth));
     }
 
     /// **The hermeticity guard.** `Stores::Machine` is the only door to a real

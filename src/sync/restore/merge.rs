@@ -1648,28 +1648,6 @@ mod tests {
             assert_eq!(held(&m).as_deref(), Some(LIVE));
         }
 
-        /// A store this build cannot write — a macOS Keychain entry arriving on
-        /// Linux, where Claude Code keeps a real file instead — is refused in
-        /// the planner rather than failing part-way through a restore.
-        #[test]
-        fn a_store_this_build_cannot_write_is_refused_in_the_plan() {
-            let m = Machine::new();
-            assert!(
-                m.roots.stores.writable(Store::ClaudeCodeOauth),
-                "a fixture is always writable; this asserts the seam, not the platform"
-            );
-
-            // `Stores::Machine` is unreachable from a test by construction, so
-            // the platform arm is asserted directly on the predicate instead.
-            #[cfg(not(target_os = "macos"))]
-            {
-                let resolved = snapshot_with_packs(&[(LOGIN, FROM_THE_BUNDLE.as_bytes())]);
-                let unwritable = Machine::new();
-                let plan = plan_of(&unwritable, &resolved, applying());
-                assert_eq!(disposition_of(&plan, LOGIN), &Disposition::ExcludedByPolicy);
-            }
-        }
-
         /// A store is a credential in both directions, so it lands under the
         /// category whose switch decided whether it travelled at all — and so
         /// does Claude Code's own credential *file*, which `scope` now collects
@@ -1740,6 +1718,34 @@ mod tests {
 
         fn another_mac() -> safe_storage::Key {
             safe_storage::derive_key(b"the-key-in-some-other-machines-keychain")
+        }
+
+        /// **The wiring, not the gate.** 6-09's tests all drive
+        /// `plan_with_safe_key`, so nothing asserted that `plan` — the entry
+        /// `restore::run` actually calls — reaches a key at all. A regression
+        /// there disables the gate silently while every test below stays green.
+        ///
+        /// The key comes from the injected stores, so this asserts the
+        /// production path end to end without going near a real Keychain.
+        #[test]
+        fn plan_takes_its_safe_storage_key_from_the_injected_stores() {
+            let m = Machine::new();
+            let theirs = safe_storage::encrypt(&another_mac(), br#"{"accessToken":"theirs"}"#);
+            let resolved = snapshot_with_packs(&[(CACHE, theirs.as_bytes())]);
+            let client = m.client();
+
+            // This machine's key is *not* the one that sealed it.
+            m.roots.stores.edit().set_safe_key(Some(this_mac()));
+            let refused = plan(&m.ctx(&client, applying()), &resolved).unwrap();
+            assert_eq!(
+                disposition_of(&refused, CACHE),
+                &Disposition::ForeignSafeStorage
+            );
+
+            // And with the key that did seal it, the same entry restores.
+            m.roots.stores.edit().set_safe_key(Some(another_mac()));
+            let accepted = plan(&m.ctx(&client, applying()), &resolved).unwrap();
+            assert_eq!(disposition_of(&accepted, CACHE), &Disposition::Create);
         }
 
         /// Same key, same answer as before this gate existed: a snapshot of

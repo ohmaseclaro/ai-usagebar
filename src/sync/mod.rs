@@ -301,15 +301,6 @@ impl SyncRoots {
         }
     }
 
-    /// Test seam: the same roots with an injected credential store set, so a
-    /// test can seed what "this machine" already holds and read back what a
-    /// restore wrote. Chainable off [`SyncRoots::at`].
-    #[must_use]
-    pub fn with_stores(mut self, stores: Stores) -> Self {
-        self.stores = stores;
-        self
-    }
-
     /// Production paths, all derived from resolvers that already exist. No new
     /// config knob: a second path to the same tree is a second thing to get
     /// wrong.
