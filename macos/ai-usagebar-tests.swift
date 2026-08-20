@@ -738,6 +738,19 @@ func testSyncStatus() {
     assertEqual(pendingLine.contains("nunca"), false, "a decoded date is not nunca")
     assertEqual(pendingLine.contains("pendente"), true, "pending changes are marked")
 
+    // How much is waiting, when the binary said — the half of D-04 a bare
+    // marker leaves out. A count it did not send degrades to the bare marker.
+    recent.pendingFiles = 3
+    recent.pendingBytes = 104_857_600
+    let counted = syncSummaryLine(recent, now: base)
+    assertEqual(counted.contains("3 pendentes"), true, "the pending count is shown")
+    assertEqual(counted.contains("MB"), true, "…and how much it is")
+    recent.pendingFiles = 1
+    recent.pendingBytes = nil
+    assertEqual(syncSummaryLine(recent, now: base).contains("1 pendente"), true,
+                "one file is singular, and a missing byte count is simply absent")
+    recent.pendingFiles = nil
+
     recent.pending = false
     assertEqual(syncSummaryLine(recent, now: base).contains("pendente"), false,
                 "nothing pending, nothing said")
