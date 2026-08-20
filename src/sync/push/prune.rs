@@ -25,7 +25,7 @@ use std::collections::HashSet;
 
 use chrono::{DateTime, TimeDelta, Utc};
 
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use crate::sync::crypto::ChunkId;
 use crate::sync::github::gate;
 use crate::sync::github::write::Asset;
@@ -143,13 +143,57 @@ pub async fn run(
     keep: usize,
     permit: &gate::Pushing,
 ) -> Result<usize> {
-    let _ = (release_id, permit);
-    // Plan 4-05 replaces the empty slice with one `list_assets` call and then
-    // deletes what comes back, sequentially. The dispatch is wired from the
-    // tracer on purpose: a retention rule nothing calls is a retention rule
-    // whose tests prove only that it can be called directly.
-    let (_truncated, deletions) = plan_deletions(landed, &[], keep, ctx.now, super::PRUNE_GRACE);
-    Ok(deletions.len())
+    let assets = ctx
+        .client
+        .list_assets(ctx.repo, release_id, ctx.now)
+        .await?;
+    let (_kept, doomed) = plan_deletions(landed, &assets, keep, ctx.now, super::PRUNE_GRACE);
+
+    // Sequential rather than concurrent, deliberately: the whole set is a
+    // handful of requests, deletion is the one irreversible operation in this
+    // crate, and stopping at the first error leaves a state a human can read.
+    // Leaving a few extra packs costs storage, and D2 says storage is exactly
+    // what a prune failure is allowed to cost.
+    let mut deleted = 0usize;
+    let mut freed: Vec<ChunkId> = Vec::new();
+    let mut refusal = None;
+    for asset_id in doomed {
+        match ctx
+            .client
+            .delete_asset(ctx.repo, asset_id, permit, ctx.now)
+            .await
+        {
+            // A 404 is success — the asset is already gone, which is what was
+            // asked for. `write::delete_asset` already treats it that way.
+            Ok(()) => {
+                deleted += 1;
+                if let Some(Kind::Pack(pack)) = assets
+                    .iter()
+                    .find(|a| a.id == asset_id)
+                    .and_then(|a| asset_kind(&a.name))
+                {
+                    freed.push(pack);
+                }
+            }
+            Err(e) => {
+                refusal = Some(e);
+                break;
+            }
+        }
+    }
+
+    // The **confirmed** deletions only, and whichever way the pass ended: the
+    // local index must stop claiming a chunk lives in a pack that is gone, or
+    // the next push builds a snapshot naming assets that no longer exist. A row
+    // that survives a failed delete is correct; one dropped for a pack still on
+    // the remote costs a re-upload, which is the safe direction. The remote's
+    // refusal is the more important error, so it wins if both happened.
+    let forgotten = ctx.index.forget_chunks(&freed);
+    if let Some(e) = refusal {
+        return Err(e);
+    }
+    forgotten?;
+    Ok(deleted)
 }
 
 /// The `ai-usagebar sync prune` entry point.
@@ -163,20 +207,55 @@ pub async fn run(
 /// which is itself a write and therefore already needs the permit this function
 /// mints.
 ///
-/// Plan 4-05 fills it: gate, `ensure_release`, load the pointer, publish the
-/// truncated one through [`pointer::commit`](super::pointer::commit) — because
-/// on-demand pruning must drop records in the same ordered way a push does,
-/// through the same compare-and-swap — then run the delete pass against what
-/// landed. Unlike the push path, a failure here **is** a failure: the user asked
-/// for exactly this.
+/// The truncated pointer goes out through the same compare-and-swap a push uses,
+/// so on-demand pruning drops its records in the same ordered way — and the
+/// delete pass then runs against what **landed**, never against the pointer this
+/// call built. Unlike the push path, a failure here **is** a failure: the user
+/// asked for exactly this.
 pub async fn run_on_demand(ctx: &PushCtx<'_>, keep: usize) -> Result<usize> {
-    let _ = keep;
-    let _permit = super::gate_now(
+    let permit = super::gate_now(
         ctx,
         ctx.cfg.includes(crate::config::SyncCategory::Credentials),
     )
     .await?;
-    Ok(0)
+
+    // Before the release, so a bundle with nothing published never *creates*
+    // one purely to run a delete — which is precisely what plan 4-06 declined to
+    // do. With no pointer there is nothing to prove an asset garbage against.
+    let (current, sha) = super::pointer::load(ctx.client, ctx.repo, &ctx.repo_id, ctx.now).await?;
+    let Some(current) = current else {
+        return Ok(0);
+    };
+
+    let release_id = ctx
+        .client
+        .ensure_release(ctx.repo, super::RELEASE_TAG, &permit, ctx.now)
+        .await?;
+
+    // `plan_deletions` is the one place the truncation rule lives; this closure
+    // does not restate it. It runs again on a 409, against whatever won.
+    let rebuild = |arriving: Option<&Pointer>| -> Result<Pointer> {
+        let arriving = arriving.ok_or_else(|| {
+            AppError::Other(
+                "the snapshot pointer disappeared while pruning. Nothing was deleted — re-run \
+                 `ai-usagebar sync prune`."
+                    .into(),
+            )
+        })?;
+        Ok(plan_deletions(arriving, &[], keep, ctx.now, super::PRUNE_GRACE).0)
+    };
+    let (landed, _sha) = super::pointer::commit(
+        ctx.client,
+        ctx.repo,
+        Some(&current),
+        sha.as_deref(),
+        rebuild,
+        &permit,
+        ctx.now,
+    )
+    .await?;
+
+    run(ctx, release_id, &landed, keep, &permit).await
 }
 
 #[cfg(test)]
