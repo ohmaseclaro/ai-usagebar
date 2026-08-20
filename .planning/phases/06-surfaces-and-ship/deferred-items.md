@@ -21,3 +21,19 @@
   this shape of ask and it fits the CURRENT one verbatim; the NEW one wants a
   third variant or a `what: &str` label. Left alone because a sibling plan is
   editing narration in this area and a half-fix reads worse than none.
+
+## 6-10: the D-04 gate reads only the `credentials` switch
+
+`sync::cli` computes `credentials_in_bundle` as
+`config.sync.includes(SyncCategory::Credentials)` and hands it to
+`github::gate::assert_pushable`. But the `config` category carries
+`config/accounts/*/.credentials.json` and a `config.toml` that may hold an
+inline `api_key`. With `config` on and `credentials` off, a **public**
+repository is cleared with a warning that says "the credentials category is
+off, so there is nothing to leak" — while the bundle carries live secrets.
+
+Pre-existing; not widened by 6-10, whose every addition is under
+`credentials`. The fix looks like one predicate
+(`includes(Credentials) || includes(Config)`), but it changes the posture of a
+shipped security gate — the D-04 carve-out becomes reachable only when both
+categories are off — so it wants its own plan and its own tests.

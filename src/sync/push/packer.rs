@@ -65,6 +65,7 @@ use crate::error::{AppError, Result};
 use crate::sync::chunk::{Blob, seal_chunk};
 use crate::sync::crypto::{ChunkId, Keys};
 use crate::sync::index::ChunkLocation;
+use crate::sync::keystore;
 use crate::sync::model::{FileEntry, IndexEntry, IndexObject, Manifest, Root};
 use crate::sync::pack::{PackWriter, should_seal};
 use crate::sync::plan::SyncPlan;
@@ -119,6 +120,36 @@ pub fn build(ctx: &PushCtx<'_>, plan: &SyncPlan) -> Result<PushBundle> {
     let mut files: Vec<FileEntry> = Vec::new();
 
     for file in &plan.file_plans {
+        // A machine-bound store, not a file: its bytes come from the store
+        // itself, and its manifest entry is the store's own fixed wire name —
+        // never `manifest_path`, which would have no root to resolve against.
+        //
+        // Read again here rather than carried down from the plan, for the
+        // reason this module's header gives: the manifest describes what the
+        // packer sealed. A credential that rotated in between is sealed as it
+        // is now, and one that vanished is simply not in the snapshot.
+        if let Some(store) = file
+            .path
+            .to_str()
+            .and_then(keystore::Store::from_manifest_path)
+        {
+            let Some(value) = ctx.roots.stores.read(store)? else {
+                continue;
+            };
+            if value.is_empty() {
+                continue;
+            }
+            let (true_len, chunks) = pack_store(ctx, &mut packs, value.as_bytes(), &reusable)?;
+            files.push(FileEntry {
+                // 0600 recorded for honesty; `restore::write` never applies a
+                // manifest mode, and a store has no mode to apply one to.
+                mode: 0o600,
+                path: store.manifest_path().to_string(),
+                true_len,
+                chunks,
+            });
+            continue;
+        }
         let planned: Vec<ChunkId> = file
             .chunk_ids
             .iter()
@@ -311,6 +342,29 @@ fn pack_file(
             packs.push(seal_chunk(ctx.keys, block)?, ctx.keys)?;
         }
     }
+}
+
+/// Seal and pack a machine-bound store's value, which is already in memory.
+///
+/// The same two-halved dedup [`pack_file`] applies — already published, or
+/// already packed by this run — so an unchanged credential costs nothing on the
+/// wire. `value` is borrowed from a [`Zeroizing`] the caller owns; nothing here
+/// copies it anywhere that outlives the call.
+fn pack_store(
+    ctx: &PushCtx<'_>,
+    packs: &mut Packing,
+    value: &[u8],
+    reusable: &HashMap<ChunkId, ChunkLocation>,
+) -> Result<(u64, Vec<ChunkId>)> {
+    let mut chunks: Vec<ChunkId> = Vec::new();
+    for block in value.chunks(CHUNK_SIZE) {
+        let id = ctx.keys.chunk_id(block);
+        chunks.push(id);
+        if !reusable.contains_key(&id) && !packs.holds(&id) {
+            packs.push(seal_chunk(ctx.keys, block)?, ctx.keys)?;
+        }
+    }
+    Ok((value.len() as u64, chunks))
 }
 
 /// The plaintext length `ids` add up to, when every one of them is already
@@ -655,6 +709,94 @@ mod tests {
         }
     }
 
+    // ---- the machine-bound stores (6-10) ----------------------------------
+
+    /// The plan entry a store produces, and the store seeded to match.
+    fn seed_store(fx: &Fixture, value: &str) -> FilePlan {
+        fx.roots
+            .stores
+            .edit()
+            .set(keystore::Store::ClaudeCodeOauth, value);
+        let chunk_ids: Vec<[u8; 32]> = chunk::split(value.as_bytes())
+            .map(|block| *fx.keys.chunk_id(block).as_bytes())
+            .collect();
+        FilePlan {
+            path: std::path::PathBuf::from(keystore::Store::ClaudeCodeOauth.manifest_path()),
+            sealed_chunks: chunk::sealed_chunk_count(value.len() as u64),
+            new_chunk_ids: chunk_ids.clone(),
+            chunk_ids,
+            new_bytes: value.len() as u64,
+            new_stored_bytes: value.len() as u64,
+            reused: false,
+        }
+    }
+
+    /// The manifest entry is the store's fixed wire name, its bytes really are
+    /// in the packs, and no absolute path or username went with them.
+    #[test]
+    fn a_stores_manifest_entry_is_its_wire_name_and_its_bytes_are_sealed() {
+        let fx = Fixture::new();
+        let login = r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-x"}}"#;
+        let plan = plan_of(vec![seed_store(&fx, login)]);
+
+        let bundle = build(&fx.ctx(None), &plan).unwrap();
+        let manifest = manifest_of(&bundle, &fx.keys);
+
+        let entry = &manifest.files[0];
+        assert_eq!(entry.path, "keystore/claude-code-oauth");
+        assert_eq!(entry.true_len, login.len() as u64);
+        assert!(!entry.path.starts_with('/'));
+        assert!(!entry.path.contains(&fx.dir.path().display().to_string()));
+
+        // The bytes are really there, read back through the format's own reader.
+        let mut restored = Vec::new();
+        for id in &entry.chunks {
+            restored.extend_from_slice(&chunk_plaintext(&bundle, &fx.keys, id));
+        }
+        assert_eq!(restored, login.as_bytes());
+    }
+
+    /// The packer is the authority on what it sealed: a credential that rotated
+    /// between planning and packing is sealed as it is *now*, and the manifest
+    /// names the ids of the bytes that really went into a pack.
+    #[test]
+    fn a_credential_that_rotated_since_planning_is_sealed_as_it_now_is() {
+        let fx = Fixture::new();
+        let plan = plan_of(vec![seed_store(&fx, "the-old-token")]);
+        fx.roots
+            .stores
+            .edit()
+            .set(keystore::Store::ClaudeCodeOauth, "the-new-token");
+
+        let bundle = build(&fx.ctx(None), &plan).unwrap();
+        let entry = &manifest_of(&bundle, &fx.keys).files[0];
+
+        let mut restored = Vec::new();
+        for id in &entry.chunks {
+            restored.extend_from_slice(&chunk_plaintext(&bundle, &fx.keys, id));
+        }
+        assert_eq!(restored, b"the-new-token");
+        assert!(
+            packed_ids(&bundle, &fx.keys)
+                .is_superset(&entry.chunks.iter().copied().collect::<HashSet<ChunkId>>())
+        );
+    }
+
+    /// A credential deleted between planning and packing leaves no entry at all
+    /// — never a zero-length one, and never a chunk id nothing sealed.
+    #[test]
+    fn a_credential_that_vanished_since_planning_is_simply_not_in_the_snapshot() {
+        let fx = Fixture::new();
+        let plan = plan_of(vec![seed_store(&fx, "gone-by-the-time-we-pack")]);
+        fx.roots
+            .stores
+            .edit()
+            .set(keystore::Store::ClaudeCodeOauth, "");
+
+        let bundle = build(&fx.ctx(None), &plan).unwrap();
+        assert!(manifest_of(&bundle, &fx.keys).files.is_empty());
+    }
+
     fn plan_of(files: Vec<FilePlan>) -> SyncPlan {
         let mut new_chunk_ids: Vec<[u8; 32]> = Vec::new();
         for file in &files {
@@ -733,6 +875,20 @@ mod tests {
             .map(|id| (*id, chunk_bytes(bundle, keys, id)))
             .collect();
         Manifest::open(keys, &chunks).unwrap()
+    }
+
+    /// One chunk's **plaintext**, from whichever of this bundle's packs holds
+    /// it — what a restore would really put back.
+    fn chunk_plaintext(bundle: &PushBundle, keys: &Keys, id: &ChunkId) -> Vec<u8> {
+        for pack in &bundle.packs {
+            let header = read_header(keys, &pack.bytes).unwrap();
+            if let Some(entry) = header.entries.into_iter().find(|e| e.id == *id) {
+                return crate::sync::pack::open_blob(keys, &pack.bytes, &entry)
+                    .unwrap()
+                    .to_vec();
+            }
+        }
+        panic!("no pack in this bundle holds that chunk");
     }
 
     /// One chunk's sealed bytes, from whichever of this bundle's packs holds it.

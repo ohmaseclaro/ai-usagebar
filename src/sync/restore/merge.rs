@@ -90,7 +90,7 @@
 //! [`Disposition::ForeignSafeStorage`] and it never writes.
 //!
 //! `.credentials.json` is deliberately untouched by all of this. It is plain
-//! JSON, it is Claude Code'"'"'s own OAuth credential, and it is what makes the CLI
+//! JSON, it is Claude Code's own OAuth credential, and it is what makes the CLI
 //! work on the second machine — the portable half of the bundle.
 //!
 //! # Restore never plans a deletion
@@ -118,6 +118,7 @@ use crate::error::Result;
 use crate::safe_storage;
 use crate::sync::CHUNK_SIZE;
 use crate::sync::crypto::{ChunkId, Keys};
+use crate::sync::keystore::{self, Store};
 use crate::sync::model::{FileEntry, IndexObject};
 use crate::sync::scope::CREDENTIAL_FILE;
 
@@ -159,23 +160,13 @@ enum Local {
 /// Manifest order is preserved and the count is exact: N entries in, N
 /// [`ItemPlan`]s out.
 pub fn plan(ctx: &RestoreCtx<'_>, resolved: &Resolved) -> Result<RestorePlan> {
-    plan_with_safe_key(ctx, resolved, local_safe_key())
-}
-
-/// This machine'"'"'s Claude Safe Storage key, or `None` where there is none to
-/// read — no Keychain item, no Claude Desktop, or not macOS at all.
-///
-/// The seam: [`plan`] reads the login Keychain, [`plan_with_safe_key`] never
-/// does, and every test goes through the latter with a key derived from a fixed
-/// fake secret. Nothing in the suite can reach a real Keychain.
-#[cfg(target_os = "macos")]
-fn local_safe_key() -> Option<safe_storage::Key> {
-    safe_storage::macos_key().ok()
-}
-
-#[cfg(not(target_os = "macos"))]
-fn local_safe_key() -> Option<safe_storage::Key> {
-    None
+    // This machine's Claude Safe Storage key is now one more thing the injected
+    // [`crate::sync::keystore::Stores`] answers for, so there is one rule for
+    // every machine-bound secret rather than two — and still no way for a test
+    // to reach a real login Keychain. `plan_with_safe_key` stays exactly as
+    // 6-09 left it: the seam its own tests drive.
+    let safe_key = ctx.roots.stores.safe_key();
+    plan_with_safe_key(ctx, resolved, safe_key)
 }
 
 fn plan_with_safe_key(
@@ -238,6 +229,15 @@ fn decide_entry(
     safe_key: Option<&safe_storage::Key>,
     packs: &PackSource,
 ) -> (Option<PathBuf>, Disposition) {
+    // **Before anything resolves a path.** A `keystore/…` entry names a store,
+    // not a file, and `layout::from_manifest_path` refuses that prefix by
+    // design — so reaching it would report a live credential as a tampered path
+    // instead of writing it where it belongs. `dest` stays `None` for every
+    // store, which is what keeps `write::apply` from ever treating one as a
+    // file: there is structurally no path for it to be written to.
+    if keystore::Store::is_store_path(&file.path) {
+        return (None, decide_store(ctx, keys, file));
+    }
     if !layout::accept_for_write(Path::new(&file.path)) {
         return (None, Disposition::ExcludedByPolicy);
     }
@@ -246,7 +246,7 @@ fn decide_entry(
         Err(why) => return (None, Disposition::RejectedPath(why.to_string())),
     };
 
-    // Before the destination is even stat'"'"'ed: the refusal holds whether or not
+    // Before the destination is even stat'ed: the refusal holds whether or not
     // a local token cache is there to lose, and no consent promotes it. `dest`
     // stays `None` for the same reason the other two refusals keep it — an
     // entry that will never be written has structurally nowhere to be written.
@@ -319,6 +319,66 @@ fn decide(
     }
 }
 
+/// Decide about one machine-bound store.
+///
+/// Four answers and no timestamps, because a store has none to compare:
+///
+/// | this machine holds | consent | answer |
+/// |---|---|---|
+/// | nothing, or no such store here | — | [`Disposition::Create`] / [`Disposition::ExcludedByPolicy`] |
+/// | the same credential | — | [`Disposition::SkipIdentical`] |
+/// | a **different** credential | none | [`Disposition::ReplacesLiveCredential`] |
+/// | a **different** credential | `--force-credentials` | [`Disposition::Update`] |
+///
+/// Identity is decided by hashing what the store holds with the same
+/// [`Keys::chunk_id`] the push side used — digest-first, the same rule
+/// [`decide`] follows for a file, and the reason a repeated pull onto the
+/// machine that pushed asks the user nothing. It reads no data pack, so a dry
+/// run answers exactly what the applying run will.
+///
+/// **`--force` alone never promotes this**, matching
+/// [`Disposition::NeedsCredentialConfirm`]. `--force` means "overwrite
+/// something newer", and a Keychain item has no mtime for that to be about; the
+/// single specific consent is the credential one.
+///
+/// An unknown `keystore/…` entry — from a build later than this one — is
+/// [`Disposition::ExcludedByPolicy`]: named in the report, never written, and
+/// never mistaken for a path.
+fn decide_store(ctx: &RestoreCtx<'_>, keys: &Keys, file: &FileEntry) -> Disposition {
+    let Some(store) = Store::from_manifest_path(&file.path) else {
+        return Disposition::ExcludedByPolicy;
+    };
+    // A store this build has no way to write — a macOS Keychain entry arriving
+    // on Linux, where Claude Code keeps a real file instead. Refused here, in
+    // the planner, rather than failing part-way through the write.
+    if !ctx.roots.stores.writable(store) {
+        return Disposition::ExcludedByPolicy;
+    }
+    // A read failure is not "there is nothing here". A locked Keychain read as
+    // an empty one would make the next line call a live credential absent and
+    // replace it without ever asking.
+    let Ok(local) = ctx.roots.stores.read(store) else {
+        return Disposition::ReplacesLiveCredential;
+    };
+    let Some(local) = local.filter(|v| !v.is_empty()) else {
+        return Disposition::Create;
+    };
+    if store_chunk_ids(keys, local.as_bytes()) == file.chunks {
+        return Disposition::SkipIdentical;
+    }
+    if ctx.opts.force_credentials {
+        return Disposition::Update;
+    }
+    Disposition::ReplacesLiveCredential
+}
+
+/// A store value's ordered chunk ids, hashed exactly as
+/// [`crate::sync::push::packer`] hashed them, so "the same credential" means
+/// the same bytes and nothing looser.
+fn store_chunk_ids(keys: &Keys, value: &[u8]) -> Vec<ChunkId> {
+    value.chunks(CHUNK_SIZE).map(|b| keys.chunk_id(b)).collect()
+}
+
 /// Is this incoming file a safeStorage blob that this machine cannot open?
 ///
 /// Answered by attempting the decryption. **Only the boolean escapes**: the
@@ -328,7 +388,7 @@ fn decide(
 /// `false` whenever the answer cannot be established, which is the honest
 /// reading of "this is not known to be foreign". In particular a dry run has no
 /// data packs to read — [`super::fetch::resolve`] downloads file content only
-/// under `apply` — so a dry run reports a token cache'"'"'s ordinary disposition
+/// under `apply` — so a dry run reports a token cache's ordinary disposition
 /// and the run that would actually write is the run that refuses. The gate
 /// guards the write, and the write is where the loss would happen.
 #[cfg(target_os = "macos")]
@@ -368,7 +428,7 @@ fn foreign_safe_storage(
     })
 }
 
-/// Not macOS: Chromium'"'"'s safeStorage is a different scheme backed by a
+/// Not macOS: Chromium's safeStorage is a different scheme backed by a
 /// different key store here, [`safe_storage::macos_key`] does not exist, and
 /// restore behaves exactly as it always has.
 #[cfg(not(target_os = "macos"))]
@@ -526,7 +586,21 @@ fn to_fetch(index: &IndexObject, items: &[ItemPlan]) -> (usize, u64) {
 fn category_of(manifest_path: &str) -> SyncCategory {
     let (prefix, rest) = manifest_path.split_once('/').unwrap_or((manifest_path, ""));
     match prefix {
+        // A store is a credential and nothing else, which is what puts it under
+        // the switch deciding whether it travels at all.
+        keystore::PREFIX => SyncCategory::Credentials,
         "desktop-profiles" => SyncCategory::Credentials,
+        // Claude Code's own credential file, which `scope` collects under
+        // `Credentials`. Both directions must agree, or the report files it
+        // under a category its owner never switched on.
+        "claude-home"
+            if rest
+                .rsplit('/')
+                .next()
+                .is_some_and(|n| CREDENTIAL_FILE.matches(n)) =>
+        {
+            SyncCategory::Credentials
+        }
         "desktop-data" if rest.starts_with("claude-code-sessions/") => SyncCategory::ChatIndex,
         "desktop-data" => SyncCategory::Routines,
         "claude-home" if rest.starts_with("projects/") => SyncCategory::Transcripts,
@@ -538,10 +612,12 @@ fn category_of(manifest_path: &str) -> SyncCategory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::chunk;
     use crate::sync::crypto::{KdfParams, Keyfile};
     use crate::sync::github::token::TokenSource;
     use crate::sync::github::{Client, Endpoints, RepoRef};
     use crate::sync::model::{IndexEntry, Manifest, Root};
+    use crate::sync::pack::PackWriter;
     use crate::sync::restore::PackSource;
     use crate::sync::{CHUNK_SIZE, SyncRoots};
     use std::fs;
@@ -948,6 +1024,68 @@ mod tests {
         }
     }
 
+    /// [`snapshot`], but with the data packs really present — the state
+    /// `plan` is in under `--apply`, and the only one in which the incoming
+    /// bytes can be read at all.
+    fn snapshot_with_packs(entries: &[(&str, &[u8])]) -> Resolved {
+        let k = keys();
+        let mut writer = PackWriter::new();
+        let mut files = Vec::new();
+        for (path, body) in entries {
+            let chunks: Vec<ChunkId> = chunk::split(body)
+                .map(|block| {
+                    let blob = chunk::seal_chunk(&k, block).unwrap();
+                    let id = blob.id;
+                    writer.push(blob);
+                    id
+                })
+                .collect();
+            files.push(FileEntry {
+                path: (*path).to_string(),
+                mode: 0o600,
+                true_len: body.len() as u64,
+                chunks,
+            });
+        }
+        let (pack_id, bytes) = writer.finish(&k).unwrap();
+        let mut packs = PackSource::empty(k);
+        packs.add(pack_id, bytes).unwrap();
+        Resolved {
+            root: Root::new(
+                7,
+                SNAPSHOT,
+                "github:1".into(),
+                Vec::new(),
+                KdfParams::default(),
+            ),
+            manifest: Manifest::new(files),
+            index: IndexObject::new(Vec::new(), Vec::new()),
+            packs,
+        }
+    }
+
+    fn applying() -> RestoreOptions {
+        RestoreOptions {
+            apply: true,
+            ..Default::default()
+        }
+    }
+
+    fn planned(m: &Machine, resolved: &Resolved, key: Option<safe_storage::Key>) -> RestorePlan {
+        let client = m.client();
+        plan_with_safe_key(&m.ctx(&client, applying()), resolved, key)
+            .expect("planning is infallible here")
+    }
+
+    fn disposition_of<'a>(plan: &'a RestorePlan, path: &str) -> &'a Disposition {
+        &plan
+            .items
+            .iter()
+            .find(|i| i.manifest_path == path)
+            .unwrap_or_else(|| panic!("{path} is missing from the plan"))
+            .disposition
+    }
+
     /// A snapshot of `(manifest path, body)` pairs, one chunk and one pack per
     /// entry — enough for every decision `plan` makes.
     fn snapshot(entries: &[(&str, &[u8])]) -> Resolved {
@@ -1313,6 +1451,246 @@ mod tests {
         }
     }
 
+    // ------------------------------------------- machine-bound credential stores
+
+    /// A credential that is not a file: read on push, written on restore. Every
+    /// store here is an injected [`keystore::Stores::fixture`], so no test in
+    /// this module can reach a real login Keychain — which is the whole reason
+    /// `SyncRoots::at` yields one.
+    mod machine_bound_stores {
+        use super::*;
+        use crate::sync::keystore::Stores;
+        use crate::sync::restore::{Applied, report, write};
+
+        const LOGIN: &str = "keystore/claude-code-oauth";
+        const LIVE: &str = r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-live"}}"#;
+        const FROM_THE_BUNDLE: &str = r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-bundle"}}"#;
+
+        /// A machine whose store already holds `value`, or holds nothing.
+        fn machine_holding(value: Option<&str>) -> Machine {
+            let m = Machine::new();
+            if let Some(value) = value {
+                m.roots.stores.edit().set(Store::ClaudeCodeOauth, value);
+            }
+            m
+        }
+
+        fn held(m: &Machine) -> Option<String> {
+            m.roots
+                .stores
+                .edit()
+                .get(Store::ClaudeCodeOauth)
+                .map(str::to_string)
+        }
+
+        fn plan_of(m: &Machine, resolved: &Resolved, opts: RestoreOptions) -> RestorePlan {
+            let client = m.client();
+            plan(&m.ctx(&client, opts), resolved).expect("planning is infallible here")
+        }
+
+        fn apply_to(m: &Machine, plan: &RestorePlan, resolved: &Resolved) -> Applied {
+            let client = m.client();
+            write::apply(&m.ctx(&client, applying()), plan, &resolved.packs)
+                .expect("the write half returns Ok even for a partial run")
+        }
+
+        /// **The headline.** A machine with no Claude login gets one, byte for
+        /// byte, and it lands in the store rather than as a file anywhere.
+        #[test]
+        fn a_machine_with_no_login_receives_one_byte_for_byte() {
+            let m = machine_holding(None);
+            let resolved = snapshot_with_packs(&[(LOGIN, FROM_THE_BUNDLE.as_bytes())]);
+
+            let plan = plan_of(&m, &resolved, applying());
+            assert_eq!(disposition_of(&plan, LOGIN), &Disposition::Create);
+            assert!(
+                plan.items[0].dest.is_none(),
+                "a store must never acquire a filesystem destination"
+            );
+
+            let applied = apply_to(&m, &plan, &resolved);
+            assert_eq!(applied.written, 1);
+            assert!(applied.failed_at.is_none());
+            assert_eq!(held(&m).as_deref(), Some(FROM_THE_BUNDLE));
+        }
+
+        /// A repeated pull onto the machine that pushed asks nothing and writes
+        /// nothing — digest-first, exactly as for a file (D7).
+        #[test]
+        fn the_same_login_already_here_is_identical_and_silent() {
+            let m = machine_holding(Some(FROM_THE_BUNDLE));
+            let resolved = snapshot_with_packs(&[(LOGIN, FROM_THE_BUNDLE.as_bytes())]);
+
+            let plan = plan_of(&m, &resolved, RestoreOptions::default());
+            assert_eq!(disposition_of(&plan, LOGIN), &Disposition::SkipIdentical);
+            assert!(!plan.items[0].disposition.writes());
+        }
+
+        /// D2 for a store: `--force` alone is not the consent, and the live
+        /// login is still there afterwards. Replacing the account this tool
+        /// exists to report on is the worst outcome in the whole feature.
+        #[test]
+        fn force_alone_never_replaces_a_different_live_login() {
+            let m = machine_holding(Some(LIVE));
+            let resolved = snapshot_with_packs(&[(LOGIN, FROM_THE_BUNDLE.as_bytes())]);
+
+            let plan = plan_of(&m, &resolved, opts(true, false));
+            assert_eq!(
+                disposition_of(&plan, LOGIN),
+                &Disposition::ReplacesLiveCredential
+            );
+            assert!(!plan.items[0].disposition.writes());
+
+            // Named, and the report says what it costs — including that the
+            // pre-restore backup cannot archive it.
+            let rendered = report::render_plan(&plan, false);
+            assert!(rendered.contains(LOGIN), "{rendered}");
+            assert!(rendered.contains("--force-credentials"), "{rendered}");
+            assert!(rendered.contains("not archived"), "{rendered}");
+
+            // And the write half refuses the whole run rather than guessing how
+            // the confirmation would have been answered — the same tripwire
+            // `NeedsCredentialConfirm` has. Nothing is written either way.
+            let client = m.client();
+            let err = write::apply(&m.ctx(&client, applying()), &plan, &resolved.packs)
+                .expect_err("an unanswered credential consent must not reach the write path");
+            assert!(err.to_string().contains("credential confirmation"), "{err}");
+            assert_eq!(held(&m).as_deref(), Some(LIVE));
+        }
+
+        /// …and the second consent does promote it, so the gate widened rather
+        /// than jammed shut.
+        #[test]
+        fn force_credentials_replaces_the_live_login_and_nothing_else_does() {
+            let m = machine_holding(Some(LIVE));
+            let resolved = snapshot_with_packs(&[(LOGIN, FROM_THE_BUNDLE.as_bytes())]);
+
+            let plan = plan_of(
+                &m,
+                &resolved,
+                RestoreOptions {
+                    apply: true,
+                    force_credentials: true,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(disposition_of(&plan, LOGIN), &Disposition::Update);
+            apply_to(&m, &plan, &resolved);
+            assert_eq!(held(&m).as_deref(), Some(FROM_THE_BUNDLE));
+        }
+
+        /// A `keystore/…` entry from a build later than this one is named,
+        /// refused, and never mistaken for a path — the forward-compatibility
+        /// rule that lets a second store be added without breaking this build.
+        #[test]
+        fn an_unknown_store_is_refused_and_leaves_the_local_one_untouched() {
+            let m = machine_holding(Some(LIVE));
+            let resolved =
+                snapshot_with_packs(&[("keystore/from-a-later-version", b"whatever-this-is")]);
+
+            let plan = plan_of(&m, &resolved, applying());
+            let item = &plan.items[0];
+            assert_eq!(item.disposition, Disposition::ExcludedByPolicy);
+            assert!(item.dest.is_none());
+
+            apply_to(&m, &plan, &resolved);
+            assert_eq!(held(&m).as_deref(), Some(LIVE));
+        }
+
+        /// **Never half-write a credential store.** A snapshot whose recorded
+        /// length disagrees with the bytes it carries is refused *before* the
+        /// store is touched, so the login that was there is still there.
+        #[test]
+        fn a_length_that_disagrees_refuses_the_item_and_keeps_the_existing_login() {
+            let m = machine_holding(Some(LIVE));
+            let mut resolved = snapshot_with_packs(&[(LOGIN, FROM_THE_BUNDLE.as_bytes())]);
+            resolved.manifest.files[0].true_len += 1;
+
+            let plan = plan_of(
+                &m,
+                &resolved,
+                RestoreOptions {
+                    apply: true,
+                    force_credentials: true,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(disposition_of(&plan, LOGIN), &Disposition::Update);
+
+            let applied = apply_to(&m, &plan, &resolved);
+            assert_eq!(applied.failed_at.as_deref(), Some(LOGIN));
+            assert_eq!(applied.written, 0);
+            assert_eq!(
+                held(&m).as_deref(),
+                Some(LIVE),
+                "a refused write took the login with it"
+            );
+        }
+
+        /// The same rule for bytes that are not a credential at all: refused
+        /// whole, never written lossily.
+        #[test]
+        fn a_value_that_is_not_utf8_is_refused_rather_than_repaired() {
+            let m = machine_holding(Some(LIVE));
+            let resolved = snapshot_with_packs(&[(LOGIN, &[0xff, 0xfe, 0xfd])]);
+
+            let plan = plan_of(
+                &m,
+                &resolved,
+                RestoreOptions {
+                    apply: true,
+                    force_credentials: true,
+                    ..Default::default()
+                },
+            );
+            let applied = apply_to(&m, &plan, &resolved);
+            assert_eq!(applied.failed_at.as_deref(), Some(LOGIN));
+            assert_eq!(held(&m).as_deref(), Some(LIVE));
+        }
+
+        /// A store is a credential in both directions, so it lands under the
+        /// category whose switch decided whether it travelled at all — and so
+        /// does Claude Code's own credential *file*, which `scope` now collects
+        /// under `Credentials` too.
+        #[test]
+        fn a_store_and_the_credential_file_are_both_filed_under_credentials() {
+            assert_eq!(category_of(LOGIN), SyncCategory::Credentials);
+            assert_eq!(
+                category_of("keystore/from-a-later-version"),
+                SyncCategory::Credentials
+            );
+            assert_eq!(
+                category_of("claude-home/.credentials.json"),
+                SyncCategory::Credentials
+            );
+            // Case-folded, like every other credential comparison in this file.
+            assert_eq!(
+                category_of("claude-home/.Credentials.json"),
+                SyncCategory::Credentials
+            );
+            // And the rest of `claude-home` is untouched.
+            assert_eq!(
+                category_of("claude-home/scheduled-tasks/x.json"),
+                SyncCategory::Routines
+            );
+        }
+
+        /// The seam itself: a fresh `SyncRoots` has an empty *injected* store,
+        /// never the machine's.
+        #[test]
+        fn every_machine_in_this_suite_has_an_injected_store() {
+            let m = Machine::new();
+            assert!(matches!(m.roots.stores, Stores::Fixture(_)));
+            assert!(
+                m.roots
+                    .stores
+                    .read(Store::ClaudeCodeOauth)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
     // ------------------------------------------- Claude Desktop token caches
 
     /// A Claude Desktop token cache travels, and is only *restorable* where the
@@ -1326,8 +1704,6 @@ mod tests {
     mod desktop_token_caches {
         use super::*;
         use crate::safe_storage;
-        use crate::sync::chunk;
-        use crate::sync::pack::PackWriter;
         use crate::sync::restore::{report, write};
 
         /// `desktop-profiles/…` is the profile store `scope` files under
@@ -1344,70 +1720,32 @@ mod tests {
             safe_storage::derive_key(b"the-key-in-some-other-machines-keychain")
         }
 
-        /// [`snapshot`], but with the data packs really present — the state
-        /// `plan` is in under `--apply`, and the only one in which the incoming
-        /// bytes can be read at all.
-        fn snapshot_with_packs(entries: &[(&str, &[u8])]) -> Resolved {
-            let k = keys();
-            let mut writer = PackWriter::new();
-            let mut files = Vec::new();
-            for (path, body) in entries {
-                let chunks: Vec<ChunkId> = chunk::split(body)
-                    .map(|block| {
-                        let blob = chunk::seal_chunk(&k, block).unwrap();
-                        let id = blob.id;
-                        writer.push(blob);
-                        id
-                    })
-                    .collect();
-                files.push(FileEntry {
-                    path: (*path).to_string(),
-                    mode: 0o600,
-                    true_len: body.len() as u64,
-                    chunks,
-                });
-            }
-            let (pack_id, bytes) = writer.finish(&k).unwrap();
-            let mut packs = PackSource::empty(k);
-            packs.add(pack_id, bytes).unwrap();
-            Resolved {
-                root: Root::new(
-                    7,
-                    SNAPSHOT,
-                    "github:1".into(),
-                    Vec::new(),
-                    KdfParams::default(),
-                ),
-                manifest: Manifest::new(files),
-                index: IndexObject::new(Vec::new(), Vec::new()),
-                packs,
-            }
-        }
-
-        fn applying() -> RestoreOptions {
-            RestoreOptions {
-                apply: true,
-                ..Default::default()
-            }
-        }
-
-        fn planned(
-            m: &Machine,
-            resolved: &Resolved,
-            key: Option<safe_storage::Key>,
-        ) -> RestorePlan {
+        /// **The wiring, not the gate.** 6-09's tests all drive
+        /// `plan_with_safe_key`, so nothing asserted that `plan` — the entry
+        /// `restore::run` actually calls — reaches a key at all. A regression
+        /// there disables the gate silently while every test below stays green.
+        ///
+        /// The key comes from the injected stores, so this asserts the
+        /// production path end to end without going near a real Keychain.
+        #[test]
+        fn plan_takes_its_safe_storage_key_from_the_injected_stores() {
+            let m = Machine::new();
+            let theirs = safe_storage::encrypt(&another_mac(), br#"{"accessToken":"theirs"}"#);
+            let resolved = snapshot_with_packs(&[(CACHE, theirs.as_bytes())]);
             let client = m.client();
-            plan_with_safe_key(&m.ctx(&client, applying()), resolved, key)
-                .expect("planning is infallible here")
-        }
 
-        fn disposition_of<'a>(plan: &'a RestorePlan, path: &str) -> &'a Disposition {
-            &plan
-                .items
-                .iter()
-                .find(|i| i.manifest_path == path)
-                .unwrap_or_else(|| panic!("{path} is missing from the plan"))
-                .disposition
+            // This machine's key is *not* the one that sealed it.
+            m.roots.stores.edit().set_safe_key(Some(this_mac()));
+            let refused = plan(&m.ctx(&client, applying()), &resolved).unwrap();
+            assert_eq!(
+                disposition_of(&refused, CACHE),
+                &Disposition::ForeignSafeStorage
+            );
+
+            // And with the key that did seal it, the same entry restores.
+            m.roots.stores.edit().set_safe_key(Some(another_mac()));
+            let accepted = plan(&m.ctx(&client, applying()), &resolved).unwrap();
+            assert_eq!(disposition_of(&accepted, CACHE), &Disposition::Create);
         }
 
         /// Same key, same answer as before this gate existed: a snapshot of

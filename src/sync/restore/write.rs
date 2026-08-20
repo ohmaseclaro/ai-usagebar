@@ -62,6 +62,23 @@
 //! restore finishes it: every write is idempotent, and 5-03's `SkipIdentical`
 //! means the second run does not even reopen what the first one completed.
 //!
+//! # A machine-bound store is written through the store, not through a file
+//!
+//! A `keystore/…` item has no destination and never gets one: it is written by
+//! [`crate::sync::keystore::Stores::write`], which replaces the whole value or
+//! fails, so a failure leaves the credential that was there untouched. Nothing
+//! about it reaches [`layout::from_manifest_path`] — a synthetic entry that
+//! resolved to a path would be a live OAuth token written in plaintext under
+//! the user's home directory, which is the one outcome this whole feature must
+//! not have.
+//!
+//! **The pre-restore backup cannot archive one.** `super::run` archives
+//! destinations, and a store has none; there is nowhere to put a Keychain item
+//! that is not a plaintext file on disk. The protection instead is the consent:
+//! a store holding a *different* live credential is
+//! [`Disposition::ReplacesLiveCredential`] until `--force-credentials` says
+//! otherwise, and the report says in those words that it is not archived.
+//!
 //! # This module assumes the backup was already taken
 //!
 //! [`super::run`] calls [`super::backup::take`] over exactly the destinations
@@ -91,7 +108,10 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 
+use zeroize::Zeroizing;
+
 use crate::error::{AppError, Result};
+use crate::sync::keystore::Store;
 
 use super::{Applied, Disposition, ItemPlan, PackSource, RestoreCtx, RestorePlan, layout, report};
 
@@ -104,11 +124,14 @@ use super::{Applied, Disposition, ItemPlan, PackSource, RestoreCtx, RestorePlan,
 /// one, and [`super::run`] does not.
 pub fn apply(ctx: &RestoreCtx<'_>, plan: &RestorePlan, packs: &PackSource) -> Result<Applied> {
     let mut out = Applied::default();
-    let mut queue: Vec<(&ItemPlan, PathBuf)> = Vec::new();
+    let mut queue: Vec<(&ItemPlan, Target)> = Vec::new();
 
     // Preflight, over every item, before any of them is written.
     for item in &plan.items {
-        if matches!(item.disposition, Disposition::NeedsCredentialConfirm { .. }) {
+        if matches!(
+            item.disposition,
+            Disposition::NeedsCredentialConfirm { .. } | Disposition::ReplacesLiveCredential
+        ) {
             return Err(AppError::Other(format!(
                 "{:?} reached the write path still awaiting the credential confirmation the CLI \
                  resolves before a restore applies — refusing rather than guessing which way it \
@@ -118,6 +141,14 @@ pub fn apply(ctx: &RestoreCtx<'_>, plan: &RestorePlan, packs: &PackSource) -> Re
         }
         if !item.disposition.writes() {
             out.skipped += 1;
+            continue;
+        }
+
+        // A machine-bound store, decided by `merge::decide_store`. It has no
+        // destination by construction, so it leaves the path preflight below
+        // entirely alone rather than being made to satisfy it.
+        if let Some(store) = Store::from_manifest_path(&item.manifest_path) {
+            queue.push((item, Target::Store(store)));
             continue;
         }
 
@@ -160,13 +191,17 @@ pub fn apply(ctx: &RestoreCtx<'_>, plan: &RestorePlan, packs: &PackSource) -> Re
                 item.manifest_path
             )));
         }
-        queue.push((item, checked));
+        queue.push((item, Target::File(checked)));
     }
 
     // Manifest order, so a partial restore stops in the same place twice and is
     // therefore debuggable.
-    for (item, dest) in queue {
-        if let Err(why) = write_one(packs, item, &dest, plan.created_at) {
+    for (item, target) in queue {
+        let outcome = match &target {
+            Target::File(dest) => write_one(packs, item, dest, plan.created_at),
+            Target::Store(store) => write_store(ctx, packs, item, *store),
+        };
+        if let Err(why) = outcome {
             // `Applied` carries where the run stopped, which is what the summary
             // renders; the cause is only useful now, so it goes to stderr rather
             // than being swallowed.
@@ -204,6 +239,55 @@ fn stopped_line(manifest_path: &str, why: &AppError) -> String {
         report::safe(manifest_path),
         report::safe(&why.to_string())
     )
+}
+
+/// Where one planned write is going. A store is not a path and is deliberately
+/// not represented as one — the type is what keeps a credential from acquiring
+/// a filesystem destination somewhere down the call chain.
+enum Target {
+    File(PathBuf),
+    Store(Store),
+}
+
+/// One machine-bound store: reassemble the credential in memory and hand the
+/// whole value to the store, which replaces it or fails.
+///
+/// **Never a partial write.** There is no truncate-then-fill and no
+/// read-modify-write: the value is complete and length-checked *before*
+/// `Stores::write` is called, so a failure anywhere above leaves the existing
+/// credential exactly as it was. That is the property this whole path was asked
+/// for — do not lose the login.
+///
+/// Nothing here logs, prints or formats the value. The length check names
+/// lengths; the error names the store's description, which is a compile-time
+/// string.
+fn write_store(
+    ctx: &RestoreCtx<'_>,
+    packs: &PackSource,
+    item: &ItemPlan,
+    store: Store,
+) -> Result<()> {
+    let mut value: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
+    for id in &item.chunks {
+        value.extend_from_slice(&packs.chunk(id)?);
+    }
+    if value.len() as u64 != item.true_len {
+        return Err(AppError::Other(format!(
+            "{} reassembled to {} bytes but the snapshot records {} — refusing to write a              truncated credential",
+            store.describe(),
+            value.len(),
+            item.true_len
+        )));
+    }
+    // A credential that is not valid UTF-8 is not one this store can hold, and
+    // the lossy conversion that would "fix" it would silently corrupt a token.
+    let value = std::str::from_utf8(&value).map_err(|_| {
+        AppError::Other(format!(
+            "the snapshot's value for {} is not valid UTF-8 — refusing to write it",
+            store.describe()
+        ))
+    })?;
+    ctx.roots.stores.write(store, value)
 }
 
 /// One file: reassemble its chunks in order, straight into a tempfile beside

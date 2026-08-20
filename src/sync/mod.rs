@@ -19,6 +19,8 @@
 //!   exclusion predicate every category funnels through.
 //! - [`transcripts`] — the bounded transcript selector.
 //! - [`index`] — the local `(path, size, mtime_ns, inode)` change-detection db.
+//! - [`keystore`] — the machine-bound credential stores that are *read* on push
+//!   and *written* on restore, because their contents cannot be copied.
 //! - [`plan`] — dry-run planning over a scan.
 //! - [`github`] — the GitHub transport: auth, the private-repo gate, and the
 //!   pairing record. The only module here that opens a socket — and in Phase 3
@@ -42,6 +44,7 @@ pub mod cli;
 pub mod crypto;
 pub mod github;
 pub mod index;
+pub mod keystore;
 pub mod model;
 pub mod pack;
 pub mod passphrase;
@@ -56,6 +59,7 @@ use std::path::PathBuf;
 
 use crate::config::Config;
 use crate::error::{AppError, Result};
+use crate::sync::keystore::Stores;
 
 /// Fixed chunk size. Fixed-size, *not* content-defined: CDC boundary positions
 /// are visible as ciphertext lengths and fingerprint the plaintext
@@ -261,6 +265,14 @@ pub struct SyncRoots {
     /// a wipeable hint, not durable state — and inside the injected tree under
     /// [`SyncRoots::at`], so no test writes to an installer's real `$XDG`.
     pub index_file: PathBuf,
+    /// The machine-bound credential stores — the login Keychain, in production.
+    ///
+    /// A root like any other, and injected like any other: [`SyncRoots::at`]
+    /// yields an empty [`Stores::fixture`] and [`SyncRoots::resolve`] is the one
+    /// place the real machine is reached. That is what keeps `cargo test` — run
+    /// by the AUR `check()` on an installer's own laptop — structurally unable
+    /// to read or clobber their Claude login. See [`keystore`].
+    pub stores: Stores,
 }
 
 impl SyncRoots {
@@ -285,6 +297,7 @@ impl SyncRoots {
             desktop_data_dir,
             desktop_profiles_dir,
             claude_home,
+            stores: Stores::fixture(),
         }
     }
 
@@ -316,6 +329,9 @@ impl SyncRoots {
             desktop_profiles_dir: desktop.profiles_dir,
             claude_home: crate::cache::home_dir()?.join(".claude"),
             index_file: index::default_path()?,
+            // The one door to a real login Keychain in the whole crate's sync
+            // tree, guarded by `keystore`'s own structural test.
+            stores: Stores::Machine,
         })
     }
 }

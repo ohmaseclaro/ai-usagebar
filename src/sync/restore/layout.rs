@@ -461,6 +461,31 @@ mod tests {
         }
     }
 
+    /// **A store is not a path, and this is the refusal that keeps it one.**
+    ///
+    /// `keystore/…` is deliberately absent from [`ROOT_PREFIXES`], so every
+    /// spelling of it — the one this build writes, one from a later build, and
+    /// a hostile one dressed up as a traversal — dies here rather than becoming
+    /// a destination. A synthetic entry that resolved to a file would be a live
+    /// OAuth token written in plaintext under the user's home directory;
+    /// `restore::merge` intercepts these long before this point, and this is
+    /// what makes that interception a belt as well as braces.
+    #[test]
+    fn a_machine_bound_stores_wire_name_never_resolves_to_a_place_on_disk() {
+        let dir = TempDir::new().unwrap();
+        let roots = machine(dir.path(), "bob");
+        for spelling in [
+            crate::sync::keystore::Store::ClaudeCodeOauth.manifest_path(),
+            "keystore/from-a-later-version",
+            "keystore/../config/config.toml",
+            "keystore",
+        ] {
+            let err = from_manifest_path(&roots, spelling)
+                .expect_err("a store resolved to a filesystem destination");
+            assert!(err.to_string().contains("refusing"), "{spelling}: {err}");
+        }
+    }
+
     #[test]
     fn ordinary_synced_state_is_accepted() {
         for accepted in [

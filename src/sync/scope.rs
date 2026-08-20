@@ -338,6 +338,20 @@ pub fn collect(
             push_path(&roots.config_file, &mut scan);
         }
         SyncCategory::Credentials => {
+            // Claude Code's own OAuth credential, where it is a file — which is
+            // every platform except macOS, whose recent builds keep it in the
+            // login Keychain instead and whose copy therefore travels as a
+            // [`crate::sync::keystore`] entry rather than as bytes. Absent, this
+            // is a no-op, so one arm covers both.
+            //
+            // It is in *this* category and not `Config` so that the D-04
+            // private-repo gate — which asks `includes(Credentials)` — refuses a
+            // public repository over it, and so that switching `credentials` off
+            // leaves it behind like every other secret here.
+            push_path(
+                &roots.claude_home.join(CREDENTIAL_FILE.to_string()),
+                &mut scan,
+            );
             // D1: per profile, `meta.json`, both token caches and
             // `desktop-state/` — and nothing else in the store. A profile
             // without a readable meta.json is skipped rather than failing the
@@ -787,6 +801,48 @@ mod tests {
         let scan = collect(SyncCategory::Credentials, &roots_at(&dir), &cfg, Utc::now());
         assert!(scan.files.is_empty());
         assert_eq!(scan.bytes, 0);
+    }
+
+    /// Where Claude Code writes its OAuth credential to a *file* — Linux, and
+    /// any macOS build predating the Keychain move — that file is the credential
+    /// this whole category exists for, and it used to be collected by nothing at
+    /// all. The macOS Keychain half travels as a `keystore/…` entry instead; see
+    /// [`crate::sync::keystore`].
+    #[test]
+    fn claude_codes_own_credential_file_is_collected_with_the_credentials() {
+        let dir = TempDir::new().unwrap();
+        seed(
+            dir.path(),
+            "claude-home/.credentials.json",
+            "{\"claudeAiOauth\":{}}",
+        );
+        seed(dir.path(), "profiles/gmail/meta.json", "{}");
+
+        let scan = scan_of(SyncCategory::Credentials, &dir);
+        assert_eq!(names(&scan), vec![".credentials.json", "meta.json"]);
+    }
+
+    /// And it is off when the category is off, like every other secret here —
+    /// which is also what keeps the D-04 private-repo gate honest, since that
+    /// gate asks `includes(Credentials)`.
+    #[test]
+    fn claude_codes_credential_file_is_left_behind_when_credentials_are_off() {
+        let dir = TempDir::new().unwrap();
+        seed(dir.path(), "claude-home/.credentials.json", "{}");
+        let cfg = SyncConfig {
+            categories: vec![SyncCategory::Config, SyncCategory::Routines],
+            ..SyncConfig::default()
+        };
+        for cat in [SyncCategory::Config, SyncCategory::Routines] {
+            let scan = collect(cat, &roots_at(&dir), &cfg, Utc::now());
+            assert!(
+                !scan
+                    .files
+                    .iter()
+                    .any(|f| f.path.ends_with(".credentials.json")),
+                "{cat:?} carried the Claude Code credential with credentials switched off"
+            );
+        }
     }
 
     // ---- routines: ~/.claude/scheduled-tasks/** plus each account registry --

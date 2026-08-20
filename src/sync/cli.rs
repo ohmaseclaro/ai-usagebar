@@ -1082,9 +1082,14 @@ fn pull_with_parts(
         .items
         .iter()
         .filter(|item| {
+            // Both consents run through the one gate: a locally-newer
+            // `.credentials.json`, and a machine-bound store this machine
+            // already holds a different login in. Answering the prompt sets
+            // `force_credentials`, which is what promotes either.
             matches!(
                 item.disposition,
                 restore::Disposition::NeedsCredentialConfirm { .. }
+                    | restore::Disposition::ReplacesLiveCredential
             )
         })
         .collect();
