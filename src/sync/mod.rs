@@ -26,6 +26,9 @@
 //! - [`push`] — the outbound path: packing, uploading, and the one
 //!   compare-and-swap that publishes a snapshot. The only module that can
 //!   *change* the remote.
+//! - [`restore`] — the inbound path: reading a bundle back onto a machine that
+//!   may not be the one that pushed it. The only module that turns a remote's
+//!   claims into local writes, and the only one that resolves a manifest path.
 //! - [`report`] — the pure `sync status` model and its renderer.
 //! - [`cli`] — the `ai-usagebar sync …` entry point.
 //!
@@ -45,6 +48,7 @@ pub mod passphrase;
 pub mod plan;
 pub mod push;
 pub mod report;
+pub mod restore;
 pub mod scope;
 pub mod transcripts;
 
