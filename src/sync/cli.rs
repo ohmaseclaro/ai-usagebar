@@ -24,7 +24,7 @@ use crate::sync::github::{
 use crate::sync::index::{self, Index};
 use crate::sync::push::progress;
 use crate::sync::push::{self, PushCtx, PushOutcome};
-use crate::sync::report::{DryRunReport, RepoSection};
+use crate::sync::report::{DryRunReport, RepoSection, Style};
 use crate::sync::restore::{self, RestoreOptions};
 use crate::sync::{SyncRoots, passphrase, plan, report};
 use crate::widget::cli::SyncAction;
@@ -134,6 +134,29 @@ pub fn run_with(
     }
 }
 
+/// The palette for a stream, decided **here** and injected downward.
+///
+/// This is the one production place the two facts meet: `IsTerminal` for the
+/// stream about to be written, and `NO_COLOR` — which is read by
+/// [`crate::display::color_enabled`] rather than here, because `src/sync/`'s
+/// structural guard forbids `std::env` anywhere in this subtree and a password
+/// input path lives two files away.
+///
+/// Two streams, two answers: `sync status` writes its report to standard output
+/// and `sync push` writes its progress to standard error, and `… | less` should
+/// colour neither while `… 2>/dev/null` should still colour the report.
+fn style_of(is_terminal: bool) -> Style {
+    Style::color(crate::display::color_enabled(is_terminal))
+}
+
+fn stdout_style() -> Style {
+    style_of(std::io::stdout().is_terminal())
+}
+
+fn stderr_style() -> Style {
+    style_of(std::io::stderr().is_terminal())
+}
+
 /// One current-thread runtime, built only where one is actually needed.
 ///
 /// `src/bin/ai-usagebar.rs` dispatches `Command::Sync` before it constructs a
@@ -192,7 +215,16 @@ fn status(
             Some(resolve_repo_section(config, roots, endpoints, chain, now)),
         )
     };
-    let (code, out) = status_with(roots, &config.sync, index.as_ref(), now, plan, repo, json);
+    let (code, out) = status_with(
+        roots,
+        &config.sync,
+        index.as_ref(),
+        now,
+        plan,
+        repo,
+        json,
+        stdout_style(),
+    );
     print!("{out}");
     code
 }
@@ -203,6 +235,10 @@ fn status(
 /// Everything the real world supplies arrives as an argument, so no test on
 /// this path calls `Config::load`, `SyncRoots::resolve`, `index::default_path`
 /// or `Utc::now`.
+// Eight, and every one of them is a fact the real world supplies that a test
+// has to be able to fake. Bundling them into a struct would move the same eight
+// one line up and add a type nothing else uses.
+#[allow(clippy::too_many_arguments)]
 fn status_with(
     roots: &SyncRoots,
     cfg: &SyncConfig,
@@ -211,14 +247,18 @@ fn status_with(
     plan: Option<plan::SyncPlan>,
     repo: Option<RepoSection>,
     json: bool,
+    style: Style,
 ) -> (i32, String) {
     // D-06: the listing survives a repository incident; the exit code does not.
     let failed = repo.as_ref().is_some_and(|r| r.failure.is_some());
     let report = report::build_status(roots, cfg, index, now, plan, repo);
     let out = if json {
+        // **Untouched by styling, deliberately.** This document is the macOS
+        // menu bar's whole read of sync and is parsed by the Node contract
+        // suites; one escape in it is a parse failure, not a decoration.
         format!("{}\n", report::status_json(&report))
     } else {
-        report::render_status(&report)
+        report::render_status_styled(&report, style)
     };
     (i32::from(failed), out)
 }
@@ -338,7 +378,7 @@ fn dry_run(config: &Config, roots: &SyncRoots, now: DateTime<Utc>, recovery: Rec
         status: report::build_status(roots, &config.sync, index.as_ref(), now, plan, None),
         no_key,
     };
-    print!("{}", report::render_dry_run(&report));
+    print!("{}", report::render_dry_run_styled(&report, stdout_style()));
     0
 }
 
@@ -366,7 +406,7 @@ fn setup(
             return 1;
         }
     };
-    let mut prompt = TtyPrompt;
+    let mut prompt = TtyPrompt::new(stdout_style());
     match rt.block_on(github::setup::run(
         &cfg.sync,
         roots,
@@ -561,7 +601,12 @@ fn open_keyfile(
 ) -> std::result::Result<LocalKeyfile, String> {
     // Argon2id at m = 1 GiB is a deliberate cost. Announce it before it starts —
     // a command that appears frozen for a second and a half reads as a hang.
-    eprintln!("sync: deriving the sync key (Argon2id — this takes a moment)…");
+    let style = stderr_style();
+    eprintln!(
+        "{} {}",
+        style.dim("sync:"),
+        style.dim("deriving the sync key (Argon2id — this takes a moment)…")
+    );
     let keys = keyfile.open(pw.as_bytes()).map_err(|e| e.to_string())?;
     Ok(LocalKeyfile {
         kdf: keyfile.kdf.params(),
@@ -683,7 +728,7 @@ fn push_with_parts(
     // A progress line on a terminal, plain completed-asset lines when piped.
     // `is_terminal` is read here rather than inside the reporter so tests can
     // pin either shape without a tty.
-    let mut progress = progress::reporter(std::io::stderr().is_terminal());
+    let mut progress = progress::reporter(std::io::stderr().is_terminal(), stderr_style());
     match rt.block_on(push::run(ctx, progress.as_mut())) {
         Ok(outcome) => {
             print!("{}", render_push(&outcome));
@@ -756,7 +801,7 @@ fn rekey(
         Err(why) => return refuse(&why),
     };
 
-    let mut prompt = TtyPrompt;
+    let mut prompt = TtyPrompt::new(stdout_style());
     prompt.say(
         "Changing the sync password rewraps the master key. Not one pack byte moves — and \
          this is NOT revocation: anyone who already holds a copy of the old keyfile can still \
@@ -1095,7 +1140,9 @@ fn pull_with_parts(
 /// no header dump, no response body echoed unsanitized. Remote-supplied text
 /// arrives already through `http::message_of`'s `sanitize_untrusted_field`.
 fn refuse(why: &str) -> i32 {
-    eprintln!("sync: {why}");
+    // The one place this tool says no. Red is reserved for exactly this.
+    let style = stderr_style();
+    eprintln!("{} {why}", style.bad("sync:"));
     1
 }
 
@@ -3108,7 +3155,16 @@ mod tests {
     fn status_json_prints_one_line_of_json_and_exits_zero() {
         let dir = TempDir::new().unwrap();
         let cfg = cfg_with_repo(None);
-        let (code, out) = status_with(&roots_at(&dir), &cfg.sync, None, NOW, None, None, true);
+        let (code, out) = status_with(
+            &roots_at(&dir),
+            &cfg.sync,
+            None,
+            NOW,
+            None,
+            None,
+            true,
+            Style::color(true),
+        );
 
         assert_eq!(code, 0);
         assert_eq!(out.lines().count(), 1, "{out:?}");
@@ -3130,7 +3186,16 @@ mod tests {
         let cfg = cfg_with_repo(None);
         let roots = roots_at(&dir);
 
-        let (code, out) = status_with(&roots, &cfg.sync, None, NOW, None, None, false);
+        let (code, out) = status_with(
+            &roots,
+            &cfg.sync,
+            None,
+            NOW,
+            None,
+            None,
+            false,
+            Style::PLAIN,
+        );
         assert_eq!(code, 0);
         assert_eq!(
             out,

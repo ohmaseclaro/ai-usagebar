@@ -317,9 +317,19 @@ pub async fn run(mut ctx: PushCtx<'_>, progress: &mut dyn Progress) -> Result<Pu
     //     nothing rather than arriving after a full upload.
     upload::assert_keyfile_is_current(&ctx)?;
 
-    // 3. Plan, then pack. Both are local and neither touches the network.
+    // 3. Plan, then pack. Both are local and neither touches the network — and
+    //    on a first push both read the whole tree, which is the minute the
+    //    reporter used to sit through in silence because it only started at the
+    //    first upload. Two transitions, with the planner's own figures on the
+    //    second; see `Progress::phase` for why this is not a bar yet.
+    progress.phase("reading what changed", 0, 0);
     let plan =
         crate::sync::plan::build_with_keys(ctx.roots, ctx.cfg, ctx.index, ctx.now, ctx.keys)?;
+    progress.phase(
+        "sealing into packs",
+        plan.files_opened,
+        plan.total_new_bytes,
+    );
     let bundle = packer::build(&ctx, &plan)?;
 
     // 4. The release the assets hang off.

@@ -311,62 +311,269 @@ fn line_of(c: &CategoryPlan, cfg: &SyncConfig) -> CategoryLine {
     }
 }
 
-/// Pure. Given the same struct it always renders the same string.
-pub fn render_status(report: &StatusReport) -> String {
-    let mut out = table(report);
-    out.push_str(&format!(
-        "\n  last sync: {}\n",
-        report
-            .last_sync
-            .map_or_else(|| "never".to_string(), |t| t.to_rfc3339()),
-    ));
-    if report.index_path.as_os_str().is_empty() {
-        out.push_str("  index:     unavailable\n");
-    } else {
-        out.push_str(&format!("  index:     {}\n", report.index_path.display()));
+// ---- styling ---------------------------------------------------------------
+//
+// Colour, without a crate. `widget::pretty` already writes `"\x1b[2m"` by hand
+// and this milestone's discipline is zero new dependencies, so this is the same
+// four escapes gathered behind one value instead of scattered through the
+// renderers.
+
+/// The terminal width every styled line is laid out against.
+///
+/// A constant rather than a query: asking the real terminal is an ambient read
+/// this module must not make (see [`Style`]), it needs a crate or an ioctl, and
+/// 80 is the width that is safe everywhere. A wider terminal renders a narrower
+/// table, which is correct-looking; a narrower one is the case that wrapped
+/// mid-word, and that is what this fixes.
+const WIDTH: usize = 80;
+
+/// Whether this rendering may use ANSI, and — since there is only one palette —
+/// which colours it uses when it may.
+///
+/// **[`Style::PLAIN`] renders byte-for-byte what this module rendered before
+/// colour existed**, and that is load-bearing rather than a courtesy: a pipe, a
+/// log file and the macOS menu bar all take that path, `sync status --json` is
+/// parsed by the Node contract suites, and every existing test in this crate
+/// asserts against it. Colour, computed column widths and wrapping are all
+/// styled-only for the same reason — a consumer that is not a human
+/// does not want its columns to move when a number gets wider.
+///
+/// Restraint is the rule: [`dim`](Style::dim) for context, one accent for a
+/// heading, [`bad`](Style::bad) only for a refusal, [`good`](Style::good) only
+/// for something that actually succeeded, and [`bold`](Style::bold) for the
+/// numbers a reader has to decide on. Someone about to hand their credentials
+/// to a remote should find the screen calm, not decorated.
+///
+/// **Do not nest one styled string inside another.** Every helper closes with a
+/// full reset, so an inner reset would end an outer attribute early. Style the
+/// leaf fragments; assemble afterwards.
+///
+/// The colour *decision* — a tty, and `NO_COLOR` unset — is made by
+/// [`crate::display::color_enabled`] and injected. It cannot be made here:
+/// `src/sync/`'s structural guard forbids reading the process environment
+/// anywhere in this subtree.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Style {
+    on: bool,
+}
+
+impl Style {
+    /// No escapes at all — today's bytes, exactly. The default, so a type that
+    /// carries a `Style` and is never told one renders plain.
+    pub const PLAIN: Style = Style { on: false };
+
+    /// From the injected decision. There is deliberately no `COLOR` constant
+    /// beside `PLAIN`: nothing in production would ever name it, and this
+    /// milestone has shipped enough tested code with no call site.
+    pub fn color(on: bool) -> Style {
+        Style { on }
     }
-    out.push_str(&rebuilt_note(report));
-    if let Some(repo) = &report.repo {
-        out.push_str(&render_repo(repo));
+
+    /// True when this rendering emits escapes — what the layout branches on.
+    pub fn is_on(self) -> bool {
+        self.on
+    }
+
+    /// `text` wrapped in an SGR sequence, and **`text` can never close it.**
+    ///
+    /// A manifest path, a GitHub error message and an asset name all come from
+    /// a hostile remote and all reach these renderers. Styling text that still
+    /// holds an `ESC` would let it terminate the sequence and start its own —
+    /// so the payload goes through the crate's shared sanitizer first, which is
+    /// what strips `ESC`, the other C0/C1 controls and the bidi overrides. It
+    /// is applied here, once, rather than at each call site that remembered.
+    ///
+    /// Plain returns the argument untouched, which is what makes "the plain
+    /// path is byte-identical" true by construction rather than by review.
+    fn sgr(self, code: &str, text: &str) -> String {
+        if !self.on {
+            return text.to_owned();
+        }
+        format!(
+            "\x1b[{code}m{}\x1b[0m",
+            crate::display::sanitize_untrusted_field(text)
+        )
+    }
+
+    /// Secondary text: labels, units, the figures that are context.
+    pub fn dim(self, text: &str) -> String {
+        self.sgr("2", text)
+    }
+
+    /// A number that decides something — bytes about to be sent, files at risk.
+    pub fn bold(self, text: &str) -> String {
+        self.sgr("1", text)
+    }
+
+    /// The one accent, and only for a heading.
+    pub fn head(self, text: &str) -> String {
+        self.sgr("1;36", text)
+    }
+
+    /// A refusal. Nothing else is red.
+    pub fn bad(self, text: &str) -> String {
+        self.sgr("31", text)
+    }
+
+    /// Something that actually succeeded. Nothing else is green.
+    pub fn good(self, text: &str) -> String {
+        self.sgr("32", text)
+    }
+}
+
+/// Break `text` so no line exceeds [`WIDTH`], continuing at `indent` spaces.
+///
+/// **Only ever at a space.** `2141 files 1.7 GiB left out by the age and size
+/// bounds` is 82 columns, and what the user actually saw was the terminal
+/// cutting it in the middle of a word. A word longer than the budget goes on a
+/// line of its own and overruns, which is visible and honest where a mid-word
+/// cut is neither.
+///
+/// Applied to the **unstyled** text, always: an escape sequence occupies bytes
+/// and no columns, so wrapping after styling measures the wrong thing.
+/// [`wrap`], but only when styled.
+///
+/// A pipe, a log file and the macOS menu bar read the plain path and must keep
+/// receiving the bytes they always did; a human at 80 columns is the one who
+/// watched a line break in the middle of a word.
+pub(crate) fn reflow(style: Style, text: &str, indent: usize) -> String {
+    if style.is_on() {
+        wrap(text, indent)
+    } else {
+        text.to_owned()
+    }
+}
+
+fn wrap(text: &str, indent: usize) -> String {
+    if text.len() <= WIDTH && !text.contains('\n') {
+        return text.to_owned();
+    }
+    let pad = " ".repeat(indent);
+    let mut out = String::with_capacity(text.len() + 8);
+    for (n, para) in text.lines().enumerate() {
+        if n > 0 {
+            out.push('\n');
+        }
+        let mut column = 0usize;
+        for (i, word) in para.split(' ').enumerate() {
+            let width = word.chars().count();
+            if i == 0 {
+                out.push_str(word);
+                column = width;
+            } else if column + 1 + width > WIDTH {
+                out.push('\n');
+                out.push_str(&pad);
+                out.push_str(word);
+                column = indent + width;
+            } else {
+                out.push(' ');
+                out.push_str(word);
+                column += 1 + width;
+            }
+        }
     }
     out
+}
+
+/// Pure. Given the same struct it always renders the same string.
+pub fn render_status(report: &StatusReport) -> String {
+    render_status_styled(report, Style::PLAIN)
+}
+
+/// [`render_status`] with a palette. Pure in both arms.
+pub fn render_status_styled(report: &StatusReport, style: Style) -> String {
+    let mut out = table(report, style);
+    out.push_str(&field(
+        style,
+        "last sync",
+        &report
+            .last_sync
+            .map_or_else(|| "never".to_string(), |t| t.to_rfc3339()),
+        true,
+    ));
+    if report.index_path.as_os_str().is_empty() {
+        out.push_str(&field(style, "index", "unavailable", false));
+    } else {
+        out.push_str(&field(
+            style,
+            "index",
+            &report.index_path.display().to_string(),
+            false,
+        ));
+    }
+    out.push_str(&rebuilt_note(report, style));
+    if let Some(repo) = &report.repo {
+        out.push_str(&render_repo(repo, style));
+    }
+    out
+}
+
+/// `  label:     value`, with the label dimmed — it is the thing the eye skips
+/// once it knows the shape, and the value is what it came for.
+///
+/// The 11-column label field is the alignment `last sync:`, `index:`, `repo:`,
+/// `visible:`, `token:` and `verified:` have always shared, restated once
+/// instead of six times in six format strings. Only the weight is new.
+fn field(style: Style, label: &str, value: &str, first: bool) -> String {
+    format!(
+        "{}  {}{}\n",
+        if first { "\n" } else { "" },
+        style.dim(&format!("{:<11}", format!("{label}:"))),
+        value
+    )
 }
 
 /// The repository half of `sync status`. Pure, like everything else here.
 ///
 /// Prints the token's **source**, never the token — [`RepoSection`] has no
 /// field that could carry one.
-fn render_repo(repo: &RepoSection) -> String {
+fn render_repo(repo: &RepoSection, style: Style) -> String {
     let Some(name) = &repo.configured else {
-        return "\n  repo:      not configured — no sync repository is paired.\n\
-                \x20            Name one in config.toml, after creating it yourself:\n\
-                \x20              gh repo create <owner>/<name> --private\n\
-                \n\
-                \x20              [sync]\n\
-                \x20              repo = \"<owner>/<name>\"\n"
-            .to_string();
+        return format!(
+            "\n  {}{}\n\
+             \x20            Name one in config.toml, after creating it yourself:\n\
+             \x20              gh repo create <owner>/<name> --private\n\
+             \n\
+             \x20              [sync]\n\
+             \x20              repo = \"<owner>/<name>\"\n",
+            style.dim(&format!("{:<11}", "repo:")),
+            style.bad("not configured — no sync repository is paired.")
+        );
     };
 
-    let mut out = format!("\n  repo:      {name}\n");
-    out.push_str(&format!(
-        "  visible:   {}\n",
-        repo.visibility.as_deref().unwrap_or("unknown")
+    let mut out = field(style, "repo", name, true);
+    // A private repository is the gate's whole precondition, so it is the one
+    // thing on this screen that has genuinely *succeeded*. Anything else here
+    // is a repository this tool will refuse to push to.
+    let visible = repo.visibility.as_deref().unwrap_or("unknown");
+    out.push_str(&field(
+        style,
+        "visible",
+        &if visible == "private" {
+            style.good(visible)
+        } else {
+            style.bad(visible)
+        },
+        false,
     ));
     out.push_str(&match repo.token_source {
-        Some(source) => format!("  token:     present ({source})\n"),
-        None => "  token:     none found\n".to_string(),
+        Some(source) => field(style, "token", &format!("present ({source})"), false),
+        None => field(style, "token", "none found", false),
     });
     out.push_str(&match repo.last_verified {
-        Some(at) => format!("  verified:  {}\n", at.to_rfc3339()),
-        None => "  verified:  never — this machine is not paired yet, run \
-                 `ai-usagebar sync setup`\n"
-            .to_string(),
+        Some(at) => field(style, "verified", &at.to_rfc3339(), false),
+        None => field(
+            style,
+            "verified",
+            "never — this machine is not paired yet, run `ai-usagebar sync setup`",
+            false,
+        ),
     });
     for warning in &repo.warnings {
-        out.push_str(&note("warning", warning));
+        out.push_str(&note("warning", warning, style, Weight::Warn));
     }
     if let Some(failure) = &repo.failure {
-        out.push_str(&note("repo:      FAILED", failure));
+        out.push_str(&note("repo:      FAILED", failure, style, Weight::Bad));
     }
     out
 }
@@ -375,111 +582,301 @@ fn render_repo(repo: &RepoSection) -> String {
 /// actually do. Pure — it takes the model and returns a string, and touches no
 /// filesystem.
 pub fn render_dry_run(report: &DryRunReport) -> String {
+    render_dry_run_styled(report, Style::PLAIN)
+}
+
+/// [`render_dry_run`] with a palette. Pure in both arms.
+pub fn render_dry_run_styled(report: &DryRunReport, style: Style) -> String {
     let status = &report.status;
-    let mut out = table(status);
+    let mut out = table(status, style);
 
     out.push_str(&format!(
-        "\n  snapshot: {} files, {} of local state\n",
-        status.total_files(),
-        human_bytes(status.total_bytes())
+        "\n  {} {} files, {} of local state\n",
+        style.dim("snapshot:"),
+        style.bold(&status.total_files().to_string()),
+        style.bold(&human_bytes(status.total_bytes()))
     ));
 
     match (&status.plan, &report.no_key) {
         (Some(plan), _) => {
             if plan.is_empty() {
-                out.push_str(&format!(
-                    "  a push would send nothing — every file matched the local index, \
-                     {} opened\n",
-                    plan.files_opened
+                out.push_str(&sentence(
+                    style,
+                    &format!(
+                        "a push would send nothing — every file matched the local index, \
+                         {} opened",
+                        plan.files_opened
+                    ),
                 ));
             } else {
-                out.push_str(&format!(
-                    "  a push would send {} in {} new chunks ({} of plaintext, from {} \
-                     file{} read)\n",
-                    human_bytes(plan.total_new_stored_bytes),
-                    plan.new_chunk_ids.len(),
-                    human_bytes(plan.total_new_bytes),
-                    plan.files_opened,
-                    if plan.files_opened == 1 { "" } else { "s" },
+                // The one figure this whole command exists to produce, so it is
+                // the one thing on the line carrying weight.
+                let sending = human_bytes(plan.total_new_stored_bytes);
+                out.push_str(&sentence_with(
+                    style,
+                    &format!(
+                        "a push would send {sending} in {} new chunks ({} of plaintext, \
+                         from {} file{} read)",
+                        plan.new_chunk_ids.len(),
+                        human_bytes(plan.total_new_bytes),
+                        plan.files_opened,
+                        if plan.files_opened == 1 { "" } else { "s" },
+                    ),
+                    &sending,
                 ));
             }
             if plan.append_check_miss_bytes > 0 {
-                out.push_str(&format!(
-                    "  {} was re-read by append checks that then failed\n",
-                    human_bytes(plan.append_check_miss_bytes)
+                out.push_str(&sentence(
+                    style,
+                    &format!(
+                        "{} was re-read by append checks that then failed",
+                        human_bytes(plan.append_check_miss_bytes)
+                    ),
                 ));
             }
         }
         // Never a zero here: "0 bytes" and "not computed" are opposite answers
         // to "what will this cost me".
-        (None, Some(why)) => out.push_str(&note("would upload: not computed", why)),
-        (None, None) => out.push_str(&note("would upload: not computed", "no plan was built")),
+        (None, Some(why)) => out.push_str(&note(
+            "would upload: not computed",
+            why,
+            style,
+            Weight::Warn,
+        )),
+        (None, None) => out.push_str(&note(
+            "would upload: not computed",
+            "no plan was built",
+            style,
+            Weight::Warn,
+        )),
     }
 
-    out.push_str(&rebuilt_note(status));
-    out.push_str("  --dry-run uploads nothing and contacts no network.\n");
+    out.push_str(&rebuilt_note(status, style));
+    out.push_str(&sentence(
+        style,
+        "--dry-run uploads nothing and contacts no network.",
+    ));
     out
+}
+
+/// One indented prose line, wrapped at a space when styled and dimmed — it is
+/// the explanation, not the figure.
+fn sentence(style: Style, body: &str) -> String {
+    if !style.is_on() {
+        return format!("  {body}\n");
+    }
+    format!("{}\n", style.dim(&reflow(style, &format!("  {body}"), 4)))
+}
+
+/// [`sentence`], with one fragment of it bold — the number the reader is
+/// deciding on, against a dim explanation.
+///
+/// Wrapping runs over the **unstyled** sentence, because an escape sequence
+/// costs bytes and no columns; the emphasis is applied afterwards, to the first
+/// occurrence of `emphasis` in the wrapped text.
+///
+/// ponytail: first occurrence, not an offset. `emphasis` is the leading figure
+/// of every sentence this is called with, so the first hit is it; if wrapping
+/// ever splits the fragment across a line the match simply fails and the whole
+/// sentence renders dim, which is a weight, not a wrong number.
+fn sentence_with(style: Style, body: &str, emphasis: &str) -> String {
+    if !style.is_on() {
+        return format!("  {body}\n");
+    }
+    let wrapped = wrap(&format!("  {body}"), 4);
+    match wrapped.find(emphasis) {
+        Some(at) => format!(
+            "{}{}{}\n",
+            style.dim(&wrapped[..at]),
+            style.bold(emphasis),
+            style.dim(&wrapped[at + emphasis.len()..])
+        ),
+        None => format!("{}\n", style.dim(&wrapped)),
+    }
 }
 
 /// The shared table: one row per category, then the totals. The third column
 /// appears only when a plan was built.
-fn table(report: &StatusReport) -> String {
-    let width = SyncCategory::ALL
-        .iter()
-        .map(|c| c.label().len())
-        .max()
-        .unwrap_or(0);
+fn table(report: &StatusReport, style: Style) -> String {
+    let w = Widths::of(report, style);
     let has_plan = report.plan.is_some();
 
     let mut out = String::new();
-    if has_plan {
-        out.push_str(&format!(
-            "  {:<width$}  {:>11}  {:>10}  {:>10}\n",
-            "", "files", "raw", "would send"
-        ));
+    // The header used to appear only alongside the third column. A styled run
+    // always draws it: "no organization" was half of what the user reported,
+    // and three unlabelled columns of numbers are exactly that.
+    if has_plan || style.is_on() {
+        let head = format!(
+            "  {:<lw$}  {:>fw$}  {:>rw$}{}",
+            "",
+            "files",
+            "raw",
+            if has_plan {
+                format!("  {:>sw$}", "would send", sw = w.send)
+            } else {
+                String::new()
+            },
+            lw = w.label,
+            fw = w.files + " files".len(),
+            rw = w.raw,
+        );
+        out.push_str(&format!("{}\n", style.dim(&head)));
     }
     for l in &report.lines {
         // "off" and "0" are different facts and the user is choosing between
         // them: an off category has not been looked at, not found to be empty.
         if !l.enabled {
             out.push_str(&format!(
-                "  {:<width$}  {:>11}\n",
-                l.category.label(),
-                "off"
+                "  {}  {}\n",
+                pad_left(style, l.category.label(), w.label),
+                style.dim(&format!("{:>fw$}", "off", fw = w.files + " files".len())),
             ));
             continue;
         }
-        out.push_str(&format!(
-            "  {:<width$}  {:>5} files  {:>10}",
+        out.push_str(&row(
+            style,
+            &w,
             l.category.label(),
             l.files,
-            human_bytes(l.bytes)
+            l.bytes,
+            report.category(l.category).map(|c| c.new_stored_bytes),
         ));
-        if let Some(c) = report.category(l.category) {
-            out.push_str(&format!("  {:>10}", human_bytes(c.new_stored_bytes)));
-        }
         if l.capped {
-            out.push_str("  (capped)");
+            out.push_str(&style.dim("  (capped)"));
         }
         out.push('\n');
-        out.push_str(&excluded_note(report, l, width));
+        out.push_str(&excluded_note(report, l, &w, style));
     }
 
-    out.push_str(&format!(
-        "\n  total{:<w$}  {:>5} files  {:>10}",
-        "",
+    out.push('\n');
+    // The totals are the figures a decision is made against, so the whole row
+    // carries weight where the per-category rows do not.
+    out.push_str(&row_bold(
+        style,
+        &w,
+        "total",
         report.total_files(),
-        human_bytes(report.total_bytes()),
-        w = width.saturating_sub(5)
+        report.total_bytes(),
+        report.plan.as_ref().map(|p| p.total_new_stored_bytes),
     ));
-    if let Some(plan) = &report.plan {
-        out.push_str(&format!(
-            "  {:>10}",
-            human_bytes(plan.total_new_stored_bytes)
-        ));
-    }
     out.push('\n');
     out
+}
+
+/// The table's column widths.
+///
+/// **Fixed when plain, measured when styled.** The fixed set is exactly what
+/// the format strings used to hard-code, so a piped run still emits the bytes
+/// it always did. Measuring is the fix for the reported defect: `{:>5}` for a
+/// file count silently overflows at six digits and shoves every column right of
+/// it out of line, and `{:>10}` does the same for `1023.9 MiB`.
+struct Widths {
+    label: usize,
+    files: usize,
+    raw: usize,
+    send: usize,
+}
+
+impl Widths {
+    fn of(report: &StatusReport, style: Style) -> Widths {
+        let label = SyncCategory::ALL
+            .iter()
+            .map(|c| c.label().len())
+            .max()
+            .unwrap_or(0);
+        if !style.is_on() {
+            return Widths {
+                label,
+                files: 5,
+                raw: 10,
+                send: 10,
+            };
+        }
+        // Every figure that will actually be drawn, including the totals row
+        // and the transcripts exclusion line — a width computed from the
+        // categories alone is the same bug one column over.
+        let mut files = report.total_files().to_string().len();
+        let mut raw = human_bytes(report.total_bytes()).len();
+        let mut send = report
+            .plan
+            .as_ref()
+            .map_or(0, |p| human_bytes(p.total_new_stored_bytes).len());
+        for l in &report.lines {
+            files = files.max(l.files.to_string().len());
+            raw = raw.max(human_bytes(l.bytes).len());
+            if let Some(c) = report.category(l.category) {
+                send = send.max(human_bytes(c.new_stored_bytes).len());
+                files = files.max(c.excluded_files.to_string().len());
+                raw = raw.max(human_bytes(c.excluded_bytes).len());
+            }
+        }
+        Widths {
+            label: label.max("total".len()),
+            files,
+            // The header labels sit in these columns too. Measuring only the
+            // figures is the same bug one row up: `would send` is ten
+            // characters and overflows any narrower field it is given.
+            raw: raw.max("raw".len()),
+            send: send.max("would send".len()),
+        }
+    }
+}
+
+/// One category row: the label and the raw size are context, the would-send
+/// figure is the one that decides whether to run the push.
+fn row(
+    style: Style,
+    w: &Widths,
+    label: &str,
+    files: usize,
+    bytes: u64,
+    send: Option<u64>,
+) -> String {
+    let mut out = format!(
+        "  {}  {:>fw$} {}  {}",
+        pad_left(style, label, w.label),
+        files,
+        style.dim("files"),
+        style.dim(&format!("{:>rw$}", human_bytes(bytes), rw = w.raw)),
+        fw = w.files,
+    );
+    if let Some(send) = send {
+        out.push_str("  ");
+        out.push_str(&style.bold(&format!("{:>sw$}", human_bytes(send), sw = w.send)));
+    }
+    out
+}
+
+/// [`row`] for the totals, where every figure is a decision input.
+fn row_bold(
+    style: Style,
+    w: &Widths,
+    label: &str,
+    files: usize,
+    bytes: u64,
+    send: Option<u64>,
+) -> String {
+    let mut out = format!(
+        "  {}  {} {}  {}",
+        pad_left(style, label, w.label),
+        style.bold(&format!("{files:>fw$}", fw = w.files)),
+        style.dim("files"),
+        style.bold(&format!("{:>rw$}", human_bytes(bytes), rw = w.raw)),
+    );
+    if let Some(send) = send {
+        out.push_str("  ");
+        out.push_str(&style.bold(&format!("{:>sw$}", human_bytes(send), sw = w.send)));
+    }
+    out
+}
+
+/// Left-align `text` in `width` columns, padding **outside** any escape.
+///
+/// `format!("{:<w$}", styled)` counts the escape bytes as columns and under-pads
+/// by exactly their length, which is how a coloured table stops lining up.
+fn pad_left(style: Style, text: &str, width: usize) -> String {
+    let pad = width.saturating_sub(text.chars().count());
+    format!("{}{}", style.dim(text), " ".repeat(pad))
 }
 
 /// What D3's bounds left behind — **transcripts only**.
@@ -491,39 +888,100 @@ fn table(report: &StatusReport) -> String {
 /// Deliberately never phrased as "30 days": on this project's own measured
 /// archive the byte budget binds first and reaches back ~21 days, so the day
 /// window is a ceiling to report against, not a promise to make.
-fn excluded_note(report: &StatusReport, l: &CategoryLine, width: usize) -> String {
+fn excluded_note(report: &StatusReport, l: &CategoryLine, w: &Widths, style: Style) -> String {
     if l.category != SyncCategory::Transcripts {
         return String::new();
     }
-    match report.category(l.category) {
-        Some(c) if c.excluded_files > 0 => format!(
+    let Some(c) = report.category(l.category) else {
+        return String::new();
+    };
+    if c.excluded_files == 0 {
+        return String::new();
+    }
+    if !style.is_on() {
+        return format!(
             "  {:<width$}  {:>5} files  {:>10}   left out by the age and size bounds\n",
             "",
             c.excluded_files,
-            human_bytes(c.excluded_bytes)
-        ),
-        _ => String::new(),
+            human_bytes(c.excluded_bytes),
+            width = w.label,
+        );
     }
+    // **This is the line the user watched wrap mid-word.** Padded into the
+    // table's own columns it is 82 characters and there is no arrangement of
+    // those columns that makes the trailing clause fit at 80. So it stops
+    // pretending to be a table row: it is a sub-note of the row above it,
+    // indented under it, dim, and short enough to fit whole.
+    format!(
+        "{}\n",
+        style.dim(&wrap(
+            &format!(
+                "    {} files, {} left out by the age and size bounds",
+                c.excluded_files,
+                human_bytes(c.excluded_bytes)
+            ),
+            6,
+        ))
+    )
+}
+
+/// How loudly a [`note`] reads. A refusal is red; nothing else is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Weight {
+    Warn,
+    Bad,
 }
 
 /// `  {head} — {first line}`, with any further lines of `body` indented under
 /// it. The reasons a column is missing run past a terminal width otherwise.
-fn note(head: &str, body: &str) -> String {
+///
+/// **`body` is frequently attacker-controlled** — a GitHub error message, a
+/// manifest path — which is why the head carries the styling and the body is
+/// only ever passed through [`Style::sgr`]'s sanitizer, never trusted to
+/// terminate a sequence it was wrapped in.
+fn note(head: &str, body: &str, style: Style, weight: Weight) -> String {
+    let painted = |text: &str| match weight {
+        Weight::Warn => style.bold(text),
+        Weight::Bad => style.bad(text),
+    };
     let mut lines = body.lines();
-    let mut out = format!("  {head} — {}\n", lines.next().unwrap_or_default());
+    let first = lines.next().unwrap_or_default();
+    let plain = format!("  {head} — {first}");
+    let mut out = if !style.is_on() {
+        format!("{plain}\n")
+    } else {
+        // Wrapped as one line and *then* split, because the head is 30 columns
+        // of the budget the body has to fit in — wrapping the body alone
+        // measures it against a margin that is not there.
+        let lead = format!("  {head} —");
+        let wrapped = wrap(&plain, 4);
+        match wrapped.strip_prefix(&lead) {
+            Some(rest) => format!("{}{}\n", painted(&lead), style.dim(rest)),
+            None => format!("{}\n", style.dim(&wrapped)),
+        }
+    };
     for line in lines {
-        out.push_str(&format!("    {line}\n"));
+        out.push_str(&format!(
+            "    {}\n",
+            if style.is_on() {
+                style.dim(&reflow(style, line, 6))
+            } else {
+                line.to_owned()
+            }
+        ));
     }
     out
 }
 
 /// A rebuilt index makes everything read as changed, which is the difference
 /// between a slow first run and a bug.
-fn rebuilt_note(report: &StatusReport) -> String {
+fn rebuilt_note(report: &StatusReport, style: Style) -> String {
     match &report.plan {
-        Some(p) if p.index_rebuilt => "  the local index was missing or unreadable and was \
-             rebuilt, so everything reads as new — the next run will be cheap.\n"
-            .to_string(),
+        Some(p) if p.index_rebuilt => sentence(
+            style,
+            "the local index was missing or unreadable and was rebuilt, so everything \
+             reads as new — the next run will be cheap.",
+        ),
         _ => String::new(),
     }
 }
@@ -788,6 +1246,285 @@ mod tests {
             .to_string();
         assert!(line.contains("off"), "{line}");
         assert!(!line.contains('0'), "not a row of zeros: {line}");
+    }
+
+    // ---- the styled path --------------------------------------------------
+    //
+    // Everything above drives `Style::PLAIN` and asserts on wording. These
+    // drive the same renderers with `Style::color(true)` and assert on the things
+    // only the styled path can get wrong.
+
+    /// The whole contract the piped world depends on: the report a pipe, a log
+    /// file and the macOS menu bar receive did not move one byte.
+    #[test]
+    fn styling_changes_nothing_at_all_when_it_is_off() {
+        let report = a_dry_run();
+        assert_eq!(
+            render_dry_run_styled(&report, Style::PLAIN),
+            render_dry_run(&report)
+        );
+        assert_eq!(
+            render_status_styled(&report.status, Style::PLAIN),
+            render_status(&report.status)
+        );
+        assert!(!render_dry_run(&report).contains('\x1b'));
+    }
+
+    /// `NO_COLOR` is the whole of the difference, and it arrives as a
+    /// [`Style`], not as an environment read this module could make.
+    #[test]
+    fn no_color_yields_the_plain_bytes_and_not_one_escape() {
+        let report = a_dry_run();
+        let style = Style::color(crate::display::color_enabled_with(true, true));
+        assert_eq!(
+            render_dry_run_styled(&report, style),
+            render_dry_run(&report)
+        );
+        assert!(!render_dry_run_styled(&report, style).contains('\x1b'));
+
+        let styled = render_dry_run_styled(&report, Style::color(true));
+        assert!(
+            styled.contains('\x1b'),
+            "and with NO_COLOR unset it is styled"
+        );
+    }
+
+    /// **Every sequence this module opens, it closes.** A report that dies
+    /// mid-render must not leave the next shell prompt tinted.
+    #[test]
+    fn every_styled_run_ends_every_sequence_it_starts() {
+        for text in [
+            render_dry_run_styled(&a_dry_run(), Style::color(true)),
+            render_status_styled(&a_dry_run().status, Style::color(true)),
+        ] {
+            let closes = text.matches("\x1b[0m").count();
+            assert_eq!(
+                text.matches("\x1b[").count(),
+                closes * 2,
+                "unbalanced: {text:?}"
+            );
+        }
+    }
+
+    /// **The reported defect.** A six-digit file count and a ten-character byte
+    /// figure both overflowed their hard-coded fields and shoved every column
+    /// right of them out of line. Widths now come from the rows.
+    #[test]
+    fn the_columns_line_up_however_wide_the_numbers_get() {
+        let report = DryRunReport {
+            status: report_of(
+                vec![
+                    a_line(SyncCategory::Config, 1, 309),
+                    a_line(SyncCategory::Credentials, 123_456, 1_099_511_627_776),
+                ],
+                Some(a_plan(vec![
+                    a_category(SyncCategory::Config, 1, 309, 300),
+                    a_category(
+                        SyncCategory::Credentials,
+                        123_456,
+                        1_099_511_627_776,
+                        1_073_741_824,
+                    ),
+                ])),
+            ),
+            no_key: None,
+        };
+        let text = render_dry_run_styled(&report, Style::color(true));
+        let rows: Vec<usize> = text
+            .lines()
+            .take_while(|l| !l.contains("snapshot:"))
+            .filter(|l| !strip(l).trim().is_empty())
+            .map(visible)
+            .collect();
+        assert!(
+            rows.len() >= 4,
+            "header, two categories and the totals: {text}"
+        );
+        assert!(
+            rows.windows(2).all(|w| w[0] == w[1]),
+            "every table row is the same width: {rows:?}\n{text}"
+        );
+        assert!(
+            rows[0] <= 80,
+            "and the table fits the terminal it is drawn on: {}",
+            rows[0]
+        );
+    }
+
+    /// The other half of the same defect: `2141 files 1.7 GiB left out by the
+    /// age and size bounds` is 82 columns padded into the table, and what the
+    /// user saw was their terminal cutting it in the middle of a word.
+    #[test]
+    fn no_styled_line_runs_past_the_terminal_or_breaks_a_word() {
+        let mut transcripts = a_category(SyncCategory::Transcripts, 2146, 2_136_746_229, 1_000);
+        transcripts.excluded_files = 2141;
+        transcripts.excluded_bytes = 1_782_579_527;
+        let report = DryRunReport {
+            status: report_of(
+                vec![a_line(SyncCategory::Transcripts, 2146, 2_136_746_229)],
+                Some(a_plan(vec![transcripts])),
+            ),
+            no_key: None,
+        };
+        // The other over-long line, which only renders without a plan: the
+        // reason the would-send column is missing, in the user's own words.
+        let unkeyed = DryRunReport {
+            status: report_of(vec![a_line(SyncCategory::Transcripts, 2146, 1 << 31)], None),
+            no_key: Some(
+                "this bundle has no sync keyfile yet and the third column needs one, so \
+                 the counts above are everything this run can honestly tell you about it"
+                    .to_string(),
+            ),
+        };
+
+        for report in [&report, &unkeyed] {
+            let text = render_dry_run_styled(report, Style::color(true));
+            for line in text.lines() {
+                assert!(visible(line) <= 80, "{} columns: {line:?}", visible(line));
+            }
+            // Never mid-word: every word of the plain rendering survives the
+            // wrapped one intact.
+            let plain = strip(&render_dry_run(report));
+            let wrapped = strip(&text);
+            for word in plain.split_whitespace() {
+                assert!(wrapped.contains(word), "{word:?} was broken up:\n{text}");
+            }
+        }
+
+        assert!(
+            render_dry_run_styled(&report, Style::color(true))
+                .contains("left out by the age and size bounds"),
+            "and the clause survives whole, on one line"
+        );
+    }
+
+    /// A hostile remote writes the manifest paths and the GitHub error
+    /// messages that reach these renderers. Wrapping one in a sequence it can
+    /// close is how it would start its own.
+    #[test]
+    fn untrusted_text_cannot_close_the_sequence_it_is_styled_inside() {
+        let hostile = "\x1b[0m\x1b]52;c;cGF5bG9hZA==\x07 sync succeeded\u{202e}drowssap";
+        let mut section = RepoSection {
+            configured: Some("owner/name".into()),
+            visibility: Some(hostile.into()),
+            ..RepoSection::default()
+        };
+        section.warnings.push(hostile.into());
+        let section = section.failed(hostile.into());
+
+        let mut status = a_dry_run().status;
+        status.repo = Some(section);
+        let text = render_status_styled(&status, Style::color(true));
+
+        assert!(!text.contains("\x1b]"), "no OSC survives: {text:?}");
+        assert!(!text.contains('\u{202e}'), "no bidi override survives");
+        // The only escapes left are this module's own, and they still balance.
+        let closes = text.matches("\x1b[0m").count();
+        assert_eq!(text.matches("\x1b[").count(), closes * 2, "{text:?}");
+        // And the payload's visible remains are inert text, not an instruction.
+        assert!(text.contains("]52;c;cGF5bG9hZA=="), "{text:?}");
+    }
+
+    /// One `\n` in a remote error message is one forged report line, so the
+    /// note indents continuation lines rather than letting them start at the
+    /// left margin where a real field would.
+    #[test]
+    fn a_multi_line_untrusted_note_cannot_forge_a_field() {
+        let status = {
+            let mut s = a_dry_run().status;
+            s.repo = Some(
+                RepoSection {
+                    configured: Some("owner/name".into()),
+                    ..RepoSection::default()
+                }
+                .failed("first\nvisible:   private".into()),
+            );
+            s
+        };
+        for text in [
+            render_status(&status),
+            strip(&render_status_styled(&status, Style::color(true))),
+        ] {
+            let forged = text
+                .lines()
+                .filter(|l| l.starts_with("  visible:   private"))
+                .count();
+            assert_eq!(forged, 0, "no field was forged: {text}");
+            assert!(
+                text.lines().any(|l| l == "    visible:   private"),
+                "the second line is indented under the note, not at field depth: {text}"
+            );
+        }
+    }
+
+    /// Restraint is the taste rule, and a rule nobody can check is a
+    /// suggestion. Four attributes, and no 24-bit colour: the palette borrows
+    /// the user's own terminal theme rather than overriding it.
+    #[test]
+    fn the_palette_is_four_attributes_and_never_a_literal_colour() {
+        let text = format!(
+            "{}{}",
+            render_dry_run_styled(&a_dry_run(), Style::color(true)),
+            render_status_styled(&a_dry_run().status, Style::color(true))
+        );
+        let mut seen: Vec<&str> = text
+            .split("\x1b[")
+            .skip(1)
+            .filter_map(|s| s.split('m').next())
+            .collect();
+        seen.sort_unstable();
+        seen.dedup();
+        // The accent (`1;36`) is spent on the `sync setup` step markers, which
+        // this module does not render — so the report itself is three.
+        assert_eq!(seen, vec!["0", "1", "2"], "{seen:?}");
+        assert!(!text.contains("\x1b[38;2;"), "no 24-bit colour");
+        assert!(
+            Style::color(true).head("x").contains("\x1b[1;36m"),
+            "the accent exists"
+        );
+    }
+
+    /// Columns, not bytes — the measurement every assertion above depends on.
+    fn visible(line: &str) -> usize {
+        strip(line).chars().count()
+    }
+
+    fn strip(text: &str) -> String {
+        let mut out = String::new();
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for skip in chars.by_ref() {
+                    if skip == 'm' {
+                        break;
+                    }
+                }
+                continue;
+            }
+            out.push(c);
+        }
+        out
+    }
+
+    fn a_dry_run() -> DryRunReport {
+        DryRunReport {
+            status: report_of(
+                vec![
+                    a_line(SyncCategory::Config, 2, 4096),
+                    a_line(SyncCategory::Credentials, 107, 24 * 1024 * 1024),
+                ],
+                Some(a_plan(vec![
+                    a_category(SyncCategory::Config, 2, 4096, 1024),
+                    a_category(
+                        SyncCategory::Credentials,
+                        107,
+                        24 * 1024 * 1024,
+                        11 * 1024 * 1024,
+                    ),
+                ])),
+            ),
+            no_key: None,
+        }
     }
 
     /// 2-CONTEXT: the excluded column counts bound-dropped files, which only
