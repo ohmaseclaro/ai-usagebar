@@ -133,6 +133,17 @@ pub enum Disposition {
     /// The manifest path did not survive [`layout::from_manifest_path`]. It
     /// still appears in the report: dropping it silently would hide tampering.
     RejectedPath(String),
+    /// A Claude Desktop token cache sealed by **another Mac's** login Keychain:
+    /// it carries Chromium's `v10` safeStorage marker and this machine's
+    /// `Claude Safe Storage` key does not open it, so Claude Desktop here could
+    /// never read it either.
+    ///
+    /// Writing it would trade a working Desktop login for bytes nothing on this
+    /// machine can decrypt — the user's own backup destroying the one thing the
+    /// backup exists to protect. Refusing costs them a sign-in; writing costs
+    /// them the session. macOS only: [`crate::safe_storage`]'s key store is the
+    /// macOS login Keychain and no other platform has the question to ask.
+    ForeignSafeStorage,
 }
 
 impl Disposition {
