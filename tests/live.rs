@@ -689,6 +689,17 @@ fn cal3_argon2id_timing_at_production_parameters() {
 /// large pack and `sync::pack::PACK_TARGET` could then grow past its 32 MiB
 /// fallback without making the waste of a whole-pack fetch worse.
 ///
+/// **Still unrun, through Phases 1, 3, 4 and 5.** Phase 5 shipped the restore
+/// path on the pessimistic assumption, which is correct whichever way this
+/// comes back. If it ever comes back **positive**, exactly one thing changes:
+/// `sync::restore::PackSource` gains a byte-range fetch keyed on the
+/// `PackEntry`'s `offset` and `clen`, which `fetch::resolve` already reads out
+/// of each pack's own sealed header. Nothing else moves — not the four
+/// ceilings, not the content-address check, not the three download rounds, and
+/// not the pointer's unauthenticated `offset`/`clen`/`true_len`, which stay
+/// unread. That is written down here so the measurement has somewhere to land
+/// rather than becoming a redesign.
+///
 /// **Setup** — a throwaway private repository with one release carrying an
 /// asset a little over 1 MiB (large enough that a whole-body `200` is
 /// unmistakable, small enough to download inside the timeout), and a
@@ -1452,6 +1463,13 @@ fn sync_token_keychain_live_round_trip() {
 ///   can compare a locally computed hash instead of re-downloading every asset,
 ///   and D3's verification pass loses its extra 115 MB on a first push. If it is
 ///   absent or covers something else, that download stays.
+///
+/// **Still unrun at the end of Phase 5**, for the same reason as CAL-1: it needs
+/// a real private repository and a real token, and this project's suites have
+/// neither. Both halves of the shipped behaviour are the conservative branch —
+/// an unrecognised `state` re-uploads, and a missing `digest` means the
+/// verifying download happens — so the code is correct unmeasured; what is
+/// unmeasured is only how much it could be *relaxed*.
 ///
 /// **Setup** — a throwaway **private** repository with one published release,
 /// and a fine-grained PAT with `Contents: write` scoped to it. This probe writes
