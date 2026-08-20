@@ -21,9 +21,12 @@
 //! belongs to [`PRUNE_GRACE`](super::PRUNE_GRACE), and the two mitigations are
 //! not interchangeable.
 
+use std::collections::HashSet;
+
 use chrono::{DateTime, TimeDelta, Utc};
 
 use crate::error::Result;
+use crate::sync::crypto::ChunkId;
 use crate::sync::github::gate;
 use crate::sync::github::write::Asset;
 
@@ -34,20 +37,44 @@ use super::{Pointer, PushCtx};
 /// Pure — `now` and `grace` are parameters rather than reads — so every rule is
 /// testable against a table rather than against a server.
 ///
-/// Plan 4-05 fills it. The rules it must implement, in full:
-/// - truncate `pointer.snapshots` from the **oldest** end down to `keep`;
-/// - the live pack set is the union of `packs` across every **surviving**
-///   record;
-/// - an asset is deletable when its name parses as a pack name whose id is not
-///   in that set **and** `now - asset.created_at > grace`;
-/// - the asset named by `pointer.keyfile` is never deletable — no snapshot's
-///   `packs` names it, and deleting it makes the bundle permanently unreadable;
-/// - an asset matching neither the pack shape nor the keyfile shape is never
-///   deletable: it might be a future version's object, and a collector that
-///   deletes what it does not recognise turns every format addition into a
-///   data-loss bug;
-/// - a pointer with **no** snapshots yields no deletions. The union of an empty
-///   set is empty, which read naively says "everything is garbage".
+/// # What survives
+///
+/// `pointer.snapshots` is truncated from the **oldest** end down to `keep`, and
+/// the live pack set is the union of `packs` across every **surviving** record.
+/// An asset is deletable only when all three hold:
+///
+/// 1. its name is one this build recognises — `pack-<64 hex>.bin` or
+///    `keyfile-<64 hex>.json`. Anything else might be a future version's object
+///    or something the user attached by hand, and a collector that deletes what
+///    it does not understand turns every format addition into a data-loss bug;
+/// 2. no surviving record names it. For a pack that is its id's absence from the
+///    live set; for a keyfile it is not being the one `pointer.keyfile` names;
+/// 3. it is older than `grace`.
+///
+/// Three exclusions are absolute, and each has its own test:
+///
+/// - **The asset named by `pointer.keyfile`.** No snapshot's `packs` list names
+///   it, so the naive rule collects it — and the wrapped master key inside is
+///   the only route to the data, for every machine, permanently. This is the
+///   single worst thing this function could do.
+/// - **Anything younger than `grace`**, whatever the pointer says about it. Not
+///   belt and braces: see [`PRUNE_GRACE`](super::PRUNE_GRACE) for the race it is
+///   the only cover for.
+/// - **A pointer with no surviving snapshots proposes nothing.** The union of an
+///   empty set is empty, which read naively says "everything is garbage", and
+///   that arithmetic is how a first-push race or a hand-edited pointer would
+///   wipe a release.
+///
+/// `keep` is clamped to at least one. Config refuses `keep_snapshots = 0`, but
+/// the truncated pointer this returns is *published* by
+/// [`run_on_demand`], so a zero arriving by any other route must not empty the
+/// snapshot list.
+///
+/// Keyfiles other than the published one are swept because an interrupted first
+/// push, or a rekey on a bundle with no pointer, can leave a wrapper asset no
+/// pointer names — an old password still opens it. Plan 4-06 found that and
+/// could not close it in `rekey.rs`, because closing it there meant calling
+/// `ensure_release` — which *creates* a release — purely to run a delete.
 pub fn plan_deletions(
     pointer: &Pointer,
     assets: &[Asset],
@@ -55,8 +82,50 @@ pub fn plan_deletions(
     now: DateTime<Utc>,
     grace: TimeDelta,
 ) -> (Pointer, Vec<u64>) {
-    let _ = (assets, keep, now, grace);
-    (pointer.clone(), Vec::new())
+    let mut kept = pointer.clone();
+    let keep = keep.max(1);
+    if kept.snapshots.len() > keep {
+        kept.snapshots.drain(..kept.snapshots.len() - keep);
+    }
+    if kept.snapshots.is_empty() {
+        return (kept, Vec::new());
+    }
+
+    let live: HashSet<ChunkId> = kept
+        .snapshots
+        .iter()
+        .flat_map(|s| s.packs.iter().copied())
+        .collect();
+    let doomed = assets
+        .iter()
+        .filter(|a| now - a.created_at > grace)
+        .filter(|a| match asset_kind(&a.name) {
+            Some(Kind::Pack(id)) => !live.contains(&id),
+            Some(Kind::Keyfile) => a.name != kept.keyfile,
+            None => false,
+        })
+        .map(|a| a.id)
+        .collect();
+    (kept, doomed)
+}
+
+/// The two asset shapes this build writes. Anything else is somebody else's.
+enum Kind {
+    Pack(ChunkId),
+    Keyfile,
+}
+
+/// Strict: the id must parse as 64 hex characters, and the affixes must be
+/// exact. `pack-<hex>.bin.bak` is not a pack, and is therefore not ours.
+fn asset_kind(name: &str) -> Option<Kind> {
+    if let Some(hex) = name
+        .strip_prefix("pack-")
+        .and_then(|r| r.strip_suffix(".bin"))
+    {
+        return hex.parse().ok().map(Kind::Pack);
+    }
+    let hex = name.strip_prefix("keyfile-")?.strip_suffix(".json")?;
+    hex.parse::<ChunkId>().ok().map(|_| Kind::Keyfile)
 }
 
 /// The delete pass after a successful flip.
