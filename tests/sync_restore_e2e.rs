@@ -56,7 +56,8 @@ use ai_usagebar::config::{SyncCategory, SyncConfig};
 use ai_usagebar::sync::SyncRoots;
 use ai_usagebar::sync::anchor::{self, Anchor};
 use ai_usagebar::sync::crypto::{KdfDoc, KdfParams, Keyfile, Keys, content_address, derive_kek};
-use ai_usagebar::sync::github::token::TokenSource;
+use ai_usagebar::sync::github::setup::{self, SetupPrompt};
+use ai_usagebar::sync::github::token::{TokenChain, TokenSource};
 use ai_usagebar::sync::github::write::ASSET_STATE_UPLOADED;
 use ai_usagebar::sync::github::{Client, Endpoints, RepoRef, pairing};
 use ai_usagebar::sync::index::Index;
@@ -1004,6 +1005,161 @@ async fn pull(
     let anchor_path = m.anchor_path();
     let backups = m.backups();
     restore::run(m.restore_ctx(&client, &repo, &anchor_path, &backups, opts)).await
+}
+
+/// `sync setup`'s prompt seam, scripted — the second machine's operator.
+///
+/// **`store_token` is overridden and has to be.** Its production default writes
+/// the **real** macOS login Keychain, and the AUR `check()` runs `cargo test`
+/// during `makepkg` on installers' machines: a test that reached it through the
+/// production call would clobber the user's own sync token. The seam exists for
+/// exactly this.
+///
+/// [`SetupPrompt::passphrase`] **panics**, which is the load-bearing assertion:
+/// it is the generate path's ask, and reaching it means setup minted a second
+/// master key for a bundle that already has one — the whole failure this test
+/// exists to catch. The join path asks
+/// [`SetupPrompt::existing_passphrase`] instead.
+struct Joining {
+    existing: Vec<String>,
+    said: Vec<String>,
+    asked: usize,
+}
+
+impl Joining {
+    fn typing(password: &str) -> Joining {
+        Joining {
+            existing: vec![password.into()],
+            said: Vec::new(),
+            asked: 0,
+        }
+    }
+}
+
+impl SetupPrompt for Joining {
+    fn say(&mut self, line: &str) {
+        self.said.push(line.to_owned());
+    }
+    fn confirm(&mut self, _question: &str, _default_yes: bool) -> ai_usagebar::error::Result<bool> {
+        Ok(true)
+    }
+    fn passphrase(&mut self, _generated: &str) -> ai_usagebar::error::Result<Zeroizing<String>> {
+        panic!("a machine joining a published bundle must never be offered a generated password")
+    }
+    fn existing_passphrase(&mut self) -> ai_usagebar::error::Result<Zeroizing<String>> {
+        self.asked += 1;
+        Ok(Zeroizing::new(if self.existing.is_empty() {
+            String::new()
+        } else {
+            self.existing.remove(0)
+        }))
+    }
+    fn categories(
+        &mut self,
+        current: &[SyncCategory],
+    ) -> ai_usagebar::error::Result<Vec<SyncCategory>> {
+        Ok(current.to_vec())
+    }
+    /// 8 MiB rather than a gibibyte, for the same reason as everywhere else.
+    fn kdf(&self) -> KdfParams {
+        FLOOR
+    }
+    /// Recorded by *not happening*: the real one writes the login Keychain.
+    fn store_token(&self, _token: &str, _file: &Path) -> ai_usagebar::error::Result<TokenSource> {
+        Ok(TokenSource::File)
+    }
+}
+
+/// A second machine as `sync setup` really leaves it — no keyfile, no pairing
+/// record and no index until the flow writes them — paired against `remote`.
+///
+/// Returns the [`Machine`] the rest of this file's helpers take, built from
+/// what setup put on disk rather than from a hand-wrapped fixture. That is the
+/// point: every other two-machine test here hands B a keyfile built by
+/// `wrap_by_hand` with A's seed, which is precisely the step the product could
+/// not perform.
+async fn set_up_second_machine(
+    remote: &Remote,
+    password: &str,
+) -> ai_usagebar::error::Result<(Machine, Joining)> {
+    let dir = TempDir::new().expect("a temp dir");
+    let roots = bob_roots(dir.path());
+    let prompt = set_up_at(remote, &roots, password).await?;
+
+    let keyfile: Keyfile =
+        serde_json::from_slice(&std::fs::read(keyfile_path(&roots)).expect("setup wrote one"))
+            .expect("a readable keyfile");
+    let keys = keyfile
+        .open(password.as_bytes())
+        .expect("the adopted keyfile");
+    let index = Index::at(&roots.index_file).expect("the local index");
+    Ok((
+        Machine {
+            dir,
+            index,
+            keys,
+            kdf: keyfile.kdf.params(),
+            keyfile_asset: keyfile_asset_of(&keyfile),
+            cfg: SyncConfig {
+                categories: SyncCategory::ALL.to_vec(),
+                repo: Some("o/n".into()),
+                ..SyncConfig::default()
+            },
+            password: Zeroizing::new(password.into()),
+            repo_id: push::repo_id_for(1),
+            roots,
+        },
+        prompt,
+    ))
+}
+
+/// `sync setup` against `remote`, under roots the caller owns — so a refusal
+/// case can assert on the paths the flow did **not** write after the `TempDir`
+/// would otherwise have gone with the `Machine` that was never built.
+async fn set_up_second_machine_at(
+    remote: &Remote,
+    roots: &SyncRoots,
+    password: &str,
+) -> ai_usagebar::error::Result<()> {
+    set_up_at(remote, roots, password).await.map(|_| ())
+}
+
+async fn set_up_at(
+    remote: &Remote,
+    roots: &SyncRoots,
+    password: &str,
+) -> ai_usagebar::error::Result<Joining> {
+    for root in [
+        &roots.config_dir,
+        &roots.desktop_data_dir,
+        &roots.desktop_profiles_dir,
+        &roots.claude_home,
+    ] {
+        std::fs::create_dir_all(root).expect("a root directory");
+    }
+    let cfg = SyncConfig {
+        categories: SyncCategory::ALL.to_vec(),
+        repo: Some("o/n".into()),
+        ..SyncConfig::default()
+    };
+
+    let mut prompt = Joining::typing(password);
+    setup::run(
+        &cfg,
+        roots,
+        &Endpoints {
+            api_base: remote.server.url(),
+            uploads_base: remote.server.url(),
+        },
+        &TokenChain {
+            env_value: Some(Zeroizing::new(TOKEN.into())),
+            ..TokenChain::default()
+        },
+        &mut prompt,
+        NOW,
+    )
+    .await?;
+    Ok(prompt)
 }
 
 fn applying() -> RestoreOptions {
@@ -2289,6 +2445,146 @@ async fn a_machine_that_missed_a_rekey_is_refused_a_push_and_can_still_pull() {
         .expect("the new password opens the rekeyed bundle");
     assert!(outcome.failed_at.is_none());
     assert_same_content(&a.roots, &restorer.roots);
+}
+
+// ---------------------------------------------------------------------------
+// 6-07 — the second machine is not read-only
+// ---------------------------------------------------------------------------
+
+/// **The gap this plan closes, as one round trip.** A second machine sets up
+/// against a repository that already holds a bundle, pushes back into it, and
+/// the first machine restores what it sent.
+///
+/// It fails without the change, and it fails at step 3 rather than at an
+/// assertion: `sync setup` called `Keyfile::create` unconditionally, so B's
+/// operator was shown a **generated** password for a bundle that already had
+/// one — which is why [`Joining::passphrase`] panics rather than returning a
+/// string. The consequence was asymmetric and easy to miss: `sync pull` worked,
+/// because `restore::fetch::resolve` opens the keyfile the *pointer* names and
+/// never consults a local one, while `sync push` was refused by
+/// `upload::assert_keyfile_is_current` — correctly, since B's fresh wrapper is
+/// not the published one. A machine that can only read is not a second machine.
+///
+/// Byte-identity is asserted rather than "opens under the same password"
+/// because byte-identity is what the push side actually compares: two keyfiles
+/// wrapping the same master key under the same password are still two different
+/// assets with two different content addresses.
+#[tokio::test]
+async fn a_second_machine_joins_the_published_bundle_and_its_push_is_accepted() {
+    let a = Machine::alice();
+    seed_a_full_tree(&a);
+    let remote = Remote::new().await;
+    push(&a, &remote).await.expect("machine A publishes");
+
+    let published = remote.with(|st| st.pointer_value().expect("published").keyfile);
+    let asset = remote.with(|st| {
+        st.assets
+            .iter()
+            .find(|x| x.name == published)
+            .expect("the keyfile asset A uploaded")
+            .bytes
+            .clone()
+    });
+
+    // ---- 2. B sets up against the same remote, with A's password ----------
+    let (b, prompt) = set_up_second_machine(&remote, PASSWORD)
+        .await
+        .expect("the published bundle is joinable with its own password");
+
+    assert_eq!(
+        std::fs::read(keyfile_path(&b.roots)).expect("setup wrote a keyfile"),
+        asset,
+        "B's keyfile is the published asset byte for byte, which is what makes its push \
+         a continuation rather than a divergent second bundle"
+    );
+    assert_eq!(
+        b.keyfile_asset, published,
+        "and it addresses to the same name"
+    );
+    assert_eq!(
+        prompt.asked, 1,
+        "one ask, and it was the existing-password one"
+    );
+    assert!(
+        !prompt.said.join("\n").contains(PASSWORD),
+        "the password never reaches the narration"
+    );
+
+    // ---- 3. B pushes, and is accepted ------------------------------------
+    b.seed(
+        &b.roots.claude_home,
+        "scheduled-tasks/from-the-second-machine.json",
+        br#"{"cron":"@daily"}"#,
+    );
+    push(&b, &remote)
+        .await
+        .expect("the second machine's push is refused — this is the gap");
+    let landed_pointer = remote.with(|st| st.pointer_value().expect("published"));
+    assert_eq!(
+        landed_pointer.snapshots.len(),
+        2,
+        "B continued A's history rather than starting one"
+    );
+    assert_eq!(
+        landed_pointer.keyfile, published,
+        "a join must not republish a second wrapper"
+    );
+
+    // ---- 4. …and A restores what B sent ----------------------------------
+    let landed = pull(&a, &remote, applying())
+        .await
+        .expect("A opens B's snapshot with the one master key both machines hold");
+    assert!(landed.failed_at.is_none(), "{landed:?}");
+    assert_eq!(
+        std::fs::read(
+            a.roots
+                .claude_home
+                .join("scheduled-tasks/from-the-second-machine.json")
+        )
+        .expect("B's file arrived on A"),
+        br#"{"cron":"@daily"}"#,
+    );
+}
+
+/// The other half of the same seam: a machine that types the wrong password
+/// leaves **no** keyfile behind.
+///
+/// `existing_keyfile_message` refuses to overwrite one, by design and for a good
+/// reason — so a keyfile written before the unwrap proved anything would strand
+/// the user behind a file that opens with a password nobody has, on a machine
+/// setup then declines to run again.
+#[tokio::test]
+async fn a_wrong_password_on_the_second_machine_leaves_nothing_to_strand_it() {
+    let a = Machine::alice();
+    seed_a_full_tree(&a);
+    let remote = Remote::new().await;
+    push(&a, &remote).await.expect("machine A publishes");
+
+    let before = remote.with(|st| st.pointer.clone());
+    let dir = TempDir::new().expect("a temp dir");
+    let roots = bob_roots(dir.path());
+    let err = match set_up_second_machine_at(&remote, &roots, NEW_PASSWORD).await {
+        Ok(()) => panic!("that password opens nothing on this bundle"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("did not open this bundle's keyfile"), "{err}");
+    assert!(
+        !err.contains(NEW_PASSWORD),
+        "the attempt is not echoed back: {err}"
+    );
+    assert!(
+        !keyfile_path(&roots).exists(),
+        "a keyfile survived a password that never opened one — the next run would refuse it"
+    );
+    assert!(!pairing::default_path(&roots).exists(), "no pairing record");
+
+    // And the remote is exactly where A left it: setup uploads nothing (D-05),
+    // and a refusal at step 3 is before the one step that writes anything.
+    assert_eq!(remote.with(|st| st.pointer.clone()), before);
+    assert!(
+        remote.with(|st| st.deleted.is_empty()),
+        "nothing was deleted"
+    );
 }
 
 // ---------------------------------------------------------------------------

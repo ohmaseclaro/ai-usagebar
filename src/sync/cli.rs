@@ -1309,6 +1309,14 @@ mod tests {
             .with_status(200)
             .with_body(PRIVATE_BODY)
             .create();
+        // Nothing has ever been pushed here, so step 3 mints a key rather than
+        // joining a published bundle. Without this the pointer read answers
+        // with mockito's 501.
+        let _p = server
+            .mock("GET", "/repos/o/n/contents/sync/pointer.json")
+            .with_status(404)
+            .with_body(r#"{"message":"Not Found"}"#)
+            .create();
 
         let script = Script::new();
         script

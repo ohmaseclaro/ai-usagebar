@@ -40,12 +40,14 @@
 use std::collections::HashMap;
 
 use base64::Engine;
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::error::{AppError, Result};
 use crate::sync::anchor::{self, Anchor};
 use crate::sync::crypto::{ChunkId, Keyfile};
 use crate::sync::github::write::{ASSET_STATE_UPLOADED, MAX_ASSET_BYTES};
+use crate::sync::github::{Client, RepoRef};
 use crate::sync::model::{IndexObject, Manifest, Root};
 use crate::sync::pack::PACK_MAX;
 use crate::sync::push::{self, RELEASE_TAG, SnapshotRecord};
@@ -161,7 +163,7 @@ pub async fn resolve(ctx: &RestoreCtx<'_>, local_anchor: Option<&Anchor>) -> Res
     }
 
     // 2. The release, read-only. A missing one is "nothing pushed yet".
-    let release_id = find_release(ctx).await?.ok_or_else(|| {
+    let release_id = find_release(ctx.client, ctx.repo).await?.ok_or_else(|| {
         AppError::Other(format!(
             "this repository has no `{RELEASE_TAG}` release, so the bundle's data is not there \
              even though a pointer is — nothing was restored"
@@ -170,12 +172,20 @@ pub async fn resolve(ctx: &RestoreCtx<'_>, local_anchor: Option<&Anchor>) -> Res
 
     // 3. One listing for the whole restore: the keyfile and every pack are
     //    looked up in it by name.
-    let assets = asset_index(ctx, release_id).await?;
+    let assets = asset_index(ctx.client, ctx.repo, release_id, ctx.now).await?;
 
     // 4. The keyfile named by the pointer. Its failure to open is deliberately
     //    the same error a wrong password gives — elaborating it would build the
     //    oracle Phase 1 refused to build.
-    let keyfile_bytes = download(ctx, &assets, &pointer.keyfile, "keyfile").await?;
+    let keyfile_bytes = download(
+        ctx.client,
+        ctx.repo,
+        ctx.now,
+        &assets,
+        &pointer.keyfile,
+        "keyfile",
+    )
+    .await?;
     let keyfile: Keyfile = serde_json::from_slice(&keyfile_bytes).map_err(|_| {
         AppError::Other(format!(
             "the keyfile asset {:?} is not a readable sync keyfile — this bundle cannot be \
@@ -332,12 +342,12 @@ pub async fn resolve(ctx: &RestoreCtx<'_>, local_anchor: Option<&Anchor>) -> Res
 /// Deliberately **not** `write::ensure_release`: that verb's 404 arm creates a
 /// release, and restore must be structurally incapable of changing the remote.
 /// `get_json` is the crate's one read verb and takes no push capability.
-async fn find_release(ctx: &RestoreCtx<'_>) -> Result<Option<u64>> {
+async fn find_release(client: &Client, repo: &RepoRef) -> Result<Option<u64>> {
     let path = format!(
         "/repos/{}/{}/releases/tags/{RELEASE_TAG}",
-        ctx.repo.owner, ctx.repo.name
+        repo.owner, repo.name
     );
-    let (status, _headers, body) = ctx.client.get_json(&path).await?;
+    let (status, _headers, body) = client.get_json(&path).await?;
     if status.as_u16() == 404 {
         return Ok(None);
     }
@@ -354,11 +364,13 @@ async fn find_release(ctx: &RestoreCtx<'_>) -> Result<Option<u64>> {
 
 /// One listing, by asset name. A torn upload (any state but `uploaded`) is not
 /// offered: its bytes are incomplete by definition.
-async fn asset_index(ctx: &RestoreCtx<'_>, release_id: u64) -> Result<HashMap<String, AssetRef>> {
-    let listed = ctx
-        .client
-        .list_assets(ctx.repo, release_id, ctx.now)
-        .await?;
+async fn asset_index(
+    client: &Client,
+    repo: &RepoRef,
+    release_id: u64,
+    now: DateTime<Utc>,
+) -> Result<HashMap<String, AssetRef>> {
+    let listed = client.list_assets(repo, release_id, now).await?;
     Ok(listed
         .into_iter()
         .filter(|a| a.state == ASSET_STATE_UPLOADED)
@@ -376,7 +388,9 @@ async fn asset_index(ctx: &RestoreCtx<'_>, release_id: u64) -> Result<HashMap<St
 
 /// Download one named asset, refusing a declared size this build will not hold.
 async fn download(
-    ctx: &RestoreCtx<'_>,
+    client: &Client,
+    repo: &RepoRef,
+    now: DateTime<Utc>,
     assets: &HashMap<String, AssetRef>,
     name: &str,
     what: &str,
@@ -395,7 +409,42 @@ async fn download(
             asset.size
         )));
     }
-    ctx.client.download_asset(ctx.repo, asset.id, ctx.now).await
+    client.download_asset(repo, asset.id, now).await
+}
+
+/// The published keyfile asset's bytes, by the name a pointer gave.
+///
+/// The whole read chain a caller that holds a pointer and **no local keyfile**
+/// needs: `sync setup`'s join path, which adopts an already-published bundle's
+/// wrapper instead of minting a second master key for it (`github::setup::run`
+/// step 3). It composes the same three verbs [`resolve`] does — none of which
+/// takes a `gate::Pushing`, so this cannot change the remote either — and it
+/// reuses [`download`]'s ceiling rather than inventing a second one: the size
+/// is remote-chosen, and it is refused from the release listing before the
+/// request that would allocate it.
+///
+/// It returns **bytes, not a [`Keyfile`]**. The caller writes them verbatim, so
+/// the local file is byte-identical to the asset the pointer names — which is
+/// what `push::upload::assert_keyfile_is_current` compares a push against.
+/// Re-serializing here would be one more place for the two to disagree.
+///
+/// Nothing is authenticated at this point. The AEAD unwrap in [`Keyfile::open`]
+/// is the only thing that ever will be, and the caller must not persist a byte
+/// before it succeeds.
+pub(crate) async fn published_keyfile(
+    client: &Client,
+    repo: &RepoRef,
+    name: &str,
+    now: DateTime<Utc>,
+) -> Result<Vec<u8>> {
+    let release_id = find_release(client, repo).await?.ok_or_else(|| {
+        AppError::Other(format!(
+            "this repository has a snapshot pointer but no `{RELEASE_TAG}` release, so the \
+             keyfile that pointer names is not there — nothing was written"
+        ))
+    })?;
+    let assets = asset_index(client, repo, release_id, now).await?;
+    download(client, repo, now, &assets, name, "keyfile").await
 }
 
 /// Fetch every pack in `wanted` that is not already held.
@@ -446,7 +495,7 @@ async fn fetch_packs(
     }
 
     for (id, name) in round {
-        let bytes = download(ctx, assets, &name, "pack").await?;
+        let bytes = download(ctx.client, ctx.repo, ctx.now, assets, &name, "pack").await?;
         packs.add(id, bytes)?;
     }
     Ok(())
