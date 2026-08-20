@@ -3,49 +3,133 @@
 //!
 //! # SAFE-05, and why the tempfile lives in the destination's own directory
 //!
-//! Every decrypted byte goes through a [`NamedTempFile::new_in`] created in the
-//! **destination's own directory**, chmod 0600 *before* any content is written,
-//! then persisted. Never `/tmp`, and it is refused there three times over: it
-//! is world-readable; it is usually a different filesystem, so `persist`
-//! degrades to a copy that leaves the plaintext original behind; and it is
-//! often tmpfs, which can reach swap.
+//! Every decrypted byte goes through a tempfile created in the **destination's
+//! own directory**, chmod 0600 *before* any content is written, then persisted.
+//! Never a shared temporary directory, and it is refused there three times
+//! over: it is world-readable, so a plaintext credential sits where anyone can
+//! read it; it is frequently a different filesystem, where `persist` cannot
+//! rename and degrades to a copy that leaves the plaintext original behind at
+//! the temporary path — the precise failure SAFE-05 names; and it is often
+//! tmpfs, which can reach swap and outlive the process on disk.
 //!
 //! The chmod happens on the tempfile rather than after the rename because
 //! `persist` keeps the tempfile's mode — a chmod afterwards leaves a window
 //! where the file exists at its real name with whatever mode the umask gave it.
 //!
+//! # The order of the steps *is* the mitigation
+//!
+//! 1. Every writable item's manifest path is resolved again, for the whole plan,
+//!    **before the first byte** — defence in depth against a plan mutated
+//!    between planning and applying. A disagreement aborts the restore rather
+//!    than skipping the item: a plan that contradicts itself is not a situation
+//!    to continue from. Doing the whole plan first is what makes `Err` from
+//!    [`apply`] mean *nothing was written*.
+//! 2. The parent directory is created at 0700 **before** the tempfile, so the
+//!    tempfile is never briefly parented by a world-listable directory.
+//!    Directories that already existed are left exactly as their owner set
+//!    them: a surprise 0700 on `~/.claude` is its own bug.
+//! 3. The tempfile is created in that directory, with the `.tmp.` prefix
+//!    [`crate::cache::atomic_write`] uses, so `scope`'s exclusion rules already
+//!    ignore it if a collection scan runs concurrently.
+//! 4. Mode 0600, then the content, then `sync_all`, then the snapshot's mtime,
+//!    then `persist`. The real name is only ever reached by that rename; no
+//!    path here opens the destination for writing, so a half-written credential
+//!    cannot exist at its real name.
+//!
 //! # The manifest's recorded mode is ignored
 //!
-//! Every restored file is 0600. The mode in the manifest is attacker-
-//! controllable, and a bundle that could talk this side into 0644 on a
-//! credential file would be a bundle that leaks it. A deliberate narrowing,
-//! recorded here rather than inferred from the absence of a read.
+//! Every restored file is 0600 and every directory this module creates is 0700.
+//! The manifest does record a mode, and it is attacker-controllable: a bundle
+//! that could talk this side into 0644 on a credential file would be a bundle
+//! that leaks it. The narrowing is safe in the only direction that matters, and
+//! it is structural rather than merely unread — [`ItemPlan`] does not carry the
+//! field, so there is no value here to apply by accident. The one user-visible
+//! consequence is that a restored executable does not come back executable; no
+//! category in the bundle contains one.
 //!
-//! Plan 5-01 filled the happy path. Plan 5-04 owns directory modes, the
-//! failure-path cleanup, the mtime stamp that makes 5-03's comparison exact,
-//! and the symlink refusal at this boundary.
+//! # What an interrupted restore leaves, and why it is not rolled back
+//!
+//! A partial restore is **reported as one, not undone**. Items before the
+//! failure stay written, the failing item does not exist at its real name, and
+//! the items after it are untouched; [`Applied::failed_at`] names where the run
+//! reached. Automatically undoing the successful writes would mean writing
+//! again, from an archive, on a machine that has just demonstrated it cannot
+//! complete a write — more failure surface at exactly the wrong moment. The
+//! user gets the rollback command from the pre-restore backup and decides.
+//!
+//! Killing the process mid-restore leaves at most one unpersisted `.tmp.` file
+//! inside a destination directory and nothing anywhere else. Re-running the
+//! restore finishes it: every write is idempotent, and 5-03's `SkipIdentical`
+//! means the second run does not even reopen what the first one completed.
+//!
+//! # This module assumes the backup was already taken
+//!
+//! [`super::run`] calls [`super::backup::take`] over exactly the destinations
+//! whose [`Disposition::writes`] — step 5, before step 6 — so *nothing archived
+//! implies nothing overwritten*. `apply` deliberately offers no way to reach a
+//! write without going through that order: it takes no "skip the backup" option
+//! and reads no flag that would let one exist.
+//!
+//! # Symlinks
+//!
+//! Nothing here ever creates one, and `persist` is a rename, so an existing
+//! symlink *at* the destination is replaced rather than written through. A
+//! symlinked directory *above* the destination is followed — deliberately: it
+//! is a configuration the user made on this machine (`~/.claude` pointed at
+//! another disk is a real setup), it cannot be created by the bundle, and
+//! refusing it would break the legitimate case far more often than the hostile
+//! one, which needs write access to the user's home directory to arrange and
+//! would not need a restore to exploit it.
+//!
+//! Plan 5-01 filled the happy path. Plan 5-04 owns the preflight, the directory
+//! modes, the failure-path cleanup, the mtime stamp that makes 5-03's
+//! newer-local comparison exact, and the partial-restore report.
 
+use std::fs::{DirBuilder, FileTimes};
 use std::io::Write as _;
+use std::path::{Path, PathBuf};
 
-use tempfile::NamedTempFile;
+use chrono::{DateTime, Utc};
 
 use crate::error::{AppError, Result};
 
 use super::{Applied, Disposition, ItemPlan, PackSource, RestoreCtx, RestorePlan, layout};
 
 /// Write every item the plan decided to write.
+///
+/// `Err` means **nothing was written**: the only errors are the preflight's,
+/// and it runs over the whole plan before the first tempfile exists. A failure
+/// during the writing itself is a partial restore, which is an `Ok` carrying
+/// [`Applied::failed_at`] — the caller must not advance the rollback anchor on
+/// one, and [`super::run`] does not.
 pub fn apply(ctx: &RestoreCtx<'_>, plan: &RestorePlan, packs: &PackSource) -> Result<Applied> {
     let mut out = Applied::default();
+    let mut queue: Vec<(&ItemPlan, PathBuf)> = Vec::new();
 
+    // Preflight, over every item, before any of them is written.
     for item in &plan.items {
+        if matches!(item.disposition, Disposition::NeedsCredentialConfirm { .. }) {
+            return Err(AppError::Other(format!(
+                "{:?} reached the write path still awaiting the credential confirmation the CLI \
+                 resolves before a restore applies — refusing rather than guessing which way it \
+                 was answered",
+                item.manifest_path
+            )));
+        }
         if !item.disposition.writes() {
             out.skipped += 1;
             continue;
         }
-        let Some(dest) = item.dest.as_ref() else {
-            out.skipped += 1;
-            continue;
-        };
+
+        // `RejectedPath` and `ExcludedByPolicy` are the only dispositions that
+        // carry no destination, and neither of them writes. A writable item
+        // without one is a bug upstream, not a case to skip quietly.
+        let dest = item.dest.as_ref().ok_or_else(|| {
+            AppError::Other(format!(
+                "{:?} is planned as a write but carries no destination — refusing to guess one",
+                item.manifest_path
+            ))
+        })?;
 
         // Defence in depth: the path rule runs again at the write boundary, and
         // a destination that fails it here is a hard error rather than a skip —
@@ -58,8 +142,20 @@ pub fn apply(ctx: &RestoreCtx<'_>, plan: &RestorePlan, packs: &PackSource) -> Re
                 item.manifest_path
             )));
         }
+        queue.push((item, checked));
+    }
 
-        write_one(packs, item, &checked)?;
+    // Manifest order, so a partial restore stops in the same place twice and is
+    // therefore debuggable.
+    for (item, dest) in queue {
+        if let Err(why) = write_one(packs, item, &dest, plan.created_at) {
+            // `Applied` carries where the run stopped, which is what the summary
+            // renders; the cause is only useful now, so it goes to stderr rather
+            // than being swallowed.
+            eprintln!("sync: restore stopped at {}: {why}", item.manifest_path);
+            out.failed_at = Some(item.manifest_path.clone());
+            break;
+        }
         out.written += 1;
         if matches!(item.disposition, Disposition::Overwrite { .. }) {
             out.overwritten.push(item.manifest_path.clone());
@@ -71,18 +167,32 @@ pub fn apply(ctx: &RestoreCtx<'_>, plan: &RestorePlan, packs: &PackSource) -> Re
 
 /// One file: reassemble its chunks in order, straight into a tempfile beside
 /// where it is going.
-fn write_one(packs: &PackSource, item: &ItemPlan, dest: &std::path::Path) -> Result<()> {
+///
+/// Every error path drops the [`tempfile::NamedTempFile`], whose `Drop` removes
+/// it. That is why nothing here calls `into_temp_path().keep()` and why no
+/// staging name outside the destination directory exists to be renamed later.
+fn write_one(
+    packs: &PackSource,
+    item: &ItemPlan,
+    dest: &Path,
+    created_at: DateTime<Utc>,
+) -> Result<()> {
     let dir = dest.parent().ok_or_else(|| {
         AppError::Other(format!(
             "the destination for {:?} has no parent directory",
             item.manifest_path
         ))
     })?;
-    std::fs::create_dir_all(dir).map_err(|e| AppError::io_at(dir, e))?;
+    ensure_dir(dir)?;
 
-    let mut tmp = NamedTempFile::new_in(dir).map_err(|e| AppError::io_at(dir, e))?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".tmp.")
+        .tempfile_in(dir)
+        .map_err(|e| AppError::io_at(dir, e))?;
 
-    // Before a single byte, so the plaintext is never briefly world-readable.
+    // Before a single byte, so the plaintext is never briefly world-readable —
+    // and `persist` keeps this mode, so it is never readable at the real name
+    // either.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -91,6 +201,8 @@ fn write_one(packs: &PackSource, item: &ItemPlan, dest: &std::path::Path) -> Res
             .map_err(|e| AppError::io_at(tmp.path(), e))?;
     }
 
+    // One chunk in memory at a time: a multi-gigabyte transcript is not
+    // assembled in RAM just to be written out.
     let mut written: u64 = 0;
     for id in &item.chunks {
         let bytes = packs.chunk(id)?;
@@ -112,11 +224,37 @@ fn write_one(packs: &PackSource, item: &ItemPlan, dest: &std::path::Path) -> Res
     tmp.as_file_mut()
         .sync_all()
         .map_err(|e| AppError::io_at(tmp.path(), e))?;
+
+    // The snapshot's time, not this restore's: it is what makes the next pull's
+    // newer-local comparison exact rather than merely conservative. Stamped
+    // before the rename, which preserves it, so there is no second open of the
+    // destination to fail. Best effort — a filesystem that will not take a
+    // timestamp is not a reason to fail a restore that has already succeeded.
+    let _ = tmp
+        .as_file()
+        .set_times(FileTimes::new().set_modified(created_at.into()));
+
     tmp.persist(dest)
         .map_err(|e| AppError::io_at(dest, e.error))?;
     Ok(())
 }
 
+/// Create the destination's directory chain at 0700, leaving anything that
+/// already existed exactly as its owner set it.
+///
+/// [`DirBuilder`]'s mode applies to the directories it creates and to nothing
+/// else, which is precisely the distinction wanted: the restore closes what it
+/// opens and does not narrow the user's own directories.
+fn ensure_dir(dir: &Path) -> Result<()> {
+    let mut builder = DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir).map_err(|e| AppError::io_at(dir, e))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,8 +607,20 @@ mod tests {
         let (packs, ids) = packed(&[b"a", b"b", b"c"]);
         let times = (SNAPSHOT, NOW);
         let mut items = vec![
-            item(&m, "config/a.toml", b"a", ids[0].clone(), Disposition::Create),
-            item(&m, "config/b.toml", b"b", ids[1].clone(), Disposition::Update),
+            item(
+                &m,
+                "config/a.toml",
+                b"a",
+                ids[0].clone(),
+                Disposition::Create,
+            ),
+            item(
+                &m,
+                "config/b.toml",
+                b"b",
+                ids[1].clone(),
+                Disposition::Update,
+            ),
             item(
                 &m,
                 "config/c.toml",
@@ -544,13 +694,7 @@ mod tests {
             remote_mtime: SNAPSHOT,
         };
         let plan = plan_of(vec![
-            item(
-                &m,
-                "config/z.toml",
-                b"a",
-                ids[0].clone(),
-                overwrite.clone(),
-            ),
+            item(&m, "config/z.toml", b"a", ids[0].clone(), overwrite.clone()),
             item(&m, "config/m.toml", b"b", ids[1].clone(), overwrite.clone()),
             item(&m, "config/a.toml", b"c", ids[2].clone(), overwrite),
         ]);
@@ -615,7 +759,13 @@ mod tests {
         let m = Machine::new();
         let (packs, ids) = packed(&[b"a", b"b"]);
         let plan = plan_of(vec![
-            item(&m, "config/a.toml", b"a", ids[0].clone(), Disposition::Create),
+            item(
+                &m,
+                "config/a.toml",
+                b"a",
+                ids[0].clone(),
+                Disposition::Create,
+            ),
             item(
                 &m,
                 CREDENTIAL,
@@ -651,7 +801,13 @@ mod tests {
         );
         tampered.dest = Some(m.roots.config_dir.join("elsewhere.toml"));
         let plan = plan_of(vec![
-            item(&m, "config/a.toml", b"a", ids[0].clone(), Disposition::Create),
+            item(
+                &m,
+                "config/a.toml",
+                b"a",
+                ids[0].clone(),
+                Disposition::Create,
+            ),
             tampered,
         ]);
 
@@ -669,7 +825,13 @@ mod tests {
     fn a_writable_item_with_no_destination_is_a_bug_not_a_skip() {
         let m = Machine::new();
         let (packs, ids) = packed(&[b"a"]);
-        let mut orphan = item(&m, "config/a.toml", b"a", ids[0].clone(), Disposition::Create);
+        let mut orphan = item(
+            &m,
+            "config/a.toml",
+            b"a",
+            ids[0].clone(),
+            Disposition::Create,
+        );
         orphan.dest = None;
 
         let err = apply(&m.ctx(), &plan_of(vec![orphan]), &packs)
