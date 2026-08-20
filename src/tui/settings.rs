@@ -919,17 +919,31 @@ pub fn render(f: &mut Frame, area: Rect, state: &SettingsState, theme: &Theme) {
             &bubble,
         ),
     ];
+    // Which body line the focused control sits on, so a terminal too short to
+    // hold the whole form scrolls to it rather than hiding it. Recorded while
+    // building rather than derived from a second layout table, which would
+    // drift the moment a row moves.
+    let mut focus_line = 1; // the primary row
     for (i, kv) in KEY_VENDORS.iter().enumerate() {
         let focused = state.focus == Focus::Key(i);
+        if focused {
+            focus_line = lines.len();
+        }
         lines.push(key_row(kv, &state.keys[i], focused, &bubble));
     }
     lines.push(Line::from(""));
 
     // — Sync —
+    if let Focus::SyncCategory(i) = state.focus {
+        focus_line = lines.len() + SYNC_PREAMBLE_LINES + i;
+    }
     lines.extend(sync_lines(state, &bubble));
     lines.push(Line::from(""));
 
     // — Save + status —
+    if state.focus == Focus::Save {
+        focus_line = lines.len();
+    }
     lines.push(save_line(state.focus == Focus::Save, &bubble));
     if !state.status.is_empty() {
         let ok = state.status.starts_with("saved");
@@ -941,7 +955,12 @@ pub fn render(f: &mut Frame, area: Rect, state: &SettingsState, theme: &Theme) {
         ]));
     }
 
-    f.render_widget(Paragraph::new(lines), chunks[0]);
+    // Scroll only far enough to keep the focused row on screen. Tab can reach
+    // rows a short terminal cannot show, and a control the user is editing
+    // blind is worse than one that is merely off-screen.
+    let visible = chunks[0].height as usize;
+    let scroll = focus_line.saturating_sub(visible.saturating_sub(1)) as u16;
+    f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), chunks[0]);
 
     // Context-aware hint footer.
     let hint = match state.focus {
@@ -1069,6 +1088,11 @@ fn value_text(input: &KeyInput, focused: bool) -> String {
     chars.into_iter().collect()
 }
 
+/// Lines [`sync_lines`] emits before the first toggle row: the section header,
+/// last-sync, and the pointer at `sync status`. `render` needs it to know
+/// which body line a focused row lands on.
+const SYNC_PREAMBLE_LINES: usize = 3;
+
 /// The Sync block — a pure function of the state and theme.
 ///
 /// No filesystem read, no clock read, no index open: the last-sync value
@@ -1076,6 +1100,7 @@ fn value_text(input: &KeyInput, focused: bool) -> String {
 /// transcript tree on every keypress would freeze the render loop (T-6-23),
 /// so the per-category counts are *pointed at* rather than computed.
 fn sync_lines(state: &SettingsState, theme: &BubbleTheme) -> Vec<Line<'static>> {
+    debug_assert_eq!(SYNC_PREAMBLE_LINES, 3);
     let mut lines = vec![
         section_header(
             "Sync",
@@ -2263,5 +2288,70 @@ categories = [\"config\"]
         // A user who sees no numbers and is told nothing assumes it is broken.
         let s = SettingsState::from_config(&Config::default());
         assert!(rendered(&s)[2].contains("ai-usagebar sync status"));
+    }
+
+    /// Draw the whole overlay onto a fixed-size test backend and read it back.
+    fn drawn(state: &SettingsState, width: u16, height: u16) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let theme = Theme::default();
+        terminal
+            .draw(|frame| render(frame, frame.area(), state, &theme))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .concat()
+    }
+
+    #[test]
+    fn the_overlay_draws_the_sync_section_and_still_reaches_save() {
+        let s = SettingsState::from_config(&Config::default());
+        let painted = drawn(&s, 120, 44);
+        for cat in SyncCategory::ALL {
+            assert!(painted.contains(cat.label()), "{cat:?} not drawn");
+        }
+        assert!(painted.contains("last sync: never"));
+        assert!(painted.contains("ai-usagebar sync status"));
+        assert!(painted.contains("Save"), "the Save row fell off the modal");
+    }
+
+    #[test]
+    fn a_short_terminal_truncates_the_overlay_instead_of_panicking() {
+        // The modal is a percentage of the frame and the body is a Paragraph:
+        // a window too short to hold every row clips, it does not overflow the
+        // buffer. Both the floor and a one-row frame are drawn here because a
+        // panic inside `draw` takes the whole TUI down.
+        let s = SettingsState::from_config(&Config::default());
+        for (w, h) in [(80, 24), (40, 10), (20, 3), (1, 1)] {
+            let _ = drawn(&s, w, h);
+        }
+    }
+
+    #[test]
+    fn a_short_terminal_scrolls_to_the_focused_row_instead_of_hiding_it() {
+        // 80x24 is the default Terminal.app window and cannot hold the whole
+        // form. Every row Tab can reach must still be visible when it has
+        // focus — toggling what leaves the machine blind is not acceptable.
+        let mut s = SettingsState::from_config(&Config::default());
+        for i in 0..SyncCategory::ALL.len() {
+            s.focus = Focus::SyncCategory(i);
+            let painted = drawn(&s, 80, 24);
+            let label = SyncCategory::ALL[i].label();
+            assert!(
+                painted.contains(label),
+                "{label} is off-screen when focused"
+            );
+            assert!(painted.contains('▸'), "{label} lost its focus marker");
+        }
+        s.focus = Focus::Save;
+        assert!(drawn(&s, 80, 24).contains("Save"));
+        s.focus = Focus::Primary;
+        assert!(drawn(&s, 80, 24).contains("Primary vendor"));
     }
 }
