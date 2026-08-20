@@ -2,18 +2,18 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-current_phase: 4
-current_phase_name: push
+current_phase: 5
+current_phase_name: pull-and-restore
 status: executing
 stopped_at: Milestone artifacts written (PROJECT, REQUIREMENTS, ROADMAP, STATE, research×3 +
 last_updated: "2026-08-19T16:50:50.537Z"
 last_activity: 2026-08-19
-last_activity_desc: Phase 4 wave 2 executing (4-02/4-03/4-04/4-06)
+last_activity_desc: Phase 5 waves 1-2 merged; 4-08 remediation in flight
 progress:
   total_phases: 6
   completed_phases: 3
   total_plans: 44
-  completed_plans: 27
+  completed_plans: 40
 ---
 
 # Project State
@@ -29,13 +29,13 @@ usage as another's.
 
 ## Current Position
 
-Phase: 4 (push) — 4-01 merged; wave 2 in flight
-Plan: 1 of 7 merged in phase 4
+Phase: 5 (pull-and-restore) — waves 1 and 2 merged
+Plan: 6 of 8 merged in phase 5
 Status: phases 1-3 code-complete + audited; phase 4 executing
 Last activity: 2026-08-19 — Phase 1 execution started
 and reconciled, REQUIREMENTS.md (37 v1) and ROADMAP.md (6 phases) written
 
-Progress: [██████░░░░] ~58% (3 of 6 phases, phase 4 in flight)
+Progress: [███████░░░] ~72% (4 of 6 phases, phase 5 in flight)
 
 ## Performance Metrics
 
@@ -199,3 +199,50 @@ at runtime (`format!(".{verb}(")`), which removes the reason to skip any region 
 
 A guard that cannot fail its own negative control is decoration. Both halves now have hand-run
 negative controls.
+
+## Phase 4 — audit verdict OPEN_THREATS, and all three blockers are two-machine bugs
+
+The milestone exists so a second machine can continue where the first stopped. All three
+blocking findings break exactly that, and none needs an attacker to be interesting:
+
+- **NEW-1, unregistered by any threat model.** The snapshot counter is computed before the
+  compare-and-swap and never recomputed after it. Two machines both read counter 6, both seal a
+  root at 7, one wins the flip and the loser's `rebuild` re-runs — but it rebuilds the *list*,
+  not the root. Both publish at 7. `anchor::accept` reads an equal counter as "already seen", so
+  restoring one machine's snapshot makes the other's read as a re-read. **A backup silently
+  dropped by the control that exists to protect backups.**
+- **T-4-04.** The accept's justification names the anchor as the rollback defence.
+  `grep -rn anchor src/sync/push/` returns three doc comments and zero reads. An authentic old
+  pointer is laundered by the next honest push, and then prune deletes every pack the rollback
+  orphaned — older than `PRUNE_GRACE`, so uncovered. Reversible tamper becomes irreversible
+  deletion, executed by the victim, exit 0.
+- **T-4-45.** `ensure_keyfile` publishes *this* machine's keyfile. A machine that has not rekeyed
+  re-uploads the old wrapper the rekeying machine had verifiably destroyed, and each push resets
+  its `created_at` so the grace window never expires. The password change was cosmetic. The code
+  called this a "known sharp edge" for "whoever wires the rekey path". Nobody wired it.
+
+**The guards themselves:** 11 negative controls run, 8 red, **3 green** — three guards do not
+detect the violation they exist for. One is Phase 3's F-8 recurring verbatim: a hand-maintained
+file list that omits the one file the threat is about. Remediation fixes the shape (recursive
+walk), not the instance.
+
+## The defect class, instance count 8
+
+`Index::known_chunks` has zero production call sites; every reference is a test. `4-02-PLAN.md`
+promised `build` would call it, the implementation needed locations instead, and the wrapper was
+kept "to keep the frozen surface honest".
+
+Running tally of *tested code nothing calls* or *text asserting absent behaviour*:
+`http::actionable`, `assert_fresh`, `ensure_keyfile`, `progress::reporter`, `known_chunks`, the
+anchor-on-the-push-path, plus three rounds of documentation. **A test that calls the function
+directly proves the function works, never that anything uses it.** Every phase from here ends by
+enumerating production call sites of what it added.
+
+## Phase 5 — two independent plans converged on the same unbroken tie
+
+`5-02` found that snapshot selection was `counter > best.counter`, so on a *tie* the pointer's
+list order decided — the thing T-5-15 requires to be inert. Ties were assumed unreachable;
+`4-08`'s NEW-1 proves they are not. Now broken on the root's sealed `created_at`, then its sealed
+bytes, with a test that runs both orders and asserts they agree.
+
+Two plans, opposite ends of the wire, same defect. Neither could have seen it alone.
