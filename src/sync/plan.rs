@@ -272,6 +272,15 @@ pub fn build_with_keys(
     now: DateTime<Utc>,
     keys: &Keys,
 ) -> Result<SyncPlan> {
+    // Before the first lookup. A cached chunk id belongs to the master key that
+    // produced it, so a keyfile change makes every one of them an address the
+    // packer will never seal — see `Index::bind_to`.
+    if index.bind_to(keys)? {
+        eprintln!(
+            "sync: the sync password changed, so the local change-detection index was \
+             rebuilt. This run re-reads every file; the next one will not."
+        );
+    }
     build(roots, cfg, index, now, |bytes| {
         *keys.chunk_id(bytes).as_bytes()
     })
@@ -983,6 +992,61 @@ mod tests {
         crate::sync::crypto::Keyfile::create_with_floor(b"a-test-passphrase", CHEAP, CHEAP.m_kib)
             .expect("a cheap keyfile")
             .1
+    }
+
+    /// A new keyfile invalidates every cached chunk id, and the index must not
+    /// hand the old ones to a planner that will never seal them.
+    ///
+    /// This is the shape that produced an unrestorable bundle on a real first
+    /// push: `sync setup` re-run writes a fresh master key, `plan::build` reuses
+    /// the cached ids without reopening the files, and `packer::pack_file` seals
+    /// a block only when the id it computes is one the plan asked for. Under a
+    /// new key nothing matches, so nothing is sealed while the manifest still
+    /// names the old ids — a push that reports success and a bundle that cannot
+    /// be restored.
+    ///
+    /// Asserted on **file reads**, not on a flag: what went wrong was that the
+    /// files were not opened.
+    #[test]
+    fn a_new_keyfile_makes_the_index_forget_ids_it_can_no_longer_seal() {
+        let dir = TempDir::new().unwrap();
+        seed_tree(dir.path());
+        let roots = roots_at(dir.path());
+        let index = index_at(dir.path());
+        let first = test_keys();
+
+        let one = build_with_keys(&roots, &cfg(), &index, now(), &first).unwrap();
+        assert!(one.files_opened > 0, "the first run reads everything");
+
+        // Same key: the index is trusted and nothing is reopened.
+        let again = build_with_keys(&roots, &cfg(), &index, now(), &first).unwrap();
+        assert_eq!(
+            again.files_opened, 0,
+            "an unchanged tree under an unchanged key opens no file"
+        );
+
+        // A different keyfile — exactly what re-running `sync setup` writes.
+        let second = crate::sync::crypto::Keyfile::create_with_floor(
+            b"a-different-passphrase",
+            CHEAP,
+            CHEAP.m_kib,
+        )
+        .expect("a cheap keyfile")
+        .1;
+        let rebound = build_with_keys(&roots, &cfg(), &index, now(), &second).unwrap();
+
+        assert_eq!(
+            rebound.files_opened, one.files_opened,
+            "a new master key re-reads every file: its cached ids address chunks \
+             nothing will seal under this key"
+        );
+        for file in &rebound.file_plans {
+            assert!(
+                !file.reused,
+                "{:?} was reported as reused under a key that never sealed it",
+                file.path
+            );
+        }
     }
 
     /// The constant is a sum of two numbers `crypto` keeps private. Pin it

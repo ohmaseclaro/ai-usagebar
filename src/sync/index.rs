@@ -37,6 +37,14 @@ const MAX_CHUNK_IDS_BYTES: i64 = 32 * 1024 * 1024;
 /// both, so the query never depends on that.
 const SQL_BATCH: usize = 900;
 
+/// `meta` key holding the fingerprint of the master key this index was built
+/// under. See [`Index::bind_to`].
+const KEY_BINDING_KEY: &str = "key_binding";
+
+/// Hashed under the name subkey to produce that fingerprint. Fixed, and never
+/// a chunk of anyone's data.
+const KEY_BINDING_LABEL: &[u8] = b"ai-usagebar sync index binding v1";
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS file (
   path          TEXT PRIMARY KEY,
@@ -463,6 +471,48 @@ impl Index {
                 .map_err(|e| self.err(e))?;
         }
         Ok(removed)
+    }
+
+    /// Tie this index to the master key whose chunk ids it caches, clearing it
+    /// if the key has changed.
+    ///
+    /// A chunk id is `keyed_hash(name_key, plaintext)`, so **every id in here
+    /// belongs to exactly one master key**. Write a new keyfile — which
+    /// `sync setup` does whenever it is re-run — and every cached id becomes an
+    /// address that nothing will ever seal again.
+    ///
+    /// That is not a slow path, it is a corrupt one. `plan::build` reuses a
+    /// cached file's ids without reopening the file, and `packer::pack_file`
+    /// seals a block only when the id it computes is one the plan asked for. So
+    /// after a key change the plan names the old ids, the packer computes new
+    /// ones, nothing matches, nothing is sealed — and the manifest ships
+    /// referencing chunks that were never uploaded. The push reports success
+    /// and the bundle cannot be restored.
+    ///
+    /// The stored value is `chunk_id` over a fixed label: a keyed hash, so it
+    /// identifies the key without being invertible to it, and it reuses the
+    /// primitive whose behaviour this is about rather than inventing a second.
+    ///
+    /// Returns `true` when the index was cleared.
+    pub fn bind_to(&self, keys: &crate::sync::crypto::Keys) -> Result<bool> {
+        let current = keys.chunk_id(KEY_BINDING_LABEL);
+        let current = current.as_bytes().to_vec();
+        match self.meta::<Vec<u8>>(KEY_BINDING_KEY) {
+            Some(stored) if stored == current => Ok(false),
+            Some(_) => {
+                // Not `reset_at`: the file is open, and `last_sync` is about the
+                // remote rather than about any key.
+                self.conn
+                    .execute_batch("DELETE FROM file; DELETE FROM chunk;")
+                    .map_err(|e| self.err(e))?;
+                self.set_meta(KEY_BINDING_KEY, current)?;
+                Ok(true)
+            }
+            None => {
+                self.set_meta(KEY_BINDING_KEY, current)?;
+                Ok(false)
+            }
+        }
     }
 
     fn meta<T: rusqlite::types::FromSql>(&self, key: &str) -> Option<T> {
