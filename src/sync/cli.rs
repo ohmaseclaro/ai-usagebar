@@ -125,8 +125,8 @@ pub fn run_with(
                 // does not offer `--force-rehash`: restore hashes what is on
                 // disk and never asks the index, so the flag would change
                 // nothing here. It lives on `sync push`, where it changes what
-                // the planner does.
-                force_rehash: false,
+                // the planner does — and `RestoreOptions` carries no field for
+                // it, so there is nothing here to set wrong.
                 assume_yes: *yes,
             },
             now,

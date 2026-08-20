@@ -67,8 +67,6 @@ pub struct RestoreOptions {
     pub allow_rollback: bool,
     /// Discard the local change-detection index and reopen it empty.
     pub rebuild_index: bool,
-    /// Ignore every cached hash for one run.
-    pub force_rehash: bool,
     /// Answer the one interactive gate affirmatively.
     pub assume_yes: bool,
 }

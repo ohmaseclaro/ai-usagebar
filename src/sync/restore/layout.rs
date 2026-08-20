@@ -40,6 +40,11 @@ use std::path::{Component, Path, PathBuf};
 use crate::error::{AppError, Result};
 use crate::sync::{SyncRoots, scope};
 
+// There is deliberately no encoder in this module. `push::packer::manifest_path`
+// has emitted the wire spelling since Phase 4, and the round-trip tests below
+// call it directly — a local mirror would make the drift test compare a copy
+// against itself, which is exactly the drift it exists to catch.
+
 // The four prefixes. `config_file` needs no fifth: `SyncRoots::resolve` derives
 // `config_dir` as its parent, so the file itself already lives under `config/`.
 fn config_dir(roots: &SyncRoots) -> &Path {
@@ -70,17 +75,6 @@ const ROOT_PREFIXES: [(&str, RootOf); 4] = [
     ("desktop-profiles", desktop_profiles_dir),
     ("claude-home", claude_home),
 ];
-
-/// Render an absolute local path as the bundle's relocatable spelling.
-///
-/// Delegates rather than reimplements: the push side has emitted this encoding
-/// since Phase 4, and two implementations of one wire format is how a bundle
-/// becomes unreadable by the client that wrote it. A path under the *longest*
-/// matching root wins — roots can nest on a customised install, and the
-/// shortest match would silently file a path under the wrong tree.
-pub fn to_manifest_path(roots: &SyncRoots, abs: &Path) -> Result<String> {
-    crate::sync::push::packer::manifest_path(roots, abs)
-}
 
 /// Resolve one manifest entry against *this* machine's roots.
 ///
@@ -180,6 +174,7 @@ pub fn accept_for_write(rel: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::push;
     use tempfile::TempDir;
 
     /// Two machines. Same bundle, different usernames — which is the entire
@@ -214,7 +209,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let roots = machine(dir.path(), "alice");
         for path in realistic(&roots) {
-            let wire = to_manifest_path(&roots, &path).expect("a path under a root");
+            let wire = push::packer::manifest_path(&roots, &path).expect("a path under a root");
             let back = from_manifest_path(&roots, &wire).expect("its own spelling resolves");
             assert_eq!(back, path, "round trip through {wire:?}");
         }
@@ -227,7 +222,7 @@ mod tests {
         let bob = machine(dir.path(), "bob");
 
         for path in realistic(&alice) {
-            let wire = to_manifest_path(&alice, &path).unwrap();
+            let wire = push::packer::manifest_path(&alice, &path).unwrap();
             let on_bob = from_manifest_path(&bob, &wire).unwrap();
             assert!(
                 on_bob.starts_with(dir.path().join("Users/bob")),
@@ -245,7 +240,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let roots = machine(dir.path(), "alice");
         for path in realistic(&roots) {
-            let wire = to_manifest_path(&roots, &path).unwrap();
+            let wire = push::packer::manifest_path(&roots, &path).unwrap();
             assert!(!wire.starts_with('/'), "{wire:?} is absolute");
             assert!(!wire.contains("alice"), "{wire:?} names the pushing user");
         }
@@ -256,7 +251,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let roots = machine(dir.path(), "alice");
         let stray = dir.path().join("etc/shadow");
-        let err = to_manifest_path(&roots, &stray).expect_err("under none of the roots");
+        let err = push::packer::manifest_path(&roots, &stray).expect_err("under none of the roots");
         assert!(
             err.to_string().contains("shadow"),
             "the error must name the path: {err}"
@@ -279,7 +274,7 @@ mod tests {
             home.join("nested/claude"),
         );
         let inside = roots.claude_home.join("projects/x.jsonl");
-        let wire = to_manifest_path(&roots, &inside).unwrap();
+        let wire = push::packer::manifest_path(&roots, &inside).unwrap();
         assert_eq!(wire, "claude-home/projects/x.jsonl");
         assert_eq!(from_manifest_path(&roots, &wire).unwrap(), inside);
     }
@@ -350,7 +345,7 @@ mod tests {
         let roots = machine(dir.path(), "alice");
         for (name, resolve) in ROOT_PREFIXES {
             let under = resolve(&roots).join("probe.json");
-            let wire = to_manifest_path(&roots, &under)
+            let wire = push::packer::manifest_path(&roots, &under)
                 .unwrap_or_else(|e| panic!("the push side refuses the {name} root: {e}"));
             assert_eq!(
                 wire,
