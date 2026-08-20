@@ -69,7 +69,7 @@ These apply to **every** phase and are not restated per phase. A phase that viol
 - [ ] **Phase 3: GitHub Auth and the Private-Repo Gate** - Paired and verified private, before any byte moves
 - [ ] **Phase 4: Push — Packs, Atomic Flip, GC, Rekey** - The bundle reaches the repo, atomically and boundedly
 - [ ] **Phase 5: Pull and Restore** - A second machine reproduces the state, reversibly
-- [ ] **Phase 6: Surfaces and Ship** - TUI + macOS menu bar, exit-0 invariant, release
+- [x] **Phase 6: Surfaces and Ship** - TUI + macOS menu bar, exit-0 invariant, release (completed 2026-08-20)
 
 ---
 
@@ -638,18 +638,18 @@ gate.
 5. The README documents the fine-grained PAT recipe and states plainly that there is no password
    recovery and that changing the password is not revocation.
 
-**Plans:** 5 plans across 3 waves (3 / 1 / 1). Wave 1's tracer freezes the
+**Plans:** 5/5 plans complete
 `sync status --json` key set, so the wave-2 menu-bar plan parses a contract it never has to
 re-derive. No two plans in a wave share a file: 6-01 owns the Swift pair plus the sync CLI,
 6-03 owns the widget, 6-04 owns the TUI.
 
 Plans:
 
-- [ ] 6-01-PLAN.md — wave 1 — `sync status --json` end to end into a menu-bar state row (tracer, D-01/D-03/D-04)
-- [ ] 6-03-PLAN.md — wave 1 — the widget exit-0 gate: injected sync-shaped failures, plus a structural unreachability test (UX-06, D-03)
-- [ ] 6-04-PLAN.md — wave 1 — the TUI Sync section: category toggles and last-sync through the overlay's one `toml_edit` save path (D-04)
-- [ ] 6-02-PLAN.md — wave 2 — menu-bar push/pull triggers and the CLI's non-interactive refusal (UX-05, D-01/D-02)
-- [ ] 6-05-PLAN.md — wave 3 — README limits, the release checklist, and both `.SRCINFO`s regenerated before tagging *(checkpoint; the tag is a human action)*
+- [x] 6-01-PLAN.md — wave 1 — `sync status --json` end to end into a menu-bar state row (tracer, D-01/D-03/D-04)
+- [x] 6-03-PLAN.md — wave 1 — the widget exit-0 gate: injected sync-shaped failures, plus a structural unreachability test (UX-06, D-03)
+- [x] 6-04-PLAN.md — wave 1 — the TUI Sync section: category toggles and last-sync through the overlay's one `toml_edit` save path (D-04)
+- [x] 6-02-PLAN.md — wave 2 — menu-bar push/pull triggers and the CLI's non-interactive refusal (UX-05, D-01/D-02)
+- [x] 6-05-PLAN.md — wave 3 — README limits, the release checklist, and both `.SRCINFO`s regenerated before tagging *(checkpoint; the tag is a human action)*
 
 **Note:** `sync status` ships text-only today. 6-01 adds `--json` as the surfaces' contract;
 that is Phase 6 work, not an assumption about Phases 3–5. Where a plan needs a field Phases
@@ -731,7 +731,7 @@ Assignment notes where a requirement could have gone elsewhere:
 | 3. GitHub Auth and the Private-Repo Gate | 0/7 | Planned | - |
 | 4. Push — Packs, Atomic Flip, GC, Rekey | 0/7 | Planned | - |
 | 5. Pull and Restore | 8/8 | In Progress|  |
-| 6. Surfaces and Ship | 0/5 | Planned | - |
+| 6. Surfaces and Ship | 5/5 | Complete   | 2026-08-20 |
 
 **Security audits required:** Phases 1, 2, 3, 4, 5.
 

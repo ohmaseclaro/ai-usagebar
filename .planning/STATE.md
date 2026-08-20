@@ -2,18 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-current_phase: 5
-current_phase_name: pull-and-restore
-status: executing
-stopped_at: Completed 5-08-PLAN.md — phase 5 complete
-last_updated: "2026-08-20T04:56:33.281Z"
-last_activity: 2026-08-19
-last_activity_desc: Phase 5 complete — sync pull exists and the two-machine e2e passes
+status: verifying
+stopped_at: Completed 6-05-PLAN.md — release prepared at 1.2.0, NOT tagged (fork/upstream divergence)
+last_updated: "2026-08-20T06:47:25.094Z"
+last_activity: 2026-08-20
 progress:
   total_phases: 6
-  completed_phases: 5
-  total_plans: 49
-  completed_plans: 49
+  completed_phases: 6
+  total_plans: 43
+  completed_plans: 48
+  percent: 100
 ---
 
 # Project State
@@ -31,10 +29,10 @@ usage as another's.
 
 Phase: 5 (pull-and-restore) — complete, all 8 merged
 Plan: 8 of 8 merged in phase 5
-Status: phases 1-5 code-complete; 1, 3 and 4 audited; phase 6 next
-Last activity: 2026-08-20 — Phase 5 closed
+Status: Phase complete — ready for verification
+Last activity: 2026-08-20
 
-Progress: [█████████░] ~88% (phase 5 complete, phase 6 next)
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
@@ -60,6 +58,7 @@ Progress: [█████████░] ~88% (phase 5 complete, phase 6 next)
 | Plan | Duration | Tasks | Files |
 |------|----------|-------|-------|
 | Phase 5 P08 | ~2h | 3 tasks | 4 files |
+| Phase 6 P05 | ~2h | 2 tasks | 10 files |
 
 ## Accumulated Context
 
@@ -95,6 +94,7 @@ Milestone-shaping decisions made during setup:
 - [Phase ?]: 5-08: the e2e fixture is built by driving push::run, so every adversarial case is one mutation of a bundle the real push side produced
 - [Phase ?]: 5-08: root B's four sync roots all have different leaf names from A's — the only thing that proves the manifest path encoding is relocatable rather than accidentally identical
 - [Phase ?]: 5-08: no TDD RED gate on a plan that asserts already-merged behaviour; four negative controls in src/ (all reverted) are the equivalent evidence
+- [Phase ?]: Release prepared at 1.2.0 but NOT tagged: v1.2.0/v1.3.0/v1.3.1 already exist as upstream tags and are not ancestors of our main. Version number and release target are a maintainer decision (6-05)
 
 ### Pending Todos
 
@@ -116,6 +116,7 @@ None yet.
 
 - README.md's Sync section does not mention `sync pull` — the command a second machine's owner types is absent from the entry-point doc (5-08 was scoped to tests/ and docs/; four lines of work)
 - src/sync/restore/fetch.rs:60 derives MAX_SNAPSHOTS_IN_POINTER from a 'monthly retention tail' that does not exist in the code; the value is fine, the justification is not
+- Tag blocked: the fork diverged from akitaonrails/ai-usagebar. v1.2.0 is taken; both PKGBUILDs' url= resolves to upstream, so an AUR build would ship upstream's code. Maintainer must pick the release target, the version number, and whether to rebase onto upstream v1.3.1 first (6-05-SUMMARY)
 
 ## Deferred Items
 
@@ -125,8 +126,8 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-08-20T04:56:25.738Z
-Stopped at: Completed 5-08-PLAN.md — phase 5 complete
+Last session: 2026-08-20T06:47:16.129Z
+Stopped at: Completed 6-05-PLAN.md — release prepared at 1.2.0, NOT tagged (fork/upstream divergence)
 SUMMARY). Nothing implemented yet.
 Resume file: None
 
@@ -281,6 +282,7 @@ gates are offered.
 - `layout::to_manifest_path`: a one-line mirror of `push::packer::manifest_path` that only tests
   called — so the *drift test* compared a copy against itself. Deleted; the round-trip tests call
   the real encoder.
+
 - `RestoreOptions::force_rehash`: written by the `Pull` dispatch, read nowhere. Deleted.
 
 Ten instances now. Both of these were found by **enumerating production call sites of everything
@@ -289,9 +291,11 @@ is now part of every phase's exit, and it is the only check in this milestone th
 caught this class.
 
 Two related refusals, both correct and both worth keeping as precedent:
+
 - `5-07` refused to put `--force-rehash` on `sync pull`: restore hashes what is on disk and never
   consults the index, so the flag would have no reader. **A flag with no reader is the same
   defect as a printed command that does not exist.**
+
 - `5-02` refused the plan's `MAX_RESTORE_BYTES = MAX_PACKS_PER_RESTORE * PACK_MAX`: the count
   check refuses at 513 packs, so that sum is unreachable and the check would be dead code. The
   two now bound different resources and each is reached by its own test.
