@@ -155,8 +155,24 @@ pub async fn ensure_keyfile(
     release_id: u64,
     permit: &gate::Pushing,
 ) -> Result<()> {
-    // Filled in by the next commit, against the tests that describe it.
-    let _ = (ctx, release_id, permit);
+    let bytes = canonical_keyfile(ctx)?;
+    let name = keyfile_asset_name(&content_address(&bytes));
+    let existing = ctx
+        .client
+        .list_assets(ctx.repo, release_id, ctx.now)
+        .await?;
+    match decide(&existing, &name, bytes.len() as u64) {
+        Decision::Present => return Ok(()),
+        Decision::Torn(asset_id) => {
+            ctx.client
+                .delete_asset(ctx.repo, asset_id, permit, ctx.now)
+                .await?;
+        }
+        Decision::Absent => {}
+    }
+    ctx.client
+        .upload_asset(ctx.repo, release_id, &name, bytes, permit, ctx.now)
+        .await?;
     Ok(())
 }
 
@@ -168,7 +184,6 @@ pub async fn ensure_keyfile(
 /// because the on-disk form is pretty-printed and the asset name addresses the
 /// compact one. No password is involved: this reads the wrapped blob and does
 /// not open it.
-#[allow(dead_code)]
 fn canonical_keyfile(ctx: &PushCtx<'_>) -> Result<Vec<u8>> {
     let path = crate::sync::cli::keyfile_path(ctx.roots);
     let raw = std::fs::read(&path).map_err(|e| AppError::io_at(&path, e))?;
