@@ -8,12 +8,12 @@ status: executing
 stopped_at: Milestone artifacts written (PROJECT, REQUIREMENTS, ROADMAP, STATE, research×3 +
 last_updated: "2026-08-19T16:50:50.537Z"
 last_activity: 2026-08-19
-last_activity_desc: Phase 5 waves 1-2 merged; 4-08 remediation in flight
+last_activity_desc: Phase 5 code complete but for 5-08; sync pull exists
 progress:
   total_phases: 6
   completed_phases: 3
   total_plans: 44
-  completed_plans: 40
+  completed_plans: 48
 ---
 
 # Project State
@@ -29,13 +29,13 @@ usage as another's.
 
 ## Current Position
 
-Phase: 5 (pull-and-restore) — waves 1 and 2 merged
-Plan: 6 of 8 merged in phase 5
+Phase: 5 (pull-and-restore) — 7 of 8 merged, 5-08 in flight
+Plan: 7 of 8 merged in phase 5
 Status: phases 1-3 code-complete + audited; phase 4 executing
 Last activity: 2026-08-19 — Phase 1 execution started
 and reconciled, REQUIREMENTS.md (37 v1) and ROADMAP.md (6 phases) written
 
-Progress: [███████░░░] ~72% (4 of 6 phases, phase 5 in flight)
+Progress: [████████░░] ~80% (phase 5 closing, phase 6 next)
 
 ## Performance Metrics
 
@@ -246,3 +246,35 @@ list order decided — the thing T-5-15 requires to be inert. Ties were assumed 
 bytes, with a test that runs both orders and asserts they agree.
 
 Two plans, opposite ends of the wire, same defect. Neither could have seen it alone.
+
+## `ai-usagebar sync pull` exists, and the gate order is the safety property
+
+`restore::run(apply:false)` → apply gate → credential gate → `restore::run(apply:true)`, which
+takes the backup and only then writes. **Both gates precede `backup::take`**, so a decline leaves
+neither an archive nor a write — asserted by walking the roots *and* the backups directory.
+
+**The stdin collision, resolved deliberately.** Both gates read stdin and `cli.rs` already reads
+the sync passphrase from it; piped, they interleave and each consumes the other's line. One
+`is_terminal()` read now decides both owners: piped, the password owns the stream and the gates
+get no reader at all (a piped run answers by flag); on a terminal, sequential reads and both
+gates are offered.
+
+## The defect class — instances 9 and 10, and the shape of the check that finds them
+
+- `layout::to_manifest_path`: a one-line mirror of `push::packer::manifest_path` that only tests
+  called — so the *drift test* compared a copy against itself. Deleted; the round-trip tests call
+  the real encoder.
+- `RestoreOptions::force_rehash`: written by the `Pull` dispatch, read nowhere. Deleted.
+
+Ten instances now. Both of these were found by **enumerating production call sites of everything
+the phase added** — not by any test, because each had passing tests of its own. That enumeration
+is now part of every phase's exit, and it is the only check in this milestone that has ever
+caught this class.
+
+Two related refusals, both correct and both worth keeping as precedent:
+- `5-07` refused to put `--force-rehash` on `sync pull`: restore hashes what is on disk and never
+  consults the index, so the flag would have no reader. **A flag with no reader is the same
+  defect as a printed command that does not exist.**
+- `5-02` refused the plan's `MAX_RESTORE_BYTES = MAX_PACKS_PER_RESTORE * PACK_MAX`: the count
+  check refuses at 513 packs, so that sum is unreachable and the check would be dead code. The
+  two now bound different resources and each is reached by its own test.
