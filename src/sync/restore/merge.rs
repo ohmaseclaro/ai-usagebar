@@ -1,41 +1,145 @@
 //! Every manifest entry, turned into exactly one decision.
 //!
-//! Plan 5-03 owns this module. The bodies below are `todo!()` until the tests
-//! beneath them say what they must do.
+//! **Nothing is dropped on the floor.** An entry whose path is refused, whose
+//! policy excludes it, or whose destination this machine will not write is
+//! still an [`ItemPlan`] — with no `dest` and a [`Disposition`] that says why —
+//! because a silently discarded entry is a tampered bundle nobody can see (D6,
+//! T-5-21).
+//!
+//! Nothing here writes. [`plan`] reads local metadata and local bytes and
+//! returns a decision; `write::apply` is the only module that touches a
+//! destination, and it is unreachable without `RestoreOptions::apply` (D1).
+//!
+//! # Digest before timestamp, always
+//!
+//! Identity is decided by comparing the manifest's ordered chunk ids against
+//! the local file's, and it short-circuits everything else — including both
+//! consents. That is D7: re-running an interrupted restore must report the
+//! conflicts it genuinely has, which is none. A timestamp check running first
+//! would turn every already-restored file into a `SkipLocalNewer` and make a
+//! resumed restore look like a disaster.
+//!
+//! The local chunk ids are hashed **off the disk**, with the same
+//! [`Keys::chunk_id`] and the same [`CHUNK_SIZE`] buffers the push side used,
+//! so an untouched file is recognised as identical across two machines. The
+//! local SQLite index is deliberately never consulted: it is a cache keyed on
+//! the *push* side's stat tuple, and one stale row would declare a file the
+//! user has since edited identical and skip it (T-5-24).
+//!
+//! # The remote timestamp is the snapshot's, one value for every item
+//!
+//! [`crate::sync::model::FileEntry`] carries `path`, `mode`, `true_len` and the
+//! chunk ids — **no mtime** — so the remote side of every comparison is
+//! `Root::created_at`, when the snapshot was captured. Adding a per-file mtime
+//! is a `MANIFEST_VERSION` bump to an already-shipping wire format for a
+//! refinement nothing yet needs; the upgrade path, for whoever needs
+//! sub-snapshot granularity, is a per-file `mtime_ns` under `MANIFEST_VERSION`
+//! 3, read here in preference to `created_at` when present.
+//!
+//! `created_at` is when the remote copy was captured, so "local mtime is after
+//! the capture" is exactly "this machine changed it since". Plan 5-04 makes
+//! that exact rather than merely conservative by stamping every restored file's
+//! mtime to that same `created_at`: a restored-then-untouched file compares
+//! equal, not newer, so the next pull of a newer snapshot updates it cleanly.
+//!
+//! ## What the comparison assumes, and what a wrong guess costs
+//!
+//! Both timestamps come from **different machines' clocks** — `created_at` from
+//! whichever laptop pushed, the mtime from this one — so the assumption is only
+//! that the two are within a snapshot's age of each other, which NTP makes true
+//! and a few seconds of drift does not break. It can still be wrong in either
+//! direction, so neither direction is allowed to be destructive:
+//!
+//! - **This clock runs fast** (or the pusher's runs slow): an unchanged local
+//!   file looks newer, so it is skipped and named in the report. The user
+//!   re-runs with `--force`. A skip costs a second command.
+//! - **This clock runs slow**: a locally-changed file looks older and is
+//!   updated. That is the direction that loses data, and it is why D3's backup
+//!   is taken before the first byte even when nothing looked like a conflict,
+//!   and why every overwritten item is named in the outcome. The recovery is
+//!   the `tar -xzf` line [`crate::sync::restore::BackupRecord::rollback_command`]
+//!   prints.
+//!
+//! Digest-first is what keeps drift cheap in practice: a file that did not
+//! change is `SkipIdentical` before either clock is read, so only genuinely
+//! diverged files can be misjudged at all.
+//!
+//! # Credentials get the strictest arm
+//!
+//! A locally-newer credential under `force` is [`Disposition::NeedsCredentialConfirm`],
+//! never `Overwrite`; only `force_credentials` **alongside** `force` promotes
+//! it. Silently reverting a live rotating OAuth token to a stale one is a
+//! failure this project has already shipped once, in the
+//! two-stores-fighting-over-a-refresh-token form, and a third path into that
+//! family is not being built. A credential that is *not* locally newer is an
+//! ordinary `Update`: the second consent guards the loss, not the category.
+//!
+//! # Restore never plans a deletion
+//!
+//! A local file the manifest does not mention is left exactly as it is. That is
+//! a decision, not an omission: a snapshot is what one machine had, not an
+//! assertion about what every machine should have. The `synced.json` baseline
+//! [`crate::claude_desktop::merge`] uses to tell a deletion from "never had it"
+//! is the right machinery for a future selective restore (REC-02, deferred to
+//! v2); reaching for it here would build a second reconciliation model for a
+//! case v1 does not have.
+//!
+//! Owned by plan 5-03.
 
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
+use zeroize::Zeroizing;
 
 use crate::config::SyncCategory;
 use crate::error::Result;
+use crate::sync::CHUNK_SIZE;
 use crate::sync::crypto::{ChunkId, Keys};
 use crate::sync::model::{FileEntry, IndexObject};
 
-use super::{
-    Disposition, ItemPlan, PackSource, Resolved, RestoreCtx, RestoreOptions, RestorePlan, layout,
-};
+use super::{Disposition, ItemPlan, Resolved, RestoreCtx, RestoreOptions, RestorePlan, layout};
+
+/// The file name that makes an entry credential-bearing whatever category it
+/// was collected under — `~/.claude/.credentials.json` and every
+/// `accounts/<name>/.credentials.json` beside the config.
+const CREDENTIAL_FILE: &str = ".credentials.json";
 
 /// What this machine has at a destination.
 struct LocalFacts {
     mtime: DateTime<Utc>,
+    /// The file's ordered chunk ids, or `None` when identity could not be — or
+    /// need not be — established: an unreadable file, or one whose length
+    /// already differs from the manifest's.
+    ///
+    /// `None` rather than an empty list on purpose. A zero-byte manifest entry
+    /// has no chunks either, and an unreadable file that compared equal to it
+    /// would be skipped as "identical" without a byte ever having been read.
     chunk_ids: Option<Vec<ChunkId>>,
 }
 
-/// What the snapshot has.
+/// What the snapshot has. `created_at` is the snapshot's, not the file's — see
+/// the module doc.
 struct RemoteFacts<'a> {
     chunk_ids: &'a [ChunkId],
     created_at: DateTime<Utc>,
 }
 
-/// The destination as it is right now.
+/// The destination as it stands right now.
 enum Local {
+    /// Nothing there. The common case on a fresh machine.
     Absent,
+    /// Something there that this restore will not write over, and why.
     Refused(String),
     File(LocalFacts),
 }
 
-/// Decide about every file in the snapshot.
+/// Decide about every file in the snapshot, writing nothing.
+///
+/// Manifest order is preserved and the count is exact: N entries in, N
+/// [`ItemPlan`]s out.
 pub fn plan(ctx: &RestoreCtx<'_>, resolved: &Resolved) -> Result<RestorePlan> {
     let keys = resolved.packs.keys();
     let created_at = resolved.root.created_at;
@@ -69,6 +173,12 @@ pub fn plan(ctx: &RestoreCtx<'_>, resolved: &Resolved) -> Result<RestorePlan> {
     })
 }
 
+/// Policy, then path, then the destination, then [`decide`].
+///
+/// The policy check runs on the **manifest path**, before any resolution, so a
+/// bundle naming machine-bound state is refused whatever root it claims (D4).
+/// Both refusals keep `dest: None`, which is the frozen contract for
+/// [`Disposition::ExcludedByPolicy`] and [`Disposition::RejectedPath`].
 fn decide_entry(
     ctx: &RestoreCtx<'_>,
     keys: &Keys,
@@ -76,33 +186,208 @@ fn decide_entry(
     category: SyncCategory,
     created_at: DateTime<Utc>,
 ) -> (Option<PathBuf>, Disposition) {
-    let _ = (ctx, keys, file, category, created_at);
-    todo!("plan 5-03")
+    if !layout::accept_for_write(Path::new(&file.path)) {
+        return (None, Disposition::ExcludedByPolicy);
+    }
+    let dest = match layout::from_manifest_path(ctx.roots, &file.path) {
+        Ok(dest) => dest,
+        Err(why) => return (None, Disposition::RejectedPath(why.to_string())),
+    };
+
+    let local = match local_at(&dest, file, keys) {
+        Local::Absent => None,
+        Local::File(facts) => Some(facts),
+        // A destination this machine will not write over. `RejectedPath` is the
+        // only variant that carries a reason, and no consent promotes it —
+        // which is the point for the symlink case (T-5-22).
+        Local::Refused(why) => return (None, Disposition::RejectedPath(why)),
+    };
+
+    let remote = RemoteFacts {
+        chunk_ids: &file.chunks,
+        created_at,
+    };
+    let disposition = decide(
+        local.as_ref(),
+        &remote,
+        credential_bearing(&file.path, category),
+        &ctx.opts,
+    );
+    (Some(dest), disposition)
 }
 
+/// The whole decision, pure: local stat facts, the manifest entry and the
+/// snapshot time arrive as arguments, so every branch is tested without a
+/// filesystem and without a clock.
 fn decide(
     local: Option<&LocalFacts>,
     remote: &RemoteFacts<'_>,
     credential: bool,
     opts: &RestoreOptions,
 ) -> Disposition {
-    let _ = (local, remote, credential, opts);
-    todo!("plan 5-03")
+    let Some(local) = local else {
+        return Disposition::Create;
+    };
+
+    // D7, and it runs before either clock is read.
+    if local.chunk_ids.as_deref() == Some(remote.chunk_ids) {
+        return Disposition::SkipIdentical;
+    }
+
+    let (local_mtime, remote_mtime) = (local.mtime, remote.created_at);
+    // Equal is not newer: a file 5-04 restored and nobody touched carries the
+    // snapshot's own timestamp, and must update rather than look like a
+    // conflict against the next snapshot.
+    if local_mtime <= remote_mtime {
+        return Disposition::Update;
+    }
+    if !opts.force {
+        return Disposition::SkipLocalNewer {
+            local_mtime,
+            remote_mtime,
+        };
+    }
+    if credential && !opts.force_credentials {
+        return Disposition::NeedsCredentialConfirm {
+            local_mtime,
+            remote_mtime,
+        };
+    }
+    Disposition::Overwrite {
+        local_mtime,
+        remote_mtime,
+    }
 }
 
+/// Would overwriting this entry cost a live secret?
+///
+/// The whole profile store, plus any `.credentials.json` under any root. The
+/// file-name half is what catches `config/accounts/*/.credentials.json`, which
+/// `scope` collects under [`SyncCategory::Config`] alongside `config.toml`, and
+/// `claude-home/.credentials.json`, which it would file under `Routines` — a
+/// category-only rule would miss both.
 fn credential_bearing(manifest_path: &str, category: SyncCategory) -> bool {
-    let _ = (manifest_path, category);
-    todo!("plan 5-03")
+    category == SyncCategory::Credentials
+        || manifest_path
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| name == CREDENTIAL_FILE)
 }
 
+/// Stat the destination and, when it is a plain file, hash it.
+///
+/// [`fs::symlink_metadata`] and never [`fs::metadata`]: a link planted at a
+/// destination must be *seen* as a link rather than followed to whatever it
+/// points at, which is the difference between refusing a write and performing
+/// it somewhere the bundle chose (T-5-22). It is the only stat call in this
+/// module.
+///
+/// Anything that is not a regular file — a link, a directory, a socket, a
+/// device node — is refused by name. Nothing here clamps or repairs it: the
+/// user is told what is in the way and decides.
 fn local_at(dest: &Path, entry: &FileEntry, keys: &Keys) -> Local {
-    let _ = (dest, entry, keys);
-    todo!("plan 5-03")
+    let md = match fs::symlink_metadata(dest) {
+        Ok(md) => md,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Local::Absent,
+        Err(e) => {
+            return Local::Refused(format!("{} could not be examined: {e}", dest.display()));
+        }
+    };
+
+    if let Some(what) = not_a_plain_file(&md) {
+        return Local::Refused(format!(
+            "{} is {what}, and restore writes only over a regular file",
+            dest.display()
+        ));
+    }
+
+    let mtime = match md.modified() {
+        Ok(t) => DateTime::<Utc>::from(t),
+        Err(e) => {
+            return Local::Refused(format!(
+                "{} has no readable modification time, so it cannot be shown to be older \
+                 than the snapshot: {e}",
+                dest.display()
+            ));
+        }
+    };
+
+    Local::File(LocalFacts {
+        mtime,
+        chunk_ids: chunk_ids_of(dest, md.len(), entry, keys),
+    })
 }
 
+/// The kind of thing in the way, or `None` for an ordinary file.
+fn not_a_plain_file(md: &fs::Metadata) -> Option<&'static str> {
+    if md.file_type().is_symlink() {
+        Some("a symbolic link")
+    } else if md.is_dir() {
+        Some("a directory")
+    } else if md.is_file() {
+        None
+    } else {
+        Some("neither a regular file nor a directory")
+    }
+}
+
+/// The local file's ordered chunk ids, or `None` when it is pointless or
+/// impossible to compute them.
+///
+/// The length check first: a file whose size differs from the manifest's
+/// `true_len` cannot share its chunk ids, and learning that from the stat
+/// beats reading a 50 MB transcript to reach the same answer.
+fn chunk_ids_of(path: &Path, size: u64, entry: &FileEntry, keys: &Keys) -> Option<Vec<ChunkId>> {
+    if size != entry.true_len {
+        return None;
+    }
+    let mut file = fs::File::open(path).ok()?;
+    let mut ids = Vec::new();
+    // Zeroizing: these are the plaintext bytes of, among other things, a live
+    // OAuth token. One buffer, reused, wiped on the way out.
+    let mut buf: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(CHUNK_SIZE));
+    loop {
+        buf.clear();
+        file.by_ref()
+            .take(CHUNK_SIZE as u64)
+            .read_to_end(&mut buf)
+            .ok()?;
+        if buf.is_empty() {
+            break;
+        }
+        ids.push(keys.chunk_id(&buf));
+        // A short read is EOF: `Take::read_to_end` fills otherwise.
+        if buf.len() < CHUNK_SIZE {
+            break;
+        }
+    }
+    Some(ids)
+}
+
+/// The packs a real run would download, and their sealed size.
+///
+/// Counted from the items that will **actually be written**, never from every
+/// entry in the manifest: a figure that counted skipped items would overstate
+/// the cost of the operation, which is the direction that makes a safe restore
+/// look alarming.
+///
+/// One `HashMap` pass rather than a `IndexObject::resolve` per chunk, which its
+/// own doc asks of a caller resolving thousands of ids against one index.
 fn to_fetch(index: &IndexObject, items: &[ItemPlan]) -> (usize, u64) {
-    let _ = (index, items);
-    todo!("plan 5-03")
+    let pack_of: HashMap<ChunkId, ChunkId> = index.entries.iter().map(|e| (e.id, e.pack)).collect();
+    let needed: HashSet<ChunkId> = items
+        .iter()
+        .filter(|item| item.disposition.writes())
+        .flat_map(|item| item.chunks.iter())
+        .filter_map(|id| pack_of.get(id).copied())
+        .collect();
+    let bytes = index
+        .entries
+        .iter()
+        .filter(|e| needed.contains(&e.pack))
+        .map(|e| u64::from(e.clen))
+        .sum();
+    (needed.len(), bytes)
 }
 
 /// Which category a bundle path belongs to, from its root prefix and the shape
@@ -122,11 +407,12 @@ fn category_of(manifest_path: &str) -> SyncCategory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sync::{CHUNK_SIZE, SyncRoots};
     use crate::sync::crypto::{KdfParams, Keyfile};
     use crate::sync::github::token::TokenSource;
     use crate::sync::github::{Client, Endpoints, RepoRef};
     use crate::sync::model::{IndexEntry, Manifest, Root};
+    use crate::sync::restore::PackSource;
+    use crate::sync::{CHUNK_SIZE, SyncRoots};
     use std::fs;
     use std::time::{Duration, SystemTime};
     use tempfile::TempDir;
@@ -488,7 +774,9 @@ mod tests {
             fs::create_dir_all(dest.parent().unwrap()).unwrap();
             fs::write(&dest, body).unwrap();
             let at = SystemTime::UNIX_EPOCH
-                + Duration::from_nanos(u64::try_from(mtime.timestamp_nanos_opt().unwrap()).unwrap());
+                + Duration::from_nanos(
+                    u64::try_from(mtime.timestamp_nanos_opt().unwrap()).unwrap(),
+                );
             fs::File::options()
                 .write(true)
                 .open(&dest)
@@ -638,10 +926,7 @@ mod tests {
             Disposition::RejectedPath(_)
         ));
 
-        for refused in [
-            "config/bridge-state.json",
-            "config/../../../../etc/shadow",
-        ] {
+        for refused in ["config/bridge-state.json", "config/../../../../etc/shadow"] {
             assert!(
                 by_path(refused).dest.is_none(),
                 "{refused} was handed a destination"
@@ -737,8 +1022,7 @@ mod tests {
     fn a_multi_chunk_file_is_recognised_as_identical() {
         let m = Machine::new();
         let body: Vec<u8> = (0..CHUNK_SIZE + 17).map(|i| (i % 251) as u8).collect();
-        let dest =
-            layout::from_manifest_path(&m.roots, "claude-home/projects/r/s.jsonl").unwrap();
+        let dest = layout::from_manifest_path(&m.roots, "claude-home/projects/r/s.jsonl").unwrap();
         fs::create_dir_all(dest.parent().unwrap()).unwrap();
         fs::write(&dest, &body).unwrap();
 
@@ -783,7 +1067,10 @@ mod tests {
             ("config/config.toml", b"[sync]\n"),              // create,    pack 1
         ]);
         let plan = plan_with(&m, &resolved, RestoreOptions::default());
-        assert_eq!(plan.packs_needed, 1, "the skipped item's pack is not needed");
+        assert_eq!(
+            plan.packs_needed, 1,
+            "the skipped item's pack is not needed"
+        );
         assert_eq!(
             plan.bytes_to_fetch, 101,
             "only pack 1's sealed length is counted"
