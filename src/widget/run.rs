@@ -1235,4 +1235,52 @@ mod tests {
         assert!(!tooltip.contains("owner/name"), "{tooltip}");
         assert_carries_no_secret_shaped_text(&tooltip);
     }
+
+    /// UX-06's real mitigation, and the strongest form of it: the widget's
+    /// render path does not recover well from a backup failure — it cannot
+    /// reach one at all. The claim is scoped to the render path, not to the
+    /// binary: `ai-usagebar` is a single binary carrying both the backup
+    /// subcommand and this path, so "the binary does not link it" would be
+    /// false. What the two genuinely share is the config file on disk, and
+    /// that is what the fixtures above cover.
+    ///
+    /// **These three files are the whole render path.** `run_once` calls
+    /// `print_pretty` on every non-JSON render, so `pretty.rs` counts as much
+    /// as `run.rs` and `render.rs` do. A refactor that adds a fourth file has
+    /// to add it here too.
+    #[test]
+    fn the_render_path_holds_no_reference_to_the_encrypted_backup_module() {
+        // Assembled at runtime rather than written as literals, so this file
+        // cannot contain the very text it forbids — a literal here would trip
+        // the gate on the test guarding it. Do not "simplify" these back.
+        // Ceiling: this catches `crate::sync…` and `sync::…`, the two spellings
+        // reachable from a direct or a grouped `use`. A rename of the module
+        // has to be reflected here.
+        let forbidden = [format!("crate{}{}", "::", "sync"), format!("{}::", "sync")];
+        for (file, source) in [
+            ("run.rs", include_str!("run.rs")),
+            ("render.rs", include_str!("render.rs")),
+            ("pretty.rs", include_str!("pretty.rs")),
+        ] {
+            let code = source
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            // Without this the gate passes just as happily against an empty
+            // string, which is how a structural check rots into decoration.
+            assert!(
+                code.contains("WaybarOutput"),
+                "{file} did not read back as the file this gate is meant to check"
+            );
+            for path in &forbidden {
+                assert!(
+                    !code.contains(path.as_str()),
+                    "{file} references {path:?}: the widget render path must not be \
+                     able to reach the encrypted-backup module, because a failure \
+                     there would then be able to take the status bar down"
+                );
+            }
+        }
+    }
 }
