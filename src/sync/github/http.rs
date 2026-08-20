@@ -543,7 +543,10 @@ mod tests {
         assert!(at(500, &[], &"x".repeat(1_000_000)).to_string().len() < 400);
         assert!(actionable(&at(500, &[], &"x".repeat(1_000_000))).len() < 800);
         // A tab inside GitHub's own `message` — the JSON branch is sanitized too.
-        assert_eq!(message_of(br#"{"message":"a\tb"}"#), r#"GitHub said: "a b""#);
+        assert_eq!(
+            message_of(br#"{"message":"a\tb"}"#),
+            r#"GitHub said: "a b""#
+        );
         // Raw ESC/BEL make the body invalid JSON, so it falls to the lossy branch —
         // which is where a hostile non-JSON body arrives. Still defanged.
         assert_eq!(

@@ -481,7 +481,7 @@ mod tests {
                 uploads_base: base.into(),
             },
             &TokenChain {
-                env_value: Some(TOKEN.into()),
+                env_value: Some(zeroize::Zeroizing::new(TOKEN.into())),
                 ..TokenChain::default()
             },
             DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
@@ -503,7 +503,7 @@ mod tests {
                 uploads_base: base.into(),
             },
             &TokenChain {
-                env_value: Some(TOKEN.into()),
+                env_value: Some(zeroize::Zeroizing::new(TOKEN.into())),
                 ..TokenChain::default()
             },
             NOW,
@@ -583,7 +583,7 @@ mod tests {
                     uploads_base: server.url(),
                 },
                 &TokenChain {
-                    env_value: Some(TOKEN.into()),
+                    env_value: Some(zeroize::Zeroizing::new(TOKEN.into())),
                     ..TokenChain::default()
                 },
                 &mut Double(std::rc::Rc::clone(&script)),

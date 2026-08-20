@@ -560,7 +560,7 @@ mod tests {
 
     fn chain() -> token::TokenChain {
         token::TokenChain {
-            env_value: Some(FIXTURE.into()),
+            env_value: Some(Zeroizing::new(FIXTURE.into())),
             ..token::TokenChain::default()
         }
     }

@@ -19,7 +19,16 @@
 //!
 //! The value is a [`Zeroizing<String>`] end to end, and **no type here derives
 //! `Debug` while holding it**. It is never logged, not even a prefix: only its
-//! [`TokenSource`] is ever reported.
+//! [`TokenSource`] is ever reported. "End to end" is the literal claim: every
+//! field, every injected closure's return type, and every buffer a source reads
+//! into is a `Zeroizing<String>`, so a value that entered the chain is wiped
+//! when it leaves it — the sentence used to be true only of `resolve`'s return
+//! value, with four plain `String`s behind it (F-9).
+//!
+//! The one boundary this module cannot own is `security(1)`'s output, which
+//! [`crate::anthropic::keychain`] hands back as a plain `String`;
+//! [`keychain::read_raw`](super::keychain::read_raw) wraps it on the first line
+//! it can, so the plain copy lives for one move and no allocation is copied.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -66,12 +75,12 @@ impl TokenSource {
 /// No `Debug`: `env_value` holds the token itself.
 #[derive(Default)]
 pub struct TokenChain {
-    pub env_value: Option<String>,
+    pub env_value: Option<Zeroizing<String>>,
     #[allow(clippy::type_complexity)]
-    pub keychain: Option<Box<dyn Fn() -> Result<Option<String>>>>,
+    pub keychain: Option<Box<dyn Fn() -> Result<Option<Zeroizing<String>>>>>,
     pub file_path: Option<PathBuf>,
     #[allow(clippy::type_complexity)]
-    pub gh: Option<Box<dyn Fn() -> Result<Option<String>>>>,
+    pub gh: Option<Box<dyn Fn() -> Result<Option<Zeroizing<String>>>>>,
 }
 
 impl TokenChain {
@@ -80,7 +89,7 @@ impl TokenChain {
     /// installers' machines.
     pub fn production() -> TokenChain {
         TokenChain {
-            env_value: std::env::var(ENV_VAR).ok(),
+            env_value: std::env::var(ENV_VAR).ok().map(Zeroizing::new),
             // Source 2 exists on macOS only. D-02 rejects `keyring`/
             // `secret-service` for the Linux half: it needs a live D-Bus
             // session and fails over SSH, which is precisely the headless
@@ -111,7 +120,7 @@ pub fn resolve(chain: &TokenChain) -> Result<(Zeroizing<String>, TokenSource)> {
     if let Some(path) = &chain.file_path {
         match std::fs::read_to_string(path) {
             Ok(raw) => {
-                if let Some(found) = usable(Some(raw)) {
+                if let Some(found) = usable(Some(Zeroizing::new(raw))) {
                     return Ok((found, TokenSource::File));
                 }
             }
@@ -145,8 +154,8 @@ pub fn resolve(chain: &TokenChain) -> Result<(Zeroizing<String>, TokenSource)> {
 }
 
 /// Trim, and treat an empty result as "this source had nothing".
-fn usable(raw: Option<String>) -> Option<Zeroizing<String>> {
-    let raw = Zeroizing::new(raw?);
+fn usable(raw: Option<Zeroizing<String>>) -> Option<Zeroizing<String>> {
+    let raw = raw?;
     let trimmed = Zeroizing::new(raw.trim().to_owned());
     (!trimmed.is_empty()).then_some(trimmed)
 }
@@ -183,7 +192,16 @@ fn keychain_hint() -> String {
 /// because [`Command::output`] has no timeout of its own, nothing in this
 /// dependency tree adds one, and `resolve` is synchronous — so `tokio::process`
 /// is not reachable from here either.
-fn gh_auth_token() -> Result<Option<String>> {
+///
+/// **Every blocking step is bounded, not just the process** (F-6). Killing `gh`
+/// does not close a stdout pipe that a credential helper `gh` spawned still
+/// holds open, so a `read_to_string` on this thread waited for an EOF that
+/// never came — the watchdog fired, the command hung anyway. The read now runs
+/// on its own thread behind a [`mpsc::Receiver::recv_timeout`], and the exit
+/// status is collected with [`std::process::Child::try_wait`] rather than
+/// `wait`: `wait` holds the mutex the watchdog needs in order to kill, so the
+/// one call that was supposed to be bounded was the one blocking the killer.
+fn gh_auth_token() -> Result<Option<Zeroizing<String>>> {
     let mut cmd = Command::new("gh");
     cmd.args(["auth", "token"])
         .stdin(Stdio::null())
@@ -219,15 +237,43 @@ fn gh_auth_token() -> Result<Option<String>> {
         }
     });
 
-    let mut out = String::new();
-    if let Some(mut pipe) = stdout {
-        let _ = pipe.read_to_string(&mut out);
-    }
-    let exited_zero = child
-        .lock()
-        .ok()
-        .and_then(|mut child| child.wait().ok())
-        .is_some_and(|status| status.success());
+    let (read, out) = mpsc::channel::<Zeroizing<String>>();
+    std::thread::spawn(move || {
+        let mut buf = Zeroizing::new(String::new());
+        if let Some(mut pipe) = stdout {
+            let _ = pipe.read_to_string(&mut buf);
+        }
+        // A dropped receiver means the timeout below already gave up; the
+        // buffer is zeroed here either way.
+        let _ = read.send(buf);
+    });
+    let Ok(out) = out.recv_timeout(GH_TIMEOUT) else {
+        if let Ok(mut child) = child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        return Ok(None);
+    };
+
+    // stdout is at EOF, so `gh` has closed it and is exiting; poll rather than
+    // block, and stop at the same bound. The watchdog above kills anything
+    // still running when this deadline passes, and the kill lands as a status
+    // the next poll collects.
+    let deadline = std::time::Instant::now() + GH_TIMEOUT;
+    let exited_zero = loop {
+        match child
+            .lock()
+            .ok()
+            .and_then(|mut c| c.try_wait().ok())
+            .flatten()
+        {
+            Some(status) => break status.success(),
+            None if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10))
+            }
+            None => break false,
+        }
+    };
     drop(finished);
 
     // `resolve` trims and treats an empty result as "nothing here".
@@ -306,11 +352,11 @@ mod tests {
 
     /// What the two injected fields hold. Nothing in this module's tests goes
     /// near the real Keychain or spawns `gh`.
-    type Source = Option<Box<dyn Fn() -> Result<Option<String>>>>;
+    type Source = Option<Box<dyn Fn() -> Result<Option<Zeroizing<String>>>>>;
 
     fn answering(value: &str) -> Source {
         let value = value.to_owned();
-        Some(Box::new(move || Ok(Some(value.clone()))))
+        Some(Box::new(move || Ok(Some(Zeroizing::new(value.clone())))))
     }
 
     fn empty() -> Source {
@@ -331,7 +377,7 @@ mod tests {
     fn the_environment_wins_and_reports_itself_as_the_source() {
         let dir = TempDir::new().unwrap();
         let chain = TokenChain {
-            env_value: Some(format!("{FIXTURE}\n")),
+            env_value: Some(Zeroizing::new(format!("{FIXTURE}\n"))),
             keychain: answering("from-the-keychain"),
             file_path: Some(seeded_file(&dir, "from-the-file")),
             gh: answering("from-gh"),
@@ -488,7 +534,7 @@ mod tests {
     #[test]
     fn no_rendering_of_the_resolved_token_type_contains_the_token() {
         let chain = TokenChain {
-            env_value: Some(FIXTURE.into()),
+            env_value: Some(Zeroizing::new(FIXTURE.into())),
             ..TokenChain::default()
         };
         let (token, source) = resolve(&chain).unwrap();
