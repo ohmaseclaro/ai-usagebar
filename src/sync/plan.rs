@@ -999,11 +999,12 @@ mod tests {
     ///
     /// This is the shape that produced an unrestorable bundle on a real first
     /// push: `sync setup` re-run writes a fresh master key, `plan::build` reuses
-    /// the cached ids without reopening the files, and `packer::pack_file` seals
-    /// a block only when the id it computes is one the plan asked for. Under a
-    /// new key nothing matches, so nothing is sealed while the manifest still
-    /// names the old ids — a push that reports success and a bundle that cannot
-    /// be restored.
+    /// the cached ids without reopening the files, and the manifest was built
+    /// from that list. Under a new key nothing the packer read matched, so
+    /// nothing was sealed while the manifest still named the old ids — a push
+    /// that reported success and a bundle that could not be restored.
+    /// `packer::build` no longer names a chunk it did not seal (6-08); this
+    /// binding is what keeps the files from being needlessly re-read.
     ///
     /// Asserted on **file reads**, not on a flag: what went wrong was that the
     /// files were not opened.

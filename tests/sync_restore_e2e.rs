@@ -1578,7 +1578,7 @@ async fn criterion_6_a_newer_local_file_is_skipped_and_named_and_force_overwrite
         Disposition::SkipLocalNewer { .. }
     ));
     assert_eq!(std::fs::read(&local).unwrap(), newer, "a skip wrote anyway");
-    let rendered = report::render_plan(&skipped.plan);
+    let rendered = report::render_plan(&skipped.plan, false);
     assert!(
         rendered.contains("scheduled-tasks/daily routine.json"),
         "the skipped item is not named in the report:\n{rendered}"
@@ -2075,7 +2075,7 @@ async fn criterion_5_a_manifest_entry_that_escapes_its_root_is_refused_and_named
     assert!(item.dest.is_none(), "a refused entry got a destination");
 
     // It is reported, not dropped — and the honest sibling still restored.
-    let rendered = report::render_plan(&outcome.plan);
+    let rendered = report::render_plan(&outcome.plan, false);
     assert!(
         rendered.contains("REFUSED") && rendered.contains(".."),
         "the refused entry is not visible in the report:\n{rendered}"

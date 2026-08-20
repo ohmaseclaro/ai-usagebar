@@ -20,6 +20,25 @@
 //! A file under none of the roots is an error rather than a fallback to the
 //! absolute path — there is no correct absolute path to fall back to.
 //!
+//! # The manifest describes what was packed, never what was planned
+//!
+//! [`plan::build`](crate::sync::plan::build) reads a file, and [`build`] reads
+//! it again minutes later. The bundle's own contents are live transcripts that
+//! are appended to while a multi-gigabyte push runs, so between the two reads a
+//! file *will* change — this is the ordinary case, not a race anyone has to
+//! engineer.
+//!
+//! So the chunk list in every [`FileEntry`], and the `true_len` beside it, come
+//! from the bytes [`pack_file`] actually read. Naming the plan's ids instead
+//! publishes a snapshot whose manifest names a chunk nothing ever sealed, and a
+//! restore rightly refuses that rather than writing a partial tree — a push that
+//! reports success and cannot be restored, which is D2's worst outcome.
+//!
+//! A file written *while* the packer reads it can still yield a torn read: a
+//! prefix of one version and a tail of the next. That is what any backup of a
+//! live file does, and it is internally consistent — every chunk it names was
+//! sealed. That is the guarantee here, and it is the one that matters.
+//!
 //! # The two size constants, and which one governs
 //!
 //! [`should_seal`] compares against [`PACK_MAX`] (48 MiB) and never reads
@@ -81,49 +100,66 @@ use super::{B64, BuiltPack, Pointer, PushBundle, PushCtx, RemoteIndexEntry};
 /// and roots are the four the format already defines, so Phase 1's deferred AAD
 /// object-type separator stays untriggered.
 pub fn build(ctx: &PushCtx<'_>, plan: &SyncPlan) -> Result<PushBundle> {
-    // Every chunk the snapshot names, deduplicated, in first-seen order. Note
-    // this is the union over `file_plans`, **not** `plan.new_chunk_ids`: a
-    // snapshot must name a pack for every chunk it references, and taking only
-    // the plan's new ids is precisely how `referenced_packs` ends up missing the
-    // packs that hold all the unchanged data.
-    let mut named: Vec<ChunkId> = Vec::new();
+    // The plan's ids, deduplicated, asked of the chunk table once. This is a
+    // *prediction* of what the packer will read — good enough to answer "is
+    // this already published?", and never the manifest's source of truth.
+    let mut planned: Vec<ChunkId> = Vec::new();
     let mut seen: HashSet<ChunkId> = HashSet::new();
     for file in &plan.file_plans {
         for raw in &file.chunk_ids {
             let id = ChunkId::from_bytes(*raw);
             if seen.insert(id) {
-                named.push(id);
+                planned.push(id);
             }
         }
     }
-    let reusable = reusable(ctx, &named);
+    let reusable = reusable(ctx, &planned);
 
     let mut packs = Packing::default();
     let mut files: Vec<FileEntry> = Vec::new();
 
     for file in &plan.file_plans {
-        let meta = std::fs::metadata(&file.path).map_err(|e| AppError::io_at(&file.path, e))?;
-        let wanted: HashSet<ChunkId> = file
+        let planned: Vec<ChunkId> = file
             .chunk_ids
             .iter()
             .map(|raw| ChunkId::from_bytes(*raw))
-            .filter(|id| !reusable.contains_key(id) && !packs.holds(id))
             .collect();
         // SYNC-02, honoured rather than merely claimed: a file whose every chunk
-        // the snapshot can already locate is not opened at all.
-        if !wanted.is_empty() {
-            pack_file(ctx, &mut packs, &file.path, &wanted)?;
-        }
+        // the snapshot can already locate is not opened at all. Its length then
+        // comes from the plaintext lengths of those same chunks and not from a
+        // stat, because a stat may already describe a different file and a
+        // `true_len` that disagrees with the chunk list beside it is a restore
+        // that refuses.
+        let (mode, true_len, chunks) = match reused_len(&planned, &reusable) {
+            Some(true_len) => {
+                let meta =
+                    std::fs::metadata(&file.path).map_err(|e| AppError::io_at(&file.path, e))?;
+                (mode_of(&meta), true_len, planned)
+            }
+            None => pack_file(ctx, &mut packs, &file.path, &reusable)?,
+        };
         files.push(FileEntry {
             path: manifest_path(ctx.roots, &file.path)?,
-            mode: mode_of(&meta),
-            true_len: meta.len(),
-            chunks: file
-                .chunk_ids
-                .iter()
-                .map(|raw| ChunkId::from_bytes(*raw))
-                .collect(),
+            mode,
+            true_len,
+            chunks,
         });
+    }
+
+    // Every chunk the snapshot names, deduplicated, in first-seen order — read
+    // off the **manifest that was just built**, not off the plan. Note this is
+    // the union over the file entries, **not** `plan.new_chunk_ids`: a snapshot
+    // must name a pack for every chunk it references, and taking only the plan's
+    // new ids is precisely how `referenced_packs` ends up missing the packs that
+    // hold all the unchanged data.
+    let mut named: Vec<ChunkId> = Vec::new();
+    let mut seen: HashSet<ChunkId> = HashSet::new();
+    for file in &files {
+        for id in &file.chunks {
+            if seen.insert(*id) {
+                named.push(*id);
+            }
+        }
     }
 
     // 1. The manifest, packed like any other chunk, and then sealed into a pack
@@ -235,7 +271,9 @@ fn entry_at(id: ChunkId, at: &ChunkLocation) -> IndexEntry {
     }
 }
 
-/// Seal and pack every chunk of `path` the snapshot cannot already locate.
+/// Seal and pack every chunk of `path` the snapshot cannot already locate, and
+/// return the file's mode, length and **chunk list as read** — see the module
+/// docs on why the caller may not use the plan's list instead.
 ///
 /// Streamed in [`CHUNK_SIZE`] blocks through **one** reused buffer (T-4-16): a
 /// 115 MB transcript never exists as a 115 MB plaintext allocation, each block's
@@ -243,28 +281,45 @@ fn entry_at(id: ChunkId, at: &ChunkLocation) -> IndexEntry {
 /// Reading the whole file into a `Vec` would hold every credential in the bundle
 /// in memory at once for no gain.
 ///
-/// The skip decision is made on the id of the block that was actually read,
-/// not on the plan's list by position: if the file changed under us, the id we
-/// would skip on is the id the blob would have had.
+/// Mode and length come from this same read — the open handle's own metadata and
+/// the bytes actually counted — rather than from a separate `metadata` call on
+/// the path, so the three halves of a manifest entry cannot describe three
+/// different versions of the file.
 fn pack_file(
     ctx: &PushCtx<'_>,
     packs: &mut Packing,
     path: &Path,
-    wanted: &HashSet<ChunkId>,
-) -> Result<()> {
+    reusable: &HashMap<ChunkId, ChunkLocation>,
+) -> Result<(u32, u64, Vec<ChunkId>)> {
     let mut file = std::fs::File::open(path).map_err(|e| AppError::io_at(path, e))?;
+    let mode = mode_of(&file.metadata().map_err(|e| AppError::io_at(path, e))?);
     let mut buf = Zeroizing::new(vec![0u8; CHUNK_SIZE]);
+    let mut chunks: Vec<ChunkId> = Vec::new();
+    let mut true_len = 0u64;
     loop {
         let read = fill(&mut file, &mut buf).map_err(|e| AppError::io_at(path, e))?;
         if read == 0 {
-            return Ok(());
+            return Ok((mode, true_len, chunks));
         }
         let block = &buf[..read];
         let id = ctx.keys.chunk_id(block);
-        if wanted.contains(&id) && !packs.holds(&id) {
+        chunks.push(id);
+        true_len = true_len.saturating_add(read as u64);
+        // Both halves of the dedup, on the id of the block that was actually
+        // read: already published, or already packed by this run.
+        if !reusable.contains_key(&id) && !packs.holds(&id) {
             packs.push(seal_chunk(ctx.keys, block)?, ctx.keys)?;
         }
     }
+}
+
+/// The plaintext length `ids` add up to, when every one of them is already
+/// locatable — the SYNC-02 short-circuit's precondition and the `true_len` it
+/// must then use, computed together because they have to come from one source.
+fn reused_len(ids: &[ChunkId], reusable: &HashMap<ChunkId, ChunkLocation>) -> Option<u64> {
+    ids.iter()
+        .map(|id| reusable.get(id).map(|at| u64::from(at.plen)))
+        .sum()
 }
 
 /// Read until `buf` is full or the file ends. `Read::read` is allowed to return
@@ -669,6 +724,45 @@ mod tests {
             .id
     }
 
+    /// The manifest this bundle carries, read back through the format's own
+    /// readers rather than from the builder's bookkeeping.
+    fn manifest_of(bundle: &PushBundle, keys: &Keys) -> Manifest {
+        let chunks: Vec<(ChunkId, Vec<u8>)> = bundle
+            .manifest_chunks
+            .iter()
+            .map(|id| (*id, chunk_bytes(bundle, keys, id)))
+            .collect();
+        Manifest::open(keys, &chunks).unwrap()
+    }
+
+    /// One chunk's sealed bytes, from whichever of this bundle's packs holds it.
+    fn chunk_bytes(bundle: &PushBundle, keys: &Keys, id: &ChunkId) -> Vec<u8> {
+        for pack in &bundle.packs {
+            let header = read_header(keys, &pack.bytes).unwrap();
+            if let Some(entry) = header.entries.into_iter().find(|e| e.id == *id) {
+                return blob_bytes(&pack.bytes, &entry).unwrap().to_vec();
+            }
+        }
+        panic!("no pack in this bundle holds that chunk");
+    }
+
+    /// **The invariant that was broken**, asserted directly: every chunk id the
+    /// manifest names is present in a pack this bundle publishes. Anything less
+    /// direct — that the plan and the manifest agree, say — is an intermediate
+    /// that can hold while the snapshot is still unrestorable.
+    fn assert_every_named_chunk_was_packed(bundle: &PushBundle, keys: &Keys) {
+        let packed = packed_ids(bundle, keys);
+        for file in manifest_of(bundle, keys).files {
+            for id in &file.chunks {
+                assert!(
+                    packed.contains(id),
+                    "the manifest names a chunk of {} that no pack in this bundle holds",
+                    file.path
+                );
+            }
+        }
+    }
+
     /// Slice one chunk out of whichever of this bundle's packs holds it.
     fn fetch(bundle: &PushBundle, at: &IndexEntry) -> Vec<u8> {
         let pack = bundle
@@ -938,6 +1032,62 @@ mod tests {
         assert!(!framed.windows(needle.len()).any(|w| w == needle));
     }
 
+    /// **The two-machine corruption this plan exists for.** `plan::build` reads a
+    /// file and the packer reads it again minutes later; the bundle's contents
+    /// are live transcripts that are appended to in between, so the planner's
+    /// tail id names bytes that no longer exist. The packer never seals it — its
+    /// `wanted` set is matched against the id of the block actually read — and a
+    /// manifest built from the plan names it anyway. Push reports success and
+    /// `sync pull --apply` refuses the snapshot.
+    #[test]
+    fn a_file_appended_to_between_planning_and_packing_names_only_chunks_it_sealed() {
+        let fx = Fixture::new();
+        let body = incompressible(2 * CHUNK_SIZE + 11);
+        let file = fx.seed("claude-home/history.jsonl", &body);
+        let path = file.path.clone();
+        let plan = plan_of(vec![file]);
+
+        // The append, after the plan and before the pack.
+        let mut grown = body.clone();
+        grown.extend_from_slice(&incompressible(4096));
+        std::fs::write(&path, &grown).unwrap();
+
+        let bundle = build(&fx.ctx(None), &plan).unwrap();
+
+        assert_every_named_chunk_was_packed(&bundle, &fx.keys);
+        let entry = manifest_of(&bundle, &fx.keys).files.remove(0);
+        assert_eq!(
+            entry.true_len,
+            grown.len() as u64,
+            "the length must come from the same read as the chunks"
+        );
+    }
+
+    /// The other direction: a file that shrank. Two of the planner's ids now
+    /// name bytes the packer never reads at all.
+    #[test]
+    fn a_file_truncated_between_planning_and_packing_names_only_chunks_it_sealed() {
+        let fx = Fixture::new();
+        let body = incompressible(2 * CHUNK_SIZE + 11);
+        let file = fx.seed("claude-home/history.jsonl", &body);
+        let path = file.path.clone();
+        let plan = plan_of(vec![file]);
+
+        let shrunk = body[..CHUNK_SIZE + 5].to_vec();
+        std::fs::write(&path, &shrunk).unwrap();
+
+        let bundle = build(&fx.ctx(None), &plan).unwrap();
+
+        assert_every_named_chunk_was_packed(&bundle, &fx.keys);
+        let entry = manifest_of(&bundle, &fx.keys).files.remove(0);
+        assert_eq!(entry.true_len, shrunk.len() as u64);
+        assert_eq!(
+            entry.chunks.len(),
+            2,
+            "one sealed chunk and a five-byte tail"
+        );
+    }
+
     /// **T-4-13.** A second push over an unchanged tree re-seals no data chunk,
     /// and still names the pack holding every one of them. Omitting a reused
     /// pack is the exact input that makes prune delete live data.
@@ -970,6 +1120,14 @@ mod tests {
         // Only the snapshot's own new objects were packed at all: the manifest,
         // and the index object in its own pack.
         assert_eq!(second.packs.len(), 2);
+        // The file was never opened, so its manifest entry's length came from
+        // the plaintext lengths of the chunks it names rather than from a stat.
+        // It must still be the file's own length, or the entry describes a
+        // length its own chunk list cannot produce.
+        let entry = manifest_of(&second, &fx.keys).files.remove(0);
+        assert_eq!(entry.true_len, body.len() as u64);
+        assert_eq!(entry.chunks.len(), 2);
+        assert!(entry.chunks.iter().all(|id| data.contains(id)));
         let published = published(&fx, &first);
         assert_eq!(
             root_for(&fx.ctx(None), Some(&published), &second.manifest_chunks)
