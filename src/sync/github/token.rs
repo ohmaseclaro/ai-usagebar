@@ -12,14 +12,23 @@
 //! [`TokenChain::production`] is the single place that decides which of them are
 //! live on this platform, and no test calls it.
 //!
-//! [`store`] and [`clear`] are the other half: where a token collected by
+//! [`store`] and [`clear_source`] are the other half: where a token collected by
 //! `sync setup` goes, and how a revoked one is taken back out. Neither can
 //! reach `config.toml` — a `Contents: write` GitHub token is a different class
 //! of secret from the read-only provider keys that file may hold inline.
 //!
 //! The value is a [`Zeroizing<String>`] end to end, and **no type here derives
 //! `Debug` while holding it**. It is never logged, not even a prefix: only its
-//! [`TokenSource`] is ever reported.
+//! [`TokenSource`] is ever reported. "End to end" is the literal claim: every
+//! field, every injected closure's return type, and every buffer a source reads
+//! into is a `Zeroizing<String>`, so a value that entered the chain is wiped
+//! when it leaves it — the sentence used to be true only of `resolve`'s return
+//! value, with four plain `String`s behind it (F-9).
+//!
+//! The one boundary this module cannot own is `security(1)`'s output, which
+//! [`crate::anthropic::keychain`] hands back as a plain `String`;
+//! [`keychain::read_raw`](super::keychain::read_raw) wraps it on the first line
+//! it can, so the plain copy lives for one move and no allocation is copied.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -66,12 +75,12 @@ impl TokenSource {
 /// No `Debug`: `env_value` holds the token itself.
 #[derive(Default)]
 pub struct TokenChain {
-    pub env_value: Option<String>,
+    pub env_value: Option<Zeroizing<String>>,
     #[allow(clippy::type_complexity)]
-    pub keychain: Option<Box<dyn Fn() -> Result<Option<String>>>>,
+    pub keychain: Option<Box<dyn Fn() -> Result<Option<Zeroizing<String>>>>>,
     pub file_path: Option<PathBuf>,
     #[allow(clippy::type_complexity)]
-    pub gh: Option<Box<dyn Fn() -> Result<Option<String>>>>,
+    pub gh: Option<Box<dyn Fn() -> Result<Option<Zeroizing<String>>>>>,
 }
 
 impl TokenChain {
@@ -80,7 +89,7 @@ impl TokenChain {
     /// installers' machines.
     pub fn production() -> TokenChain {
         TokenChain {
-            env_value: std::env::var(ENV_VAR).ok(),
+            env_value: std::env::var(ENV_VAR).ok().map(Zeroizing::new),
             // Source 2 exists on macOS only. D-02 rejects `keyring`/
             // `secret-service` for the Linux half: it needs a live D-Bus
             // session and fails over SSH, which is precisely the headless
@@ -111,7 +120,7 @@ pub fn resolve(chain: &TokenChain) -> Result<(Zeroizing<String>, TokenSource)> {
     if let Some(path) = &chain.file_path {
         match std::fs::read_to_string(path) {
             Ok(raw) => {
-                if let Some(found) = usable(Some(raw)) {
+                if let Some(found) = usable(Some(Zeroizing::new(raw))) {
                     return Ok((found, TokenSource::File));
                 }
             }
@@ -145,8 +154,8 @@ pub fn resolve(chain: &TokenChain) -> Result<(Zeroizing<String>, TokenSource)> {
 }
 
 /// Trim, and treat an empty result as "this source had nothing".
-fn usable(raw: Option<String>) -> Option<Zeroizing<String>> {
-    let raw = Zeroizing::new(raw?);
+fn usable(raw: Option<Zeroizing<String>>) -> Option<Zeroizing<String>> {
+    let raw = raw?;
     let trimmed = Zeroizing::new(raw.trim().to_owned());
     (!trimmed.is_empty()).then_some(trimmed)
 }
@@ -183,7 +192,16 @@ fn keychain_hint() -> String {
 /// because [`Command::output`] has no timeout of its own, nothing in this
 /// dependency tree adds one, and `resolve` is synchronous — so `tokio::process`
 /// is not reachable from here either.
-fn gh_auth_token() -> Result<Option<String>> {
+///
+/// **Every blocking step is bounded, not just the process** (F-6). Killing `gh`
+/// does not close a stdout pipe that a credential helper `gh` spawned still
+/// holds open, so a `read_to_string` on this thread waited for an EOF that
+/// never came — the watchdog fired, the command hung anyway. The read now runs
+/// on its own thread behind a [`mpsc::Receiver::recv_timeout`], and the exit
+/// status is collected with [`std::process::Child::try_wait`] rather than
+/// `wait`: `wait` holds the mutex the watchdog needs in order to kill, so the
+/// one call that was supposed to be bounded was the one blocking the killer.
+fn gh_auth_token() -> Result<Option<Zeroizing<String>>> {
     let mut cmd = Command::new("gh");
     cmd.args(["auth", "token"])
         .stdin(Stdio::null())
@@ -219,15 +237,43 @@ fn gh_auth_token() -> Result<Option<String>> {
         }
     });
 
-    let mut out = String::new();
-    if let Some(mut pipe) = stdout {
-        let _ = pipe.read_to_string(&mut out);
-    }
-    let exited_zero = child
-        .lock()
-        .ok()
-        .and_then(|mut child| child.wait().ok())
-        .is_some_and(|status| status.success());
+    let (read, out) = mpsc::channel::<Zeroizing<String>>();
+    std::thread::spawn(move || {
+        let mut buf = Zeroizing::new(String::new());
+        if let Some(mut pipe) = stdout {
+            let _ = pipe.read_to_string(&mut buf);
+        }
+        // A dropped receiver means the timeout below already gave up; the
+        // buffer is zeroed here either way.
+        let _ = read.send(buf);
+    });
+    let Ok(out) = out.recv_timeout(GH_TIMEOUT) else {
+        if let Ok(mut child) = child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        return Ok(None);
+    };
+
+    // stdout is at EOF, so `gh` has closed it and is exiting; poll rather than
+    // block, and stop at the same bound. The watchdog above kills anything
+    // still running when this deadline passes, and the kill lands as a status
+    // the next poll collects.
+    let deadline = std::time::Instant::now() + GH_TIMEOUT;
+    let exited_zero = loop {
+        match child
+            .lock()
+            .ok()
+            .and_then(|mut c| c.try_wait().ok())
+            .flatten()
+        {
+            Some(status) => break status.success(),
+            None if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10))
+            }
+            None => break false,
+        }
+    };
     drop(finished);
 
     // `resolve` trims and treats an empty result as "nothing here".
@@ -278,15 +324,95 @@ fn store_file(token: &str, file_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Remove every stored half, idempotently — the 401 path: a revoked token
-/// should be cleared, not retried.
+/// Remove the stored token, idempotently — **and only from the store that
+/// produced the value that was rejected**.
 ///
-/// Both halves, on macOS too: a file written on another machine and copied over
-/// is still a source [`resolve`] would find.
-pub fn clear(file_path: &Path) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    super::keychain::delete_raw()?;
-    clear_file(file_path)
+/// This used to clear the Keychain item *and* the token file unconditionally,
+/// with the resolved [`TokenSource`] bound and never consulted (F-1). A 401 says
+/// the value that was *sent* is dead; it says nothing about the other three
+/// sources. The realistic sequence needs no attacker and is the documented
+/// configuration: a macOS user pairs (token → Keychain), later a shell exports
+/// `AI_USAGEBAR_SYNC_TOKEN` — CI, an `.envrc`, or a 90-day PAT that expired,
+/// both of which this project's own docs recommend — and the next `sync status`
+/// resolves `Env`, 401s, and deletes the still-valid Keychain token that was
+/// never used. The env var still holds the dead one, so the next run fails
+/// identically, and the message sends the user off to mint a *third*.
+///
+/// `Env` and `GhCli` therefore clear nothing: neither store is this tool's to
+/// delete. [`clear_note`] is the other half — what the user is told instead.
+pub fn clear_source(source: TokenSource, file_path: &Path) -> Result<()> {
+    if !owns_a_store(source) {
+        return Ok(());
+    }
+    match source {
+        #[cfg(target_os = "macos")]
+        TokenSource::Keychain => super::keychain::delete_raw(),
+        // Source 2 does not exist off macOS, so nothing can have resolved from
+        // it — and if it somehow did, there is no item here to delete.
+        #[cfg(not(target_os = "macos"))]
+        TokenSource::Keychain => Ok(()),
+        TokenSource::File => clear_file(file_path),
+        // Unreachable behind the guard above, and stated anyway: the two
+        // partitions must not disagree.
+        TokenSource::Env | TokenSource::GhCli => Ok(()),
+    }
+}
+
+/// Whether this tool has a store of its own for `source` — the partition
+/// [`clear_source`] acts on, asked rather than restated.
+///
+/// `Env` and `GhCli` are values the caller's shell and the GitHub CLI own; a 401
+/// on one of them is not permission to reach into ai-usagebar's own stores,
+/// which the failing request never sent (F-1). A caller that wants to skip the
+/// destructive seam entirely — a guided flow behind a test double, say — asks
+/// this rather than writing the rule a second time.
+pub fn owns_a_store(source: TokenSource) -> bool {
+    matches!(source, TokenSource::Keychain | TokenSource::File)
+}
+
+/// What [`clear_source`] just did, in the user's words — kept beside it so the
+/// message and the action cannot drift apart, which is the half of F-1 that made
+/// the other half invisible.
+///
+/// The two "nothing was cleared" arms are the ones that matter: they name the
+/// thing the user has to change, because a replacement written anywhere else
+/// will not be reached while the environment or `gh` still answers first.
+pub fn clear_note(source: TokenSource, file_path: &Path) -> String {
+    match source {
+        TokenSource::Keychain => format!(
+            "The rejected token came from {}, and that entry has been removed. \
+             Nothing else was touched.",
+            keychain_label()
+        ),
+        TokenSource::File => format!(
+            "The rejected token came from {}, and that file has been removed. \
+             Nothing else was touched.",
+            file_path.display()
+        ),
+        TokenSource::Env => format!(
+            "Nothing was cleared: the rejected token came from {ENV_VAR}, which is not this \
+             tool's to delete and which outranks every stored token. Unset or replace it — \
+             a new token in the Keychain or in the token file is never reached while it is set."
+        ),
+        TokenSource::GhCli => {
+            "Nothing was cleared: the rejected token came from `gh auth token`, which is the \
+             GitHub CLI's credential and not this tool's. Run `gh auth login` again, or set \
+             AI_USAGEBAR_SYNC_TOKEN to a token of ai-usagebar's own so `gh` is not consulted."
+                .to_owned()
+        }
+    }
+}
+
+/// Named through the same constant the read and the write select on, so this
+/// cannot point at an item that does not exist.
+#[cfg(target_os = "macos")]
+fn keychain_label() -> String {
+    format!("the macOS Keychain item `{}`", super::keychain::SERVICE)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn keychain_label() -> String {
+    "the macOS Keychain".to_owned()
 }
 
 fn clear_file(file_path: &Path) -> Result<()> {
@@ -306,11 +432,11 @@ mod tests {
 
     /// What the two injected fields hold. Nothing in this module's tests goes
     /// near the real Keychain or spawns `gh`.
-    type Source = Option<Box<dyn Fn() -> Result<Option<String>>>>;
+    type Source = Option<Box<dyn Fn() -> Result<Option<Zeroizing<String>>>>>;
 
     fn answering(value: &str) -> Source {
         let value = value.to_owned();
-        Some(Box::new(move || Ok(Some(value.clone()))))
+        Some(Box::new(move || Ok(Some(Zeroizing::new(value.clone())))))
     }
 
     fn empty() -> Source {
@@ -331,7 +457,7 @@ mod tests {
     fn the_environment_wins_and_reports_itself_as_the_source() {
         let dir = TempDir::new().unwrap();
         let chain = TokenChain {
-            env_value: Some(format!("{FIXTURE}\n")),
+            env_value: Some(Zeroizing::new(format!("{FIXTURE}\n"))),
             keychain: answering("from-the-keychain"),
             file_path: Some(seeded_file(&dir, "from-the-file")),
             gh: answering("from-gh"),
@@ -484,11 +610,31 @@ mod tests {
         assert!(!path.exists());
     }
 
+    /// F-1's inner guard, independent of the caller's: even asked directly, a
+    /// source this tool does not own removes nothing. The token file is seeded
+    /// so a wrong answer has something to destroy.
+    #[test]
+    fn clearing_an_env_or_gh_source_removes_nothing_this_tool_stores() {
+        let dir = TempDir::new().unwrap();
+        let path = seeded_file(&dir, FIXTURE);
+
+        for source in [TokenSource::Env, TokenSource::GhCli] {
+            assert!(!owns_a_store(source), "{source:?}");
+            clear_source(source, &path).unwrap();
+            assert!(path.exists(), "{source:?} removed the token file");
+        }
+
+        assert!(owns_a_store(TokenSource::File));
+        clear_source(TokenSource::File, &path).unwrap();
+        assert!(!path.exists(), "the file source clears the file");
+        clear_source(TokenSource::File, &path).expect("clearing twice is not a failure");
+    }
+
     /// T-3-01: the value is never rendered, not even through a derived `Debug`.
     #[test]
     fn no_rendering_of_the_resolved_token_type_contains_the_token() {
         let chain = TokenChain {
-            env_value: Some(FIXTURE.into()),
+            env_value: Some(Zeroizing::new(FIXTURE.into())),
             ..TokenChain::default()
         };
         let (token, source) = resolve(&chain).unwrap();

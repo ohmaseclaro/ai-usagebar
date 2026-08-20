@@ -25,6 +25,8 @@
 //! public for the `#[ignore]`d round trip in `tests/live.rs`, which passes a
 //! service name of its own so it cannot disturb a real stored token.
 
+use zeroize::Zeroizing;
+
 use crate::anthropic::keychain as worker;
 use crate::error::Result;
 
@@ -35,8 +37,15 @@ use crate::error::Result;
 /// left that knows where to look.
 pub const SERVICE: &str = "ai-usagebar-sync-token";
 
-pub fn read_raw() -> Result<Option<String>> {
-    read_raw_service(SERVICE)
+/// The chain's source 2, wrapped on the first line this module controls.
+///
+/// `security(1)`'s output arrives from the shared worker as a plain `String`;
+/// this is where it becomes a [`Zeroizing<String>`], so `token`'s "the value is
+/// zeroized end to end" is true of everything downstream of here (F-9). The
+/// `String` is moved, never copied, so there is no second allocation left
+/// behind unwiped.
+pub fn read_raw() -> Result<Option<Zeroizing<String>>> {
+    Ok(read_raw_service(SERVICE)?.map(Zeroizing::new))
 }
 
 pub fn write_raw(token: &str) -> Result<()> {

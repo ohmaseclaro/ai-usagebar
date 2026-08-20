@@ -1,15 +1,27 @@
 //! `ai-usagebar sync setup` — pair this machine with the private repository
 //! named in `[sync] repo`, in the five steps UX-03 asks for.
 //!
-//! **Uploads nothing** (D-05). The flow is: the repository and the gate, then
-//! the passphrase, then the categories, then the size, then "ready to push".
+//! **Uploads nothing** (D-05). The flow is: the categories, then the repository
+//! and the gate, then the passphrase, then the size, then everything that
+//! persists.
 //!
-//! **The ordering is the substance.** Step 1 refuses before [`SetupPrompt`] is
-//! touched at all, because asking someone to choose a passphrase for a
-//! repository that is about to be refused wastes their time and teaches them
-//! the refusal is negotiable. Every test drives a scripted prompt double that
-//! records which methods were reached, so that ordering is asserted rather than
-//! reviewed.
+//! **The ordering is the substance**, and it changed for a security reason.
+//! The categories come *first* because the credentials category is an input to
+//! the gate — the one deciding D-04's public-repo carve-out — and a gate
+//! answered before the question was settled was answered a question it was no
+//! longer being asked (F-2). Everything else still refuses as early as it can:
+//! the local preconditions and the whole gate run before a passphrase is
+//! generated, so nobody is asked to choose one for a repository that is about to
+//! be refused.
+//!
+//! **Nothing persists until the confirmation passes** (F-10). The keyfile, the
+//! `config.toml` write-back, the token and the pairing record are all written in
+//! step 5, after the last thing that can abort. A keyfile written earlier
+//! survived the decline and then refused the re-run, stranding the user behind a
+//! passphrase they were shown once.
+//!
+//! Every test drives a scripted prompt double that records which methods were
+//! reached, so that ordering is asserted rather than reviewed.
 //!
 //! `roots` is the **only** way this module reaches a filesystem path: the
 //! keyfile, the pairing record, the token file, the index, and the
@@ -31,7 +43,7 @@ use crate::sync::passphrase::{self, Strength};
 use crate::sync::report::{self, DryRunReport};
 use crate::sync::{SyncRoots, plan};
 
-use super::gate::{self, PushClearance};
+use super::gate;
 use super::pairing;
 use super::token::{self, TokenSource};
 use super::{Client, Endpoints, RepoRef};
@@ -49,21 +61,25 @@ pub trait SetupPrompt {
     fn say(&mut self, line: &str);
 
     /// A yes/no with a default — step 4's size confirmation, and anything else
-    /// that needs one.
+    /// that needs one. It is the last thing that can abort: nothing persists
+    /// until it has passed.
     fn confirm(&mut self, question: &str, default_yes: bool) -> Result<bool>;
 
-    /// Step 2. `generated` has already been displayed with Phase 1's
+    /// Step 3. `generated` has already been displayed with Phase 1's
     /// no-recovery warning; the implementation either accepts it or supplies
     /// its own. Called again when the strength floor refuses a supplied one.
     fn passphrase(&mut self, generated: &str) -> Result<Zeroizing<String>>;
 
-    /// Step 3. Returns the categories to keep, in any order.
+    /// Step 1, and the gate's own input: whether `credentials` is in the answer
+    /// is what decides D-04's public-repo carve-out, so this is asked before the
+    /// gate rather than after it (F-2). Returns the categories to keep, in any
+    /// order.
     fn categories(&mut self, current: &[SyncCategory]) -> Result<Vec<SyncCategory>>;
 
     /// The KDF cost a new keyfile is written at.
     ///
     /// A seam, not a question: the shipped default is 1 GiB and takes about a
-    /// second and a half, which every test that reaches step 2 would otherwise
+    /// second and a half, which every test that reaches step 3 would otherwise
     /// pay — and the AUR `check()` runs those tests during `makepkg`. Tests
     /// override it with [`crate::sync::crypto::MIN_KDF_MEMORY_KIB`].
     fn kdf(&self) -> KdfParams {
@@ -79,10 +95,13 @@ pub trait SetupPrompt {
         token::store(token, file)
     }
 
-    /// The 401 path, for the same reason: [`token::clear`] deletes the real
-    /// Keychain item on macOS.
-    fn clear_token(&self, file: &Path) -> Result<()> {
-        token::clear(file)
+    /// The 401 path, for the same reason: [`token::clear_source`] deletes the
+    /// real Keychain item on macOS.
+    ///
+    /// `source` is not decoration — it is what decides *which* store is touched,
+    /// and passing the wrong one destroys a credential the run never used.
+    fn clear_token(&self, source: TokenSource, file: &Path) -> Result<()> {
+        token::clear_source(source, file)
     }
 }
 
@@ -147,8 +166,12 @@ impl SetupPrompt for TtyPrompt {
     }
 }
 
-/// What setup learned. Carries the [`PushClearance`] rather than a `bool`,
-/// because a `bool` is a cached check and D-04 forbids one.
+/// What setup learned.
+///
+/// **No [`PushClearance`](gate::PushClearance).** Setup has no consumer for one
+/// — the field was minted, moved in, and dropped — and carrying it would hand
+/// Phase 4 a stale capability that is easy to reach for (F-3). A push mints its
+/// own, immediately before its first byte, and spends it.
 ///
 /// Nothing here is a secret: the token is reported as a *source*, the
 /// passphrase is not represented at all, and no keyfile byte is carried.
@@ -162,7 +185,6 @@ pub struct SetupOutcome {
     pub stored_at: TokenSource,
     pub visibility: String,
     pub warnings: Vec<String>,
-    pub clearance: PushClearance,
     pub categories: Vec<SyncCategory>,
     /// The local keyfile. Still local — Phase 4 uploads it.
     pub keyfile: PathBuf,
@@ -175,6 +197,11 @@ pub struct SetupOutcome {
 }
 
 /// The five steps, in order.
+///
+/// A refusal after step 1 has cost the user the category question and nothing
+/// else — no passphrase, no file, no remote write. That is the price of asking
+/// the gate a settled question, and it is the right one: the alternative is a
+/// public repository cleared for a bundle it was never assessed against.
 pub async fn run(
     cfg: &SyncConfig,
     roots: &SyncRoots,
@@ -183,18 +210,21 @@ pub async fn run(
     prompt: &mut dyn SetupPrompt,
     now: DateTime<Utc>,
 ) -> Result<SetupOutcome> {
-    // ---- Step 1: the repository, and the gate ---------------------------
-    // Nothing below this block is reached by a refusal, and no prompt method is
-    // called inside it (T-3-35).
+    // ---- Preconditions: local, and reached before any prompt -------------
+    // T-3-38 first, and before anything asks the user for anything: this is a
+    // fact about *this machine*, not about the repository, and a run that is
+    // going to refuse should refuse before it costs a question. Overwriting a
+    // keyfile makes every bundle written under the old password permanently
+    // unreadable.
+    let keyfile_path = crate::sync::cli::keyfile_path(roots);
+    if keyfile_path.exists() {
+        return Err(AppError::Other(existing_keyfile_message(&keyfile_path)));
+    }
+
     let Some(configured) = cfg.repo.as_deref() else {
         return Err(AppError::Other(no_repo_message()));
     };
     let repo = RepoRef::parse(configured)?;
-
-    // Computed **once** and passed to both gate calls. Derived twice, plan
-    // 3-04's credentials-off carve-out dies: `check_drift` carves it out and
-    // `assert_pushable` would then overrule it.
-    let credentials_in_bundle = cfg.includes(SyncCategory::Credentials);
 
     let token_file = token_path(roots);
     let (value, source) = token::resolve(chain)?;
@@ -204,42 +234,87 @@ pub async fn run(
 
     let facts = match gate::fetch_facts(&client, &repo, now).await {
         Ok(facts) => facts,
-        Err(e) => return Err(clear_if_dead(e, &token_file, &|p| prompt.clear_token(p))),
+        Err(e) => {
+            return Err(clear_if_dead(e, source, &token_file, &|src, p| {
+                prompt.clear_token(src, p)
+            }));
+        }
     };
+
+    // ---- Step 1: the categories — the question the gate is asked ---------
+    //
+    // **This runs before the gate, and that ordering is the whole point.**
+    // `credentials_in_bundle` is the only gate input the user can change, and it
+    // is the one deciding D-04's public-repo carve-out. Asked afterwards, a
+    // public repository with `categories = ["config"]` took the carve-out, minted
+    // a clearance, and *then* had `credentials` added at this prompt — the dry
+    // run enumerated the credential files, the pairing record was written at
+    // `private: false`, and setup printed "paired and ready to push" (F-2).
+    // Nothing re-gated.
+    //
+    // Reordering rather than re-asserting is deliberate: a recompute-and-check
+    // closes the window but leaves two evaluations to keep in agreement, which
+    // is the shape that produced the hole. There is now exactly one.
+    prompt.say("1/5  What gets bundled. `credentials` is the deliberate one — turning it on syncs saved logins.");
+    let categories = prompt.categories(&cfg.categories)?;
+    let chosen_cfg = SyncConfig {
+        categories: categories.clone(),
+        ..cfg.clone()
+    };
+
+    // ---- Step 2: the repository, and the gate ----------------------------
+    // Computed **once**, from the categories just chosen, and passed to both
+    // gate calls. Derived twice, plan 3-04's credentials-off carve-out dies:
+    // `check_drift` carves it out and `assert_pushable` would then overrule it.
+    let credentials_in_bundle = chosen_cfg.includes(SyncCategory::Credentials);
 
     let pairing_file = pairing::default_path(roots);
     let record = pairing::read_from(&pairing_file)?;
     // check_drift first, then assert_pushable — that order, always.
     let drift = pairing::check_drift(record.as_ref(), &facts, credentials_in_bundle, now)?;
-    let (clearance, gate_warnings) =
+    // The clearance is dropped here, deliberately: `sync setup` uploads nothing
+    // (D-05), so the only thing keeping it could do is age. A push mints and
+    // spends its own — see `gate`'s Phase 4 contract.
+    let (_clearance, gate_warnings) =
         gate::assert_pushable(&facts, &repo, credentials_in_bundle, now)?;
 
     let mut warnings = drift.warnings.clone();
     warnings.extend(gate_warnings);
 
     prompt.say(&format!(
-        "1/5  {repo} is {} — the gate passed.",
+        "\n2/5  {repo} is {} — the gate passed.",
         facts.visibility
     ));
     for warning in &warnings {
         prompt.say(&format!("     warning: {warning}"));
     }
-    if !drift.first_contact {
+    if drift.first_contact {
+        // F-5. Deleting the pairing record makes `check_drift` skip the
+        // owner_id/repo_id comparison entirely and report first contact — and
+        // with no positive line for it, a silently reset pairing looked exactly
+        // like a first-ever setup. Say it, with the ids, and say what it means
+        // if it is a surprise.
+        prompt.say(&format!(
+            "     first contact: pairing with repository id {} owned by {} (id {}). \
+             Nothing was compared, because there was no pairing record to compare against.",
+            facts.id, facts.owner_login, facts.owner_id
+        ));
+        prompt.say(
+            "     If this machine was already paired, that record did not remove itself — \
+             treat its disappearance as an incident, and confirm those ids are the \
+             repository you mean before going on.",
+        );
+    } else {
         prompt.say(
             "     this machine is already paired with it; reusing that pairing rather than \
              issuing a second one.",
         );
     }
 
-    // ---- Step 2: the passphrase, and the keyfile ------------------------
-    let keyfile_path = crate::sync::cli::keyfile_path(roots);
-    if keyfile_path.exists() {
-        return Err(AppError::Other(existing_keyfile_message(&keyfile_path)));
-    }
-
+    // ---- Step 3: the passphrase, and the keyfile -------------------------
     let kdf = prompt.kdf();
     let generated = passphrase::generate()?;
-    prompt.say("\n2/5  A sync password protects the bundle.");
+    prompt.say("\n3/5  A sync password protects the bundle.");
     prompt.say(passphrase::NO_RECOVERY);
     prompt.say(passphrase::OFFLINE_ATTACK_NOTE);
     // Shown exactly once — not re-displayed on a re-prompt below.
@@ -262,21 +337,11 @@ pub async fn run(
         }
     };
 
+    // Created, **not written**: see step 5. F-10 — the file used to land here,
+    // before the confirmation that can abort, and its own existence then refused
+    // the re-run, stranding a user who declined behind a passphrase they were
+    // shown once and told there is no recovery for.
     let (keyfile, keys) = Keyfile::create(chosen_pw.as_bytes(), kdf)?;
-    write_keyfile(&keyfile_path, &keyfile)?;
-    prompt.say(&format!("     keyfile written: {}", keyfile_path.display()));
-
-    // ---- Step 3: the categories -----------------------------------------
-    prompt.say("\n3/5  What gets bundled. `credentials` is the deliberate one — turning it on syncs saved logins.");
-    let categories = prompt.categories(&cfg.categories)?;
-    let chosen_cfg = SyncConfig {
-        categories: categories.clone(),
-        ..cfg.clone()
-    };
-    if categories != cfg.categories {
-        write_categories(&roots.config_file, &categories)?;
-        prompt.say(&format!("     saved to {}", roots.config_file.display()));
-    }
 
     // ---- Step 4: the size ------------------------------------------------
     let index = Index::at(&roots.index_file)?;
@@ -307,12 +372,24 @@ pub async fn run(
     if !prompt.confirm("     Pair this machine with that scope?", true)? {
         return Err(AppError::Other(
             "setup stopped at the size confirmation. Nothing was uploaded — this command \
-             never uploads — and the repository was not touched."
+             never uploads — the repository was not touched, and nothing was written here: \
+             no keyfile, no config change, no stored token. Re-run when you are ready."
                 .into(),
         ));
     }
 
-    // ---- Step 5: ready ---------------------------------------------------
+    // ---- Step 5: everything that persists --------------------------------
+    // Nothing above this line writes. The confirmation is the last thing that
+    // can abort, so it is the last thing before the first write (F-10).
+    write_keyfile(&keyfile_path, &keyfile)?;
+    prompt.say(&format!(
+        "\n5/5  keyfile written: {}",
+        keyfile_path.display()
+    ));
+    if categories != cfg.categories {
+        write_categories(&roots.config_file, &categories)?;
+        prompt.say(&format!("     saved to {}", roots.config_file.display()));
+    }
     let stored_at = prompt.store_token(&keep, &token_file).map_err(|e| {
         AppError::Other(format!(
             "could not save the GitHub sync token: {e}\n\
@@ -328,7 +405,6 @@ pub async fn run(
         stored_at,
         visibility: facts.visibility,
         warnings,
-        clearance,
         categories,
         keyfile: keyfile_path,
         reused_pairing: !drift.first_contact,
@@ -345,29 +421,53 @@ pub(crate) fn token_path(roots: &SyncRoots) -> PathBuf {
     roots.config_dir.join("sync-token")
 }
 
-/// Keep the promise `http::actionable`'s 401 arm makes.
+/// Take a rejected token out of circulation — the *right* one, and say which.
 ///
-/// That message tells the user the stored token "will be cleared". This is the
-/// only call site that does it — without this the sentence is a lie, and a user
-/// who re-authenticates believing they start clean walks into the same failure.
+/// Two predicates were wrong here, and they compounded (F-1):
 ///
-/// `clear` is a parameter because [`token::clear`] deletes the **real** login
-/// Keychain item on macOS, which no unit test may touch. Production passes
-/// `token::clear`; the test passes a recorder, which is what makes the pairing
-/// assertable rather than reviewable.
+/// - **The trigger** was `matches!(err, AppError::Credentials(_))`, which also
+///   catches `Client::get_json`'s "this token is not a legal HTTP header value".
+///   A token with one illegal byte silently deleted the Keychain item while
+///   printing a message about header validity. The trigger is now
+///   [`gate::FetchError::token_rejected`] — a 401 from GitHub, nothing else.
+/// - **The action** ignored the [`TokenSource`] it was handed. It is now the
+///   only thing that decides which store is touched; see
+///   [`token::clear_source`] for the sequence that destroyed a working token
+///   with no attacker involved.
+///
+/// The message follows the action rather than preceding it: `http::actionable`'s
+/// 401 arm no longer promises a clear it cannot know about, and
+/// [`token::clear_note`] states what was actually done, per source.
+///
+/// `clear` is a parameter because the production function deletes the **real**
+/// login Keychain item on macOS, which no unit test may touch. Production passes
+/// `token::clear_source`; the test passes a recorder, which is what makes the
+/// pairing assertable rather than reviewable.
 ///
 /// A failure to clear is deliberately swallowed: the original 401 is the thing
 /// the user needs to read, and burying it under a filesystem error would be
 /// worse than a token file that outlived its usefulness.
 pub(crate) fn clear_if_dead(
-    err: AppError,
+    err: gate::FetchError,
+    source: TokenSource,
     token_file: &Path,
-    clear: &dyn Fn(&Path) -> Result<()>,
+    clear: &dyn Fn(TokenSource, &Path) -> Result<()>,
 ) -> AppError {
-    if matches!(err, AppError::Credentials(_)) {
-        let _ = clear(token_file);
+    if !err.token_rejected {
+        return err.error;
     }
-    err
+    // The seam is not even reached for a source this tool has no store for —
+    // belt to `token::clear_source`'s braces, and what makes "the environment's
+    // token 401'd and nothing was deleted" assertable through the test double
+    // rather than only inside the production function.
+    if token::owns_a_store(source) {
+        let _ = clear(source, token_file);
+    }
+    AppError::Credentials(format!(
+        "{}\n{}",
+        err.error,
+        token::clear_note(source, token_file)
+    ))
 }
 
 /// D-01: nothing is guessed, and the failure names the exact fix.
@@ -466,9 +566,11 @@ pub(crate) struct Script {
     pub categories: Option<Vec<SyncCategory>>,
     pub confirm: bool,
     /// Token-file paths the flow asked to store / clear. Recorded rather than
-    /// acted on — no test may reach a real Keychain.
+    /// acted on — no test may reach a real Keychain. `cleared` carries the
+    /// `TokenSource` too: *which* store a 401 reaches is the whole question
+    /// (F-1), and a recorder that dropped it could not tell right from wrong.
     pub stored: Vec<PathBuf>,
-    pub cleared: Vec<PathBuf>,
+    pub cleared: Vec<(TokenSource, PathBuf)>,
 }
 
 #[cfg(test)]
@@ -523,8 +625,11 @@ impl SetupPrompt for Double {
         self.0.borrow_mut().stored.push(file.to_path_buf());
         Ok(TokenSource::File)
     }
-    fn clear_token(&self, file: &Path) -> Result<()> {
-        self.0.borrow_mut().cleared.push(file.to_path_buf());
+    fn clear_token(&self, source: TokenSource, file: &Path) -> Result<()> {
+        self.0
+            .borrow_mut()
+            .cleared
+            .push((source, file.to_path_buf()));
         Ok(())
     }
 }
@@ -560,7 +665,7 @@ mod tests {
 
     fn chain() -> token::TokenChain {
         token::TokenChain {
-            env_value: Some(FIXTURE.into()),
+            env_value: Some(Zeroizing::new(FIXTURE.into())),
             ..token::TokenChain::default()
         }
     }
@@ -617,9 +722,11 @@ mod tests {
             .await
             .unwrap();
 
+        // Categories first: the gate cannot be asked before the question it is
+        // being asked is settled (F-2).
         let reached = script.borrow().reached.clone();
-        assert_eq!(reached[0], "passphrase", "{reached:?}");
-        assert_eq!(reached[1], "categories", "{reached:?}");
+        assert_eq!(reached[0], "categories", "{reached:?}");
+        assert_eq!(reached[1], "passphrase", "{reached:?}");
         assert!(reached[2].starts_with("confirm:"), "{reached:?}");
         assert_eq!(reached.len(), 3, "{reached:?}");
 
@@ -672,7 +779,13 @@ mod tests {
         assert!(!rendered.contains(wrapped), "{rendered}");
     }
 
-    /// T-3-35, the whole ordering claim: a refusal never reaches step 2.
+    /// T-3-35, the whole ordering claim: a refusal never reaches the password
+    /// step, and never leaves a keyfile behind.
+    ///
+    /// The category question is the one thing a gate refusal now costs, and it
+    /// has to: it is the gate's own input (F-2). Everything that is not a gate
+    /// input still refuses with no prompt at all — which is why the two
+    /// token/repository failures are asserted separately and more strictly.
     #[tokio::test]
     async fn every_refusal_stops_before_the_password_step_is_reached() {
         for (body, status) in [(PUBLIC, 200), ("{}", 404), ("{}", 401)] {
@@ -681,11 +794,17 @@ mod tests {
             let err = drive(&cfg_for(Some("o/n")), &dir, body, status, &script)
                 .await
                 .expect_err("this repository is not pairable");
+            let reached = script.borrow().reached.clone();
             assert!(
-                script.borrow().reached.is_empty(),
-                "status {status} reached {:?}",
-                script.borrow().reached
+                !reached.iter().any(|r| r == "passphrase"),
+                "status {status} reached {reached:?}"
             );
+            if status != 200 {
+                assert!(
+                    reached.is_empty(),
+                    "a failure that is not a gate decision asks nothing: {reached:?}"
+                );
+            }
             assert!(!crate::sync::cli::keyfile_path(&roots_at(&dir)).exists());
             let _ = err;
         }
@@ -725,26 +844,79 @@ mod tests {
 
     // ---- the 401 promise -------------------------------------------------
 
-    /// The cross-plan promise from 3-CONTEXT: `http::actionable`'s 401 arm says
-    /// the stored token "will be cleared", and this is the call site that does
-    /// it. The clear is injected because the real one reaches the macOS login
-    /// Keychain.
+    /// F-1, both halves, on the function that decides them.
+    ///
+    /// The trigger used to be `matches!(err, AppError::Credentials(_))`, which
+    /// also catches `Client::get_json`'s "not a valid HTTP header value" — so a
+    /// malformed token deleted the Keychain item while printing about header
+    /// validity. And the action ignored the `TokenSource` entirely, deleting
+    /// both stores whatever had answered.
     #[test]
-    fn a_401_clears_the_stored_token_and_nothing_else_does() {
+    fn only_a_401_clears_and_it_clears_only_the_store_it_came_from() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("sync-token");
-        let cleared: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
-        let record = |p: &Path| {
-            cleared.borrow_mut().push(p.to_path_buf());
+        let cleared: RefCell<Vec<(TokenSource, PathBuf)>> = RefCell::new(Vec::new());
+        let record = |source: TokenSource, p: &Path| {
+            cleared.borrow_mut().push((source, p.to_path_buf()));
             Ok(())
         };
+        let dead = || gate::FetchError {
+            error: AppError::Credentials("GitHub rejected the sync token (401)".into()),
+            token_rejected: true,
+        };
 
-        let dead = AppError::Credentials("GitHub rejected the sync token (401)".into());
-        let returned = clear_if_dead(dead, &path, &record);
-        assert_eq!(cleared.borrow().as_slice(), std::slice::from_ref(&path));
-        // The 401 still reaches the user; clearing does not swallow it.
-        assert!(returned.to_string().contains("401"), "{returned}");
+        // (a) A `Credentials` error that is not a 401 clears nothing — the
+        // malformed-token path, which produces the same `AppError` arm.
+        let returned = clear_if_dead(
+            gate::FetchError {
+                error: AppError::Credentials(
+                    "the stored sync token is not a valid HTTP header value".into(),
+                ),
+                token_rejected: false,
+            },
+            TokenSource::Keychain,
+            &path,
+            &record,
+        );
+        assert!(
+            cleared.borrow().is_empty(),
+            "a token this build could not send is not a token GitHub rejected"
+        );
+        assert!(returned.to_string().contains("header value"), "{returned}");
 
+        // (b) Neither store belongs to this tool, so neither is touched — and
+        // the message names the thing the user must change instead.
+        for source in [TokenSource::Env, TokenSource::GhCli] {
+            let returned = clear_if_dead(dead(), source, &path, &record);
+            assert!(cleared.borrow().is_empty(), "{source:?} cleared something");
+            let text = returned.to_string();
+            assert!(text.contains("Nothing was cleared"), "{text}");
+            assert!(
+                text.contains("401"),
+                "the 401 still reaches the user: {text}"
+            );
+        }
+        assert!(
+            clear_if_dead(dead(), TokenSource::Env, &path, &record)
+                .to_string()
+                .contains("AI_USAGEBAR_SYNC_TOKEN"),
+            "the env arm names the variable that outranks every stored token"
+        );
+
+        // (c) The store that produced the rejected value, and only it.
+        for source in [TokenSource::Keychain, TokenSource::File] {
+            cleared.borrow_mut().clear();
+            let returned = clear_if_dead(dead(), source, &path, &record);
+            assert_eq!(
+                cleared.borrow().as_slice(),
+                &[(source, path.clone())],
+                "{source:?}"
+            );
+            assert!(returned.to_string().contains("removed"), "{returned}");
+        }
+
+        // Nothing else clears, whatever arm it lands on.
+        cleared.borrow_mut().clear();
         for keep in [
             AppError::Http {
                 status: 403,
@@ -756,35 +928,88 @@ mod tests {
             },
             AppError::Transport("connection reset".into()),
         ] {
-            clear_if_dead(keep, &path, &record);
+            clear_if_dead(
+                gate::FetchError {
+                    error: keep,
+                    token_rejected: false,
+                },
+                TokenSource::Keychain,
+                &path,
+                &record,
+            );
         }
-        assert_eq!(
-            cleared.borrow().len(),
-            1,
+        assert!(
+            cleared.borrow().is_empty(),
             "only a 401 clears — a 403 must keep a working token"
         );
     }
 
-    /// The promise's other half: the message the user actually reads says the
-    /// token will be cleared, so the wiring above is not decoration.
+    /// The documented configuration F-1 destroyed a credential in, end to end:
+    /// the value came from `AI_USAGEBAR_SYNC_TOKEN` (`chain()` sets it), so a
+    /// 401 takes out neither the Keychain item nor the token file — both of
+    /// which this run never sent — and says which variable to change.
     #[tokio::test]
-    async fn the_401_message_promises_the_clear_the_call_site_performs() {
+    async fn a_401_on_an_environment_token_clears_nothing_and_names_the_variable() {
         let dir = TempDir::new().unwrap();
         let script = Script::new();
         let err = drive(&cfg_for(Some("o/n")), &dir, "{}", 401, &script)
             .await
             .expect_err("401");
         assert!(matches!(err, AppError::Credentials(_)), "{err:?}");
-        assert!(err.to_string().contains("will be cleared"), "{err}");
-        // …and the flow actually cleared it, at the injected token path.
-        assert_eq!(
-            script.borrow().cleared.as_slice(),
-            std::slice::from_ref(&token_path(&roots_at(&dir)))
+        let text = err.to_string();
+        assert!(text.contains("That token is dead"), "{text}");
+        assert!(text.contains("Nothing was cleared"), "{text}");
+        assert!(text.contains("AI_USAGEBAR_SYNC_TOKEN"), "{text}");
+        assert!(
+            script.borrow().cleared.is_empty(),
+            "the stored token was never sent and is not this 401's to delete"
         );
         assert!(
             script.borrow().stored.is_empty(),
             "a dead token is not stored"
         );
+    }
+
+    /// …and the other side of the same wiring: a token that *did* come from the
+    /// file is cleared, at the injected path, and nowhere else.
+    #[tokio::test]
+    async fn a_401_on_a_file_token_clears_that_file_and_says_so() {
+        let dir = TempDir::new().unwrap();
+        let roots = roots_at(&dir);
+        let token_file = token_path(&roots);
+        std::fs::create_dir_all(token_file.parent().unwrap()).unwrap();
+        fs::write(&token_file, format!("{FIXTURE}\n")).unwrap();
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/repos/o/n")
+            .with_status(401)
+            .with_body("{}")
+            .create_async()
+            .await;
+
+        let script = Script::new();
+        let err = run(
+            &cfg_for(Some("o/n")),
+            &roots,
+            &endpoints_at(&server.url()),
+            &token::TokenChain {
+                file_path: Some(token_file.clone()),
+                ..token::TokenChain::default()
+            },
+            &mut Double(Rc::clone(&script)),
+            now(),
+        )
+        .await
+        .expect_err("401");
+
+        assert_eq!(
+            script.borrow().cleared.as_slice(),
+            &[(TokenSource::File, token_file.clone())]
+        );
+        let text = err.to_string();
+        assert!(text.contains(&token_file.display().to_string()), "{text}");
+        assert!(text.contains("has been removed"), "{text}");
     }
 
     /// A 403 keeps a working token (T-3-16): the message says so, and the flow
@@ -800,7 +1025,7 @@ mod tests {
         assert!(script.borrow().cleared.is_empty(), "a 403 must not clear");
     }
 
-    // ---- step 2 ----------------------------------------------------------
+    // ---- step 3: the passphrase and the keyfile --------------------------
 
     #[tokio::test]
     async fn the_keyfile_is_written_owner_only_inside_the_injected_directory() {
@@ -867,14 +1092,17 @@ mod tests {
             .await
             .expect_err("a keyfile is already there");
         assert!(err.to_string().contains("will not overwrite"), "{err}");
-        assert!(script.borrow().reached.is_empty(), "before step 2's prompt");
+        assert!(
+            script.borrow().reached.is_empty(),
+            "before any prompt at all — it is a local precondition, not a gate decision"
+        );
         assert_eq!(
             fs::read_to_string(&existing).unwrap(),
             "{\"already\":\"here\"}"
         );
     }
 
-    // ---- step 3 ----------------------------------------------------------
+    // ---- step 1: the categories ------------------------------------------
 
     #[tokio::test]
     async fn a_toggled_category_lands_in_the_injected_config_and_reads_back() {
@@ -928,7 +1156,8 @@ mod tests {
         assert!(!script.borrow().reached.is_empty(), "the flow continued");
     }
 
-    /// Credentials **on**: the same repository stops at step 1.
+    /// Credentials **on**: the same repository stops at the gate, having asked
+    /// only the one question the gate needed answered.
     #[tokio::test]
     async fn a_public_repository_with_credentials_on_stops_before_the_passphrase() {
         let dir = TempDir::new().unwrap();
@@ -937,7 +1166,62 @@ mod tests {
             .await
             .expect_err("credentials are in the bundle by default");
         assert!(err.to_string().contains("REFUSING TO PUSH"), "{err}");
-        assert!(script.borrow().reached.is_empty());
+        assert_eq!(script.borrow().reached, ["categories"]);
+    }
+
+    /// F-2, the composed path, exactly as it was reachable with default
+    /// answers: config says `categories = ["config"]`, so the *old* order took
+    /// D-04's carve-out and minted a clearance — and the user then added
+    /// `credentials` at a prompt nothing re-gated. Setup stored the token, wrote
+    /// the pairing record at `private: false`, and printed "ready to push".
+    ///
+    /// The gate is now asked the question the user actually answered.
+    #[tokio::test]
+    async fn adding_credentials_at_the_prompt_re_decides_the_public_repository() {
+        let dir = TempDir::new().unwrap();
+        let roots = roots_at(&dir);
+        // The carve-out's own configuration, so a gate reading `cfg` rather than
+        // the answer would clear this run.
+        let cfg = SyncConfig {
+            repo: Some("o/n".into()),
+            categories: vec![SyncCategory::Config],
+            ..SyncConfig::default()
+        };
+        let script = Script::new();
+        script.borrow_mut().categories =
+            Some(vec![SyncCategory::Config, SyncCategory::Credentials]);
+
+        let err = drive(&cfg, &dir, PUBLIC, 200, &script)
+            .await
+            .expect_err("a public repository does not hold credentials");
+        assert!(err.to_string().contains("REFUSING TO PUSH"), "{err}");
+        assert!(err.to_string().contains("rotate"), "{err}");
+
+        // …and none of the things that made it look cleared happened.
+        assert!(script.borrow().stored.is_empty(), "no token was stored");
+        assert!(!pairing::default_path(&roots).exists(), "no pairing record");
+        assert!(
+            !crate::sync::cli::keyfile_path(&roots).exists(),
+            "no keyfile"
+        );
+        let said = script.borrow().said.join("\n");
+        assert!(!said.contains("the gate passed"), "{said}");
+    }
+
+    /// The carve-out still lives, from the other direction: config carries
+    /// `credentials`, the user turns it *off* at the prompt, and the same public
+    /// repository proceeds with the warning. One evaluation, of the answer.
+    #[tokio::test]
+    async fn removing_credentials_at_the_prompt_re_decides_it_too() {
+        let dir = TempDir::new().unwrap();
+        let script = Script::new();
+        script.borrow_mut().categories = Some(vec![SyncCategory::Config]);
+
+        let out = drive(&cfg_for(Some("o/n")), &dir, PUBLIC, 200, &script)
+            .await
+            .expect("credentials are off, so public is a warning");
+        assert_eq!(out.categories, vec![SyncCategory::Config]);
+        assert!(out.warnings.iter().any(|w| w.contains("public")), "{out:?}");
     }
 
     // ---- pairing reuse, and the filesystem boundary -----------------------
@@ -1013,10 +1297,34 @@ mod tests {
         let script = Script::new();
         script.borrow_mut().confirm = false;
 
+        let config = dir.path().join("config.toml");
+        fs::write(&config, "[sync]\n").unwrap();
+        let before = fs::read_to_string(&config).unwrap();
+        script.borrow_mut().categories = Some(vec![SyncCategory::Config]);
+
         let err = drive(&cfg_for(Some("o/n")), &dir, PRIVATE, 200, &script)
             .await
             .expect_err("the user declined");
         assert!(err.to_string().contains("Nothing was uploaded"), "{err}");
         assert!(!pairing::default_path(&roots_at(&dir)).exists());
+
+        // F-10: the keyfile used to be written before this confirmation, and
+        // then refused the re-run — stranding the user behind a passphrase they
+        // were shown once, with no recovery by design. Nothing persists until
+        // the last thing that can abort has passed.
+        let keyfile = crate::sync::cli::keyfile_path(&roots_at(&dir));
+        assert!(!keyfile.exists(), "a declined setup leaves no keyfile");
+        assert_eq!(
+            fs::read_to_string(&config).unwrap(),
+            before,
+            "and no config write-back either"
+        );
+        assert!(script.borrow().stored.is_empty(), "and no stored token");
+
+        // …so the flow can simply be re-run, which is the whole point.
+        let again = Script::new();
+        drive(&cfg_for(Some("o/n")), &dir, PRIVATE, 200, &again)
+            .await
+            .expect("a declined setup is re-runnable");
     }
 }
