@@ -5,15 +5,15 @@ milestone_name: milestone
 current_phase: 5
 current_phase_name: pull-and-restore
 status: executing
-stopped_at: Milestone artifacts written (PROJECT, REQUIREMENTS, ROADMAP, STATE, research×3 +
-last_updated: "2026-08-19T16:50:50.537Z"
+stopped_at: Completed 5-08-PLAN.md — phase 5 complete
+last_updated: "2026-08-20T04:56:33.281Z"
 last_activity: 2026-08-19
-last_activity_desc: Phase 5 waves 1-2 merged; 4-08 remediation in flight
+last_activity_desc: Phase 1 execution started
 progress:
   total_phases: 6
-  completed_phases: 3
-  total_plans: 44
-  completed_plans: 40
+  completed_phases: 5
+  total_plans: 43
+  completed_plans: 38
 ---
 
 # Project State
@@ -30,12 +30,12 @@ usage as another's.
 ## Current Position
 
 Phase: 5 (pull-and-restore) — waves 1 and 2 merged
-Plan: 6 of 8 merged in phase 5
+Plan: 8 of 8 merged in phase 5
 Status: phases 1-3 code-complete + audited; phase 4 executing
 Last activity: 2026-08-19 — Phase 1 execution started
 and reconciled, REQUIREMENTS.md (37 v1) and ROADMAP.md (6 phases) written
 
-Progress: [███████░░░] ~72% (4 of 6 phases, phase 5 in flight)
+Progress: [█████████░] 88% (38 of 43 plans; phase 5 complete, phase 6 next)
 
 ## Performance Metrics
 
@@ -55,6 +55,12 @@ Progress: [███████░░░] ~72% (4 of 6 phases, phase 5 in fligh
 
 - Last 5 plans: —
 - Trend: —
+
+**Per-Plan Metrics:**
+
+| Plan | Duration | Tasks | Files |
+|------|----------|-------|-------|
+| Phase 5 P08 | ~2h | 3 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -87,6 +93,10 @@ Milestone-shaping decisions made during setup:
 - [Research]: Syncing credentials by default **overrides** the research recommendation not to;
   it is the user's stated purpose, bounded by the private-repo gate
 
+- [Phase ?]: 5-08: the e2e fixture is built by driving push::run, so every adversarial case is one mutation of a bundle the real push side produced
+- [Phase ?]: 5-08: root B's four sync roots all have different leaf names from A's — the only thing that proves the manifest path encoding is relocatable rather than accidentally identical
+- [Phase ?]: 5-08: no TDD RED gate on a plan that asserts already-merged behaviour; four negative controls in src/ (all reverted) are the equivalent evidence
+
 ### Pending Todos
 
 None yet.
@@ -97,13 +107,16 @@ None yet.
   private-repo release assets honour `Range:` (CAL-1, Phase 1), Claude Desktop LevelDB
   compaction behaviour (CAL-2, Phase 2), Argon2id timings on slow aarch64 Linux (CAL-3,
   Phase 1), and the real compressed size of the 115 MB default bundle (CAL-4, Phase 2).
-  Each has a named fallback so none can block its phase.
+  Each has a named fallback so can block its phase.
 
 - **`.planning/` must not reach an upstream PR.** This repo is a fork of
   `akitaonrails/ai-usagebar`; use `/gsd-pr-branch` to produce a clean PR branch.
 
 - **Phase 6 excludes the GNOME, KDE and Omarchy sync surfaces** (each is an independent
   frontend contract suite). Revisit if they should be in scope.
+
+- README.md's Sync section does not mention `sync pull` — the command a second machine's owner types is absent from the entry-point doc (5-08 was scoped to tests/ and docs/; four lines of work)
+- src/sync/restore/fetch.rs:60 derives MAX_SNAPSHOTS_IN_POINTER from a 'monthly retention tail' that does not exist in the code; the value is fine, the justification is not
 
 ## Deferred Items
 
@@ -113,8 +126,8 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-08-17
-Stopped at: Milestone artifacts written (PROJECT, REQUIREMENTS, ROADMAP, STATE, research×3 +
+Last session: 2026-08-20T04:56:25.738Z
+Stopped at: Completed 5-08-PLAN.md — phase 5 complete
 SUMMARY). Nothing implemented yet.
 Resume file: None
 
@@ -132,13 +145,16 @@ neither gates the code, so the run proceeds — but the roadmap checkbox stays h
 `1-HUMAN-UAT.md` is actually executed.
 
 **What the phase caught that planning did not:**
+
 - A measured defect — the *default* bundle's manifest (1558 entries, 448 KiB) could not seal
   against a 256 KiB chunk limit. Fixed in-phase (`1-09`) because `Root`'s shape is on-disk
   format and `1-07` was about to pin it.
+
 - An AEAD **nonce-reuse flaw** introduced by the fix for an earlier plan-review blocker: the
   nonce derived from the plaintext while the sealed message was the zstd frame. Invisible to
   all 13 adversarial tests and to the first verification pass; found only by auditing from the
   threat model rather than from the suite.
+
 - Three separate instances of *documentation describing behaviour that does not exist*, the
   last one still asserting the removed nonce rule after two remediation rounds.
 
@@ -211,11 +227,13 @@ blocking findings break exactly that, and none needs an attacker to be interesti
   not the root. Both publish at 7. `anchor::accept` reads an equal counter as "already seen", so
   restoring one machine's snapshot makes the other's read as a re-read. **A backup silently
   dropped by the control that exists to protect backups.**
+
 - **T-4-04.** The accept's justification names the anchor as the rollback defence.
   `grep -rn anchor src/sync/push/` returns three doc comments and zero reads. An authentic old
   pointer is laundered by the next honest push, and then prune deletes every pack the rollback
   orphaned — older than `PRUNE_GRACE`, so uncovered. Reversible tamper becomes irreversible
   deletion, executed by the victim, exit 0.
+
 - **T-4-45.** `ensure_keyfile` publishes *this* machine's keyfile. A machine that has not rekeyed
   re-uploads the old wrapper the rekeying machine had verifiably destroyed, and each push resets
   its `created_at` so the grace window never expires. The password change was cosmetic. The code
