@@ -293,6 +293,29 @@ impl Client {
                     MAX_BODY_BYTES as u64,
                 )
                 .await?;
+            if status == StatusCode::UNPROCESSABLE_ENTITY {
+                // GitHub will not tag a repository that has no commits, and it
+                // says only "Validation Failed". An empty repository is exactly
+                // what `gh repo create --private` leaves behind, so this is the
+                // ordinary first-run state — and the generic 422 text sends the
+                // user to the status page for something that is not an outage.
+                //
+                // `NotFound` because its `Display` is the message verbatim and
+                // `is_retryable` never retries it, and because what GitHub
+                // cannot find is a commit to tag.
+                return Err(GithubError::NotFound {
+                    message: format!(
+                        "{}/{} has no commits yet, so GitHub will not create the release \
+                     the packs hang off.\n\
+                     Give it one — a README is enough — and re-run this command:\n\
+                     \x20 gh api repos/{}/{}/contents/README.md -X PUT \\\n\
+                     \x20   -f message=init -f content=\"$(printf '# sync' | base64)\"\n\
+                     Nothing was uploaded. A repository created with `--add-readme` \
+                     does not hit this.",
+                        repo.owner, repo.name, repo.owner, repo.name
+                    ),
+                });
+            }
             if !status.is_success() {
                 return Err(http::classify(status, &headers, &body, now));
             }
@@ -843,6 +866,59 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(id, 5);
+        post.assert_async().await;
+    }
+
+    /// A repository with no commits cannot be tagged, so GitHub answers the
+    /// release `POST` with a bare 422 "Validation Failed".
+    ///
+    /// This is the **ordinary first-run state**, not an exotic one:
+    /// `gh repo create --private` leaves a repository with zero commits, and a
+    /// user who follows the README's own recipe lands here on their first push.
+    /// The generic 422 text told them to check GitHub's status page and retry,
+    /// which is advice for an outage that is not happening.
+    ///
+    /// Asserted on the *content* of the message rather than the variant: what
+    /// failed here is that the user could not tell what to do next.
+    #[tokio::test]
+    async fn a_repository_with_no_commits_says_so_instead_of_blaming_github() {
+        let mut server = mockito::Server::new_async().await;
+        let _get = server
+            .mock("GET", "/repos/o/n/releases/tags/ai-usagebar-sync-v1")
+            .with_status(404)
+            .with_body(r#"{"message":"Not Found"}"#)
+            .create_async()
+            .await;
+        // Exactly what GitHub returns for a tag against an empty repository:
+        // no `errors` array, no field, no hint.
+        let post = server
+            .mock("POST", "/repos/o/n/releases")
+            .with_status(422)
+            .with_body(r#"{"message":"Validation Failed"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let err = client_at(&server.url())
+            .ensure_release(&repo(), "ai-usagebar-sync-v1", &permit(), NOW)
+            .await
+            .expect_err("an empty repository cannot hold a release");
+        let text = err.to_string();
+
+        assert!(text.contains("o/n has no commits yet"), "{text}");
+        assert!(
+            text.contains("gh api repos/o/n/contents/README.md"),
+            "the message carries the command that fixes it: {text}"
+        );
+        assert!(
+            text.contains("Nothing was uploaded"),
+            "a refusal says what did not happen: {text}"
+        );
+        assert!(
+            !text.contains("githubstatus"),
+            "an empty repository is not an outage: {text}"
+        );
+        // One attempt: retrying cannot make commits appear.
         post.assert_async().await;
     }
 
