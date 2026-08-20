@@ -168,7 +168,14 @@ pub enum Command {
 pub enum SyncAction {
     /// What sync would carry: per-category file counts and raw bytes, plus
     /// when it last ran. Reads only — nothing is uploaded or written.
-    Status,
+    Status {
+        /// Machine-readable output, consumed by the macOS menu bar.
+        ///
+        /// Answers from the stat sweep alone: it builds no plan and contacts no
+        /// network, so it never wants a password and never blocks on one.
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Pair this machine with the private GitHub repository named in
     /// `[sync] repo`.

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 
-use crate::config::{Config, SyncCategory};
+use crate::config::{Config, SyncCategory, SyncConfig};
 use crate::sync::crypto::{KdfParams, Keyfile, Keys, content_address};
 use crate::sync::github::setup::TtyPrompt;
 use crate::sync::github::{
@@ -74,7 +74,7 @@ pub fn run_with(
     now: DateTime<Utc>,
 ) -> i32 {
     match action {
-        SyncAction::Status => status(cfg, roots, endpoints, chain, now),
+        SyncAction::Status { json } => status(cfg, roots, endpoints, chain, now, *json),
         SyncAction::Setup => setup(cfg, roots, endpoints, chain, now),
         SyncAction::Push {
             dry_run: true,
@@ -165,22 +165,62 @@ fn open_index(roots: &SyncRoots) -> Option<Index> {
 /// category listing visible (a user should be able to see what *would* be sent
 /// without authenticating), but a repository-section failure is still a
 /// non-zero exit (D-06, REPO-05, T-3-41).
+///
+/// **`--json` resolves strictly less.** It builds no plan and asks GitHub
+/// nothing, because the object it prints has no key for either: the whole
+/// point of the machine-readable form is that a menu bar can call it on every
+/// menu open. A plan would want the sync password on a stdin a subprocess has
+/// no way to answer (D-02) and would open file bodies to get it; a repository
+/// section would put a network round-trip behind a UI gesture (T-6-04).
 fn status(
     config: &Config,
     roots: &SyncRoots,
     endpoints: &Endpoints,
     chain: &TokenChain,
     now: DateTime<Utc>,
+    json: bool,
 ) -> i32 {
     let index = open_index(roots);
-    // UX-02 is "what would change now", so status builds a plan when it can —
-    // and still prints plan 2-01's counts-only form when it cannot.
-    let (plan, _) = try_plan(roots, config, index.as_ref(), now);
-    let repo = resolve_repo_section(config, roots, endpoints, chain, now);
-    let failed = repo.failure.is_some();
-    let report = report::build_status(roots, &config.sync, index.as_ref(), now, plan, Some(repo));
-    print!("{}", report::render_status(&report));
-    i32::from(failed)
+    let (plan, repo) = if json {
+        (None, None)
+    } else {
+        // UX-02 is "what would change now", so status builds a plan when it can
+        // — and still prints plan 2-01's counts-only form when it cannot.
+        let (plan, _) = try_plan(roots, config, index.as_ref(), now);
+        (
+            plan,
+            Some(resolve_repo_section(config, roots, endpoints, chain, now)),
+        )
+    };
+    let (code, out) = status_with(roots, &config.sync, index.as_ref(), now, plan, repo, json);
+    print!("{out}");
+    code
+}
+
+/// One built [`report::StatusReport`], rendered one of two ways — which is what
+/// keeps the text and the JSON from ever disagreeing about the same run.
+///
+/// Everything the real world supplies arrives as an argument, so no test on
+/// this path calls `Config::load`, `SyncRoots::resolve`, `index::default_path`
+/// or `Utc::now`.
+fn status_with(
+    roots: &SyncRoots,
+    cfg: &SyncConfig,
+    index: Option<&Index>,
+    now: DateTime<Utc>,
+    plan: Option<plan::SyncPlan>,
+    repo: Option<RepoSection>,
+    json: bool,
+) -> (i32, String) {
+    // D-06: the listing survives a repository incident; the exit code does not.
+    let failed = repo.as_ref().is_some_and(|r| r.failure.is_some());
+    let report = report::build_status(roots, cfg, index, now, plan, repo);
+    let out = if json {
+        format!("{}\n", report::status_json(&report))
+    } else {
+        report::render_status(&report)
+    };
+    (i32::from(failed), out)
 }
 
 /// The repository section, or the reason there is none.
@@ -1314,7 +1354,12 @@ mod tests {
             assert!(text.contains(category.label()), "{text}");
         }
         assert_eq!(
-            drive(&SyncAction::Status, &cfg, &dir, "http://127.0.0.1:1"),
+            drive(
+                &SyncAction::Status { json: false },
+                &cfg,
+                &dir,
+                "http://127.0.0.1:1"
+            ),
             0,
             "an unconfigured machine is not a failure"
         );
@@ -1345,7 +1390,7 @@ mod tests {
         .unwrap();
 
         let code = drive(
-            &SyncAction::Status,
+            &SyncAction::Status { json: false },
             &cfg_with_repo(Some("o/n")),
             &dir,
             &server.url(),
@@ -1423,7 +1468,15 @@ mod tests {
             text.contains("config"),
             "the categories are still there: {text}"
         );
-        assert_ne!(drive(&SyncAction::Status, &cfg, &dir, &server.url()), 0);
+        assert_ne!(
+            drive(
+                &SyncAction::Status { json: false },
+                &cfg,
+                &dir,
+                &server.url()
+            ),
+            0
+        );
     }
 
     // ---- 4-01: the push, end to end ---------------------------------------
@@ -1953,7 +2006,7 @@ mod tests {
         assert!(text.contains("credentials"), "the listing survives: {text}");
         assert_ne!(
             run_with(
-                &SyncAction::Status,
+                &SyncAction::Status { json: false },
                 &cfg,
                 &roots,
                 &Endpoints {
@@ -1974,7 +2027,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cfg = cfg_with_repo(Some("o/n"));
         assert_ne!(
-            drive(&SyncAction::Status, &cfg, &dir, "http://127.0.0.1:1"),
+            drive(
+                &SyncAction::Status { json: false },
+                &cfg,
+                &dir,
+                "http://127.0.0.1:1"
+            ),
             0
         );
         let repo = section_for(&cfg, &dir, "http://127.0.0.1:1");
