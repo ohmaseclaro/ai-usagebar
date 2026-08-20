@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
+use chrono::{DateTime, Utc};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Modifier;
@@ -23,7 +24,7 @@ use ratatui_bubbletea_theme::BubbleTheme;
 use serde::{Deserialize, Serialize};
 use toml_edit::{DocumentMut, value};
 
-use crate::config::Config;
+use crate::config::{Config, SyncCategory};
 use crate::error::{AppError, Result};
 use crate::theme::Theme;
 use crate::tui::style::bubble_theme;
@@ -132,11 +133,13 @@ fn config_inline_key<'a>(cfg: &'a Config, section: &str) -> Option<&'a str> {
     }
 }
 
-/// Which control has keyboard focus. `Key(i)` indexes into [`KEY_VENDORS`].
+/// Which control has keyboard focus. `Key(i)` indexes into [`KEY_VENDORS`];
+/// `SyncCategory(i)` indexes into [`SyncCategory::ALL`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Primary,
     Key(usize),
+    SyncCategory(usize),
     Save,
 }
 
@@ -145,7 +148,9 @@ impl Focus {
         match self {
             Focus::Primary => Focus::Key(0),
             Focus::Key(i) if i + 1 < KEY_VENDORS.len() => Focus::Key(i + 1),
-            Focus::Key(_) => Focus::Save,
+            Focus::Key(_) => Focus::SyncCategory(0),
+            Focus::SyncCategory(i) if i + 1 < SyncCategory::ALL.len() => Focus::SyncCategory(i + 1),
+            Focus::SyncCategory(_) => Focus::Save,
             Focus::Save => Focus::Primary,
         }
     }
@@ -154,7 +159,9 @@ impl Focus {
             Focus::Primary => Focus::Save,
             Focus::Key(0) => Focus::Primary,
             Focus::Key(i) => Focus::Key(i - 1),
-            Focus::Save => Focus::Key(KEY_VENDORS.len() - 1),
+            Focus::SyncCategory(0) => Focus::Key(KEY_VENDORS.len() - 1),
+            Focus::SyncCategory(i) => Focus::SyncCategory(i - 1),
+            Focus::Save => Focus::SyncCategory(SyncCategory::ALL.len() - 1),
         }
     }
 }
@@ -263,12 +270,36 @@ pub struct SettingsState {
     pub primary: VendorId,
     /// One input per [`KEY_VENDORS`] entry, same order.
     pub keys: Vec<KeyInput>,
+    /// What encrypted sync collects — one row per [`SyncCategory::ALL`] entry,
+    /// in that order. This is a projection of [`crate::config::SyncConfig::categories`],
+    /// not a parallel truth: it round-trips through the same TOML key.
+    pub sync_categories: Vec<(SyncCategory, bool)>,
+    /// When sync last completed, as the local index reports it. `None` is the
+    /// normal never-synced answer *and* the answer when the index could not be
+    /// read — the same conflation `ai-usagebar sync status` already makes.
+    ///
+    /// It arrives on the state rather than being read here: the overlay must
+    /// not open a database (nor walk a transcript tree) to draw itself.
+    pub sync_last_sync: Option<DateTime<Utc>>,
+    /// True once the user has toggled a row. Only then does save write
+    /// `[sync] categories` — an untouched save must not turn "never chose"
+    /// into a persisted choice, the same discipline the primary selector and
+    /// the key fields already follow.
+    pub sync_dirty: bool,
     /// One-line status displayed in the footer ("saved …", "save failed …").
     pub status: String,
 }
 
 impl SettingsState {
+    /// Pure: config in, state out. No filesystem, no clock, no `$HOME`.
+    /// Last-sync is unknown here; see [`SettingsState::from_config_with_sync`].
     pub fn from_config(cfg: &Config) -> Self {
+        Self::from_config_with_sync(cfg, None)
+    }
+
+    /// Same, plus the last-sync instant the caller already had. The caller
+    /// owns that read because it is the one that may touch the index file.
+    pub fn from_config_with_sync(cfg: &Config, last_sync: Option<DateTime<Utc>>) -> Self {
         let keys = KEY_VENDORS
             .iter()
             .map(|kv| KeyInput::from_config(config_inline_key(cfg, kv.section)))
@@ -283,11 +314,18 @@ impl SettingsState {
             .filter(|vendor| primary_choices.contains(vendor))
             .or_else(|| primary_choices.first().copied())
             .unwrap_or_else(|| cfg.ui.primary.unwrap_or(VendorId::Anthropic));
+        let sync_categories = SyncCategory::ALL
+            .iter()
+            .map(|cat| (*cat, cfg.sync.includes(*cat)))
+            .collect();
         Self {
             focus: Focus::Primary,
             primary_choices,
             primary,
             keys,
+            sync_categories,
+            sync_last_sync: last_sync,
+            sync_dirty: false,
             status: String::new(),
         }
     }
@@ -384,6 +422,7 @@ pub fn handle_key(state: &mut SettingsState, code: KeyCode, mods: KeyModifiers) 
                 handle_input(input, code);
             }
         }
+        Focus::SyncCategory(i) => toggle_sync_category(state, i, code),
         Focus::Save => {
             if matches!(code, KeyCode::Enter) {
                 return try_save(state);
@@ -391,6 +430,20 @@ pub fn handle_key(state: &mut SettingsState, code: KeyCode, mods: KeyModifiers) 
         }
     }
     Action::Continue
+}
+
+/// Space or Enter flips exactly one row. Deliberately **not** Left/Right:
+/// those mean "cycle a choice" on the Primary row, and a mis-aimed arrow must
+/// not be able to change which credentials are eligible to leave the machine
+/// (T-6-20). Modifier chords were already swallowed above.
+fn toggle_sync_category(state: &mut SettingsState, index: usize, code: KeyCode) {
+    if !matches!(code, KeyCode::Char(' ') | KeyCode::Enter) {
+        return;
+    }
+    if let Some(row) = state.sync_categories.get_mut(index) {
+        row.1 = !row.1;
+        state.sync_dirty = true;
+    }
 }
 
 fn try_save(state: &mut SettingsState) -> Action {
@@ -856,6 +909,12 @@ pub fn render(f: &mut Frame, area: Rect, state: &SettingsState, theme: &Theme) {
             ("↑↓/tab", "move"),
             ("type", "edit key"),
             ("^V", "reveal"),
+            ("^S", "save"),
+            ("esc", "close"),
+        ]),
+        Focus::SyncCategory(_) => bubble.help_line([
+            ("↑↓/tab", "move"),
+            ("space/enter", "toggle"),
             ("^S", "save"),
             ("esc", "close"),
         ]),
@@ -1699,7 +1758,10 @@ enabled = true
         let s = SettingsState::from_config_with_sync(&cfg, Some(at));
         assert_eq!(s.sync_last_sync, Some(at));
         // The seam changes nothing else about the state.
-        assert_eq!(s.sync_categories, SettingsState::from_config(&cfg).sync_categories);
+        assert_eq!(
+            s.sync_categories,
+            SettingsState::from_config(&cfg).sync_categories
+        );
     }
 
     #[test]
