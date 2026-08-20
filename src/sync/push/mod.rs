@@ -308,6 +308,17 @@ pub async fn run(mut ctx: PushCtx<'_>, progress: &mut dyn Progress) -> Result<Pu
         }
     };
 
+    // 6b. The wrapped master key, published under its own content address.
+    //     Idempotent, so after the first push it costs one listing.
+    //
+    //     **After the re-gate, not before.** Without it a first push would
+    //     publish a pointer naming a keyfile asset that does not exist and no
+    //     second machine could bootstrap — but it is the wrapped master key,
+    //     the most sensitive object in the bundle, and `went_public_mid_push`
+    //     deletes pack names only. Uploading it before the gate would leave it
+    //     behind in a repository that had just turned readable.
+    upload::ensure_keyfile(&ctx, release_id, &permit).await?;
+
     // 7. **The only commit point.** Everything above is inert without it.
     let record = SnapshotRecord {
         root: B64.encode(&bundle.root),

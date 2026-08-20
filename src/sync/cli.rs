@@ -22,7 +22,7 @@ use crate::sync::github::{
     self, Client, Endpoints, RepoRef, gate, pairing, token, token::TokenChain,
 };
 use crate::sync::index::Index;
-use crate::sync::push::progress::Silent;
+use crate::sync::push::progress;
 use crate::sync::push::{self, PushCtx, PushOutcome};
 use crate::sync::report::{DryRunReport, RepoSection};
 use crate::sync::{SyncRoots, passphrase, plan, report};
@@ -561,9 +561,11 @@ fn push_with_parts(
         Err(why) => return refuse(&why),
     };
     let ctx = context(cfg, roots, keyfile, parts, now);
-    // `Silent` until plan 4-03 adds the terminal and non-terminal reporters
-    // behind the same trait; the uploader already calls every hook.
-    match rt.block_on(push::run(ctx, &mut Silent)) {
+    // A progress line on a terminal, plain completed-asset lines when piped.
+    // `is_terminal` is read here rather than inside the reporter so tests can
+    // pin either shape without a tty.
+    let mut progress = progress::reporter(std::io::stderr().is_terminal());
+    match rt.block_on(push::run(ctx, progress.as_mut())) {
         Ok(outcome) => {
             print!("{}", render_push(&outcome));
             0
@@ -1094,6 +1096,12 @@ mod tests {
             Keyfile::create_with_floor(b"correct horse battery staple", cheap, cheap.m_kib)
                 .unwrap();
         let asset = keyfile_asset_for(&file).unwrap();
+        // `ensure_keyfile` publishes the keyfile from disk, exactly as `sync
+        // setup` writes it — so the fixture has to have written it. Holding the
+        // `Keyfile` only in memory made every push fail at the keyfile hop.
+        let keyfile_path = keyfile_path(&roots);
+        fs::create_dir_all(keyfile_path.parent().unwrap()).unwrap();
+        fs::write(&keyfile_path, serde_json::to_vec_pretty(&file).unwrap()).unwrap();
         pairing::write_to(
             &pairing::default_path(&roots),
             &pairing::Pairing {
@@ -1207,7 +1215,12 @@ mod tests {
             .match_query(mockito::Matcher::Any)
             .with_status(200)
             .with_body("[]")
-            .expect(1)
+            // How many listings a push makes depends on how far it gets: the
+            // resume scan always, `ensure_keyfile`'s own listing only if the
+            // re-gate passes. `expect_at_least(1)` so the incident path, which
+            // stops before the keyfile hop, still leaves its own listing mock
+            // unsatisfied — mockito prefers a matching mock still missing hits.
+            .expect_at_least(1)
             .create();
 
         // The body is recorded from `with_body_from_request`, not from
@@ -1219,7 +1232,7 @@ mod tests {
             .mock("POST", mockito::Matcher::Regex("/releases/9/assets".into()))
             .with_status(201)
             .with_body_from_request(move |req| {
-                let name = asset_name_in(req.path_and_query().as_ref());
+                let name = asset_name_in(req.path_and_query());
                 let mut held = recorder.lock().unwrap();
                 held.push((name.clone(), req.body().unwrap().clone()));
                 asset_json_sized(held.len() as u64, &name, held.last().unwrap().1.len())
@@ -1235,7 +1248,7 @@ mod tests {
             )
             .with_status(200)
             .with_body_from_request(move |req| {
-                let id = asset_id_in(req.path().as_ref());
+                let id = asset_id_in(req.path());
                 echo.lock()
                     .unwrap()
                     .get(id - 1)
@@ -1277,9 +1290,23 @@ mod tests {
         );
         gate.assert();
         flip.assert();
+        let uploaded = sent.lock().unwrap();
         assert!(
-            !sent.lock().unwrap().is_empty(),
-            "one pack's bytes reached the uploads host"
+            uploaded.iter().any(|(name, _)| name.starts_with("pack-")),
+            "pack bytes reached the uploads host: {:?}",
+            uploaded.iter().map(|(n, _)| n).collect::<Vec<_>>()
+        );
+        // The call-site guard. `ensure_keyfile` shipped once with no caller at
+        // all, its own tests green because they called it directly — the third
+        // time this milestone has produced a tested function nothing invokes.
+        // A first push that skips it publishes a pointer naming a keyfile asset
+        // that does not exist, and no second machine can bootstrap from it.
+        assert!(
+            uploaded
+                .iter()
+                .any(|(name, _)| name.starts_with("keyfile-")),
+            "the wrapped master key is published, not merely addressed: {:?}",
+            uploaded.iter().map(|(n, _)| n).collect::<Vec<_>>()
         );
     }
 
@@ -1341,7 +1368,7 @@ mod tests {
             )
             .with_status(204)
             .with_body_from_request(move |req| {
-                recorder.lock().unwrap().push(asset_id_in(req.path().as_ref()));
+                recorder.lock().unwrap().push(asset_id_in(req.path()));
                 Vec::new()
             })
             .create();
