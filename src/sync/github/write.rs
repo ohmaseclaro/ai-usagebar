@@ -14,6 +14,26 @@
 //! place in the crate that turns it into a header value; no code below ever
 //! names it.
 //!
+//! **Every verb that can write takes a [`gate::Pushing`](super::gate::Pushing).**
+//! That is plan 3-08's contract, and it is what makes the private-repo gate
+//! structurally prior to the first byte rather than merely earlier in a
+//! narrative: a `Pushing` exists only as the output of
+//! `assert_pushable(…)?.0.spend(now)?`, so a call that reaches this file at all
+//! proves a visibility check that was fresh within `MAX_CLEARANCE_AGE`.
+//!
+//! It is taken by **reference**, not by value, and the distinction is deliberate.
+//! One push legitimately writes many times under one clearance — a release, `n`
+//! pack assets, then the pointer — so by-value consumption at this level would
+//! mean either one write per gate call or a permit handed back and forth. The
+//! by-value consumption lives where "once" is the real semantics: at the entry
+//! points in `src/sync/push/`, each of which mints its own permit and holds it
+//! for exactly the span of writes it is gating. The flip gets a **second**
+//! permit, minted by the re-gate after the uploads, which is D3.
+//!
+//! The three read verbs — [`Client::list_assets`], [`Client::download_asset`],
+//! [`Client::get_contents`] — take no permit. Reading a private repository is
+//! what the gate exists to *establish*, not something it needs to authorise.
+//!
 //! Owned by plan 4-01. Its six signatures are frozen: plans 4-03 through 4-06
 //! build against them in parallel worktrees.
 
@@ -29,6 +49,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{AppError, Result};
 use crate::vendor::{HTTP_CLIENT_TIMEOUT, MAX_BODY_BYTES, read_body_capped};
 
+use super::gate::Pushing;
 use super::http::{self, GithubError};
 use super::{ACCEPT_JSON, Client, RepoRef};
 
@@ -232,6 +253,7 @@ impl Client {
         &self,
         repo: &RepoRef,
         tag: &str,
+        _permit: &Pushing,
         now: DateTime<Utc>,
     ) -> Result<u64> {
         let existing = retried(now, || async {
@@ -337,6 +359,7 @@ impl Client {
         release_id: u64,
         name: &str,
         body: Vec<u8>,
+        permit: &Pushing,
         now: DateTime<Utc>,
     ) -> Result<Asset> {
         // Our asset names are a literal prefix plus 64 hex characters plus an
@@ -386,6 +409,10 @@ impl Client {
         })
         .await?;
 
+        // `permit` is bound rather than `_`-prefixed because the already-exists
+        // arm below re-lists, and a reader of this function should see that the
+        // permit governs the POST above and nothing else.
+        let _ = permit;
         if let Some(asset) = uploaded {
             return Ok(asset);
         }
@@ -415,6 +442,7 @@ impl Client {
         &self,
         repo: &RepoRef,
         asset_id: u64,
+        _permit: &Pushing,
         now: DateTime<Utc>,
     ) -> Result<()> {
         retried(now, || async {
@@ -581,6 +609,7 @@ impl Client {
         message: &str,
         body: &[u8],
         sha: Option<&str>,
+        _permit: &Pushing,
         now: DateTime<Utc>,
     ) -> Result<String> {
         let content = B64.encode(body);
@@ -705,6 +734,27 @@ mod tests {
         RepoRef::parse("o/n").unwrap()
     }
 
+    /// A permit through the only door there is: a private repository, gated and
+    /// spent at the test's fixed clock. There is no constructor to shortcut, so
+    /// this is also a standing check that the gate still clears a private repo.
+    fn permit() -> crate::sync::github::gate::Pushing {
+        let facts = crate::sync::github::gate::RepoFacts {
+            id: 1,
+            private: true,
+            visibility: "private".into(),
+            owner_login: "o".into(),
+            owner_id: 7,
+            archived: false,
+            fork: false,
+            admin_permission: false,
+        };
+        crate::sync::github::gate::assert_pushable(&facts, &repo(), true, NOW)
+            .expect("a private repository clears")
+            .0
+            .spend(NOW)
+            .expect("freshly minted")
+    }
+
     /// Both bases at one server — which is exactly what makes the uploads host
     /// testable, and the reason `Endpoints` has carried two fields since 3-01.
     fn client_at(base: &str) -> Client {
@@ -750,7 +800,7 @@ mod tests {
             .await;
 
         let id = client_at(&server.url())
-            .ensure_release(&repo(), "ai-usagebar-sync-v1", NOW)
+            .ensure_release(&repo(), "ai-usagebar-sync-v1", &permit(), NOW)
             .await
             .unwrap();
         assert_eq!(id, 77);
@@ -779,7 +829,7 @@ mod tests {
             .await;
 
         let id = client_at(&server.url())
-            .ensure_release(&repo(), "ai-usagebar-sync-v1", NOW)
+            .ensure_release(&repo(), "ai-usagebar-sync-v1", &permit(), NOW)
             .await
             .unwrap();
         assert_eq!(id, 5);
@@ -858,7 +908,14 @@ mod tests {
             .await;
 
         let asset = client_split(&api.url(), &uploads.url())
-            .upload_asset(&repo(), 9, "pack-aa.bin", b"packbytes".to_vec(), NOW)
+            .upload_asset(
+                &repo(),
+                9,
+                "pack-aa.bin",
+                b"packbytes".to_vec(),
+                &permit(),
+                NOW,
+            )
             .await
             .unwrap();
         assert_eq!(asset.id, 42);
@@ -889,7 +946,14 @@ mod tests {
             .await;
 
         let asset = client_at(&server.url())
-            .upload_asset(&repo(), 9, "pack-aa.bin", b"packbytes".to_vec(), NOW)
+            .upload_asset(
+                &repo(),
+                9,
+                "pack-aa.bin",
+                b"packbytes".to_vec(),
+                &permit(),
+                NOW,
+            )
             .await
             .unwrap();
         assert_eq!(asset.id, 42);
@@ -899,7 +963,14 @@ mod tests {
     #[tokio::test]
     async fn an_asset_name_outside_the_generated_shape_is_refused_before_any_request() {
         let err = client_at("http://127.0.0.1:1")
-            .upload_asset(&repo(), 9, "pack-../../etc.bin", b"x".to_vec(), NOW)
+            .upload_asset(
+                &repo(),
+                9,
+                "pack-../../etc.bin",
+                b"x".to_vec(),
+                &permit(),
+                NOW,
+            )
             .await
             .expect_err("that is not a generated asset name");
         assert!(err.to_string().contains("content address"), "{err}");
@@ -923,9 +994,12 @@ mod tests {
             .await;
 
         let client = client_at(&server.url());
-        client.delete_asset(&repo(), 1, NOW).await.unwrap();
         client
-            .delete_asset(&repo(), 2, NOW)
+            .delete_asset(&repo(), 1, &permit(), NOW)
+            .await
+            .unwrap();
+        client
+            .delete_asset(&repo(), 2, &permit(), NOW)
             .await
             .expect("gone is the outcome the caller asked for");
     }
@@ -1088,7 +1162,15 @@ mod tests {
 
         let client = client_at(&server.url());
         let sha = client
-            .put_contents(&repo(), "sync/pointer.json", "first", b"{}", None, NOW)
+            .put_contents(
+                &repo(),
+                "sync/pointer.json",
+                "first",
+                b"{}",
+                None,
+                &permit(),
+                NOW,
+            )
             .await
             .unwrap();
         assert_eq!(sha, "new1");
@@ -1099,6 +1181,7 @@ mod tests {
                 "second",
                 b"{}",
                 Some("old1"),
+                &permit(),
                 NOW,
             )
             .await
@@ -1128,7 +1211,15 @@ mod tests {
             .await;
 
         let err = client_at(&server.url())
-            .put_contents(&repo(), "sync/pointer.json", "m", b"{}", None, NOW)
+            .put_contents(
+                &repo(),
+                "sync/pointer.json",
+                "m",
+                b"{}",
+                None,
+                &permit(),
+                NOW,
+            )
             .await
             .expect_err("422 here is a conflict");
         assert!(
