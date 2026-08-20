@@ -27,12 +27,12 @@ usage as another's.
 
 ## Current Position
 
-Phase: 5 (pull-and-restore) — complete, all 8 merged
-Plan: 8 of 8 merged in phase 5
-Status: Phase complete — ready for verification
+Phase: 6 (surfaces-and-ship) — complete
+Plan: all merged
+Status: code complete, gates green, awaiting the human tag and a real two-machine run
 Last activity: 2026-08-20
 
-Progress: [██████████] 100%
+Progress: [██████████] 100% code-complete — tag is the user's
 
 ## Performance Metrics
 
@@ -299,3 +299,48 @@ Two related refusals, both correct and both worth keeping as precedent:
 - `5-02` refused the plan's `MAX_RESTORE_BYTES = MAX_PACKS_PER_RESTORE * PACK_MAX`: the count
   check refuses at 513 packs, so that sum is unreachable and the check would be dead code. The
   two now bound different resources and each is reached by its own test.
+
+## Closing state — 2026-08-20
+
+**1722 tests, 0 failures.** clippy `-D warnings` 0, `cargo fmt --check` clean, `make test` green
+(cargo + GNOME + KDE + Omarchy), `./macos/run-tests.sh` 239 assertions, `cargo machete` clean.
+`ai-usagebar --version` → 1.4.0.
+
+**Upstream was merged rather than ignored.** While the milestone ran, `akitaonrails` shipped
+v1.2.0, v1.3.0 and v1.3.1 — 53 files, 5524 insertions, including the `nous` and `opencode-go`
+vendors. Two facts made this non-optional: `v1.2.0` **already existed as a tag**, so the prepared
+release could not be tagged at all; and `packaging/aur/PKGBUILD` fetches
+`$url/archive/refs/tags/v$pkgver.tar.gz` against the **upstream** URL, so an AUR build at 1.2.0
+would have succeeded and shipped upstream's code under our version — worse than failing.
+
+Twelve conflicts, every one resolved as a **union rather than a choice**: both command dispatches,
+both clap subcommand trees, both test modules, both changelog histories. 1.4.0 sits above
+upstream's newest tag. Both `.SRCINFO`s regenerated with `makepkg` in `archlinux:base-devel`,
+never hand-edited.
+
+## Still the user's, and deliberately so
+
+- **The tag.** `6-05` is the milestone's only `autonomous: false` plan, for the reason it states:
+  tags are immutable and a wrong one cannot be moved. Nothing was tagged or pushed.
+- **`omarchy plugin validate .`** — the `omarchy` CLI does not exist for macOS. Not run, and
+  recorded as *not run* rather than passing. It must run on the Linux box before any tag.
+- **CAL-1 and CAL-5** — both need a real private repo and a token; both remain `#[ignore]`d and
+  both doc comments state what a measurement would change.
+- **The real two-machine run.** Every one of the 60 integration assertions talks to mockito, so
+  the round trip is genuine except that the GitHub on the other end is one this repo wrote. That
+  is the one verification the codebase cannot perform on itself.
+
+## The milestone's defining defect class, for whoever picks this up
+
+Eleven instances of *code that is tested but that nothing calls*, or *text asserting behaviour
+that does not exist* — two of them missing security controls, one surviving two rounds of
+remediation, and one written into a plan as an explicit instruction ("so no existing call site
+changes", which guarantees the new function is never called).
+
+**A test that calls a function directly proves the function works, never that anything uses it.**
+The only check that has ever caught this class is enumerating production call sites of everything
+a phase added. Every phase now ends with it.
+
+The strongest fix found was `sync::FixedName`: rather than correct two byte-exact filename
+comparisons on a case-folding filesystem, it made `name == CREDENTIAL_FILE` **fail to compile**.
+The next person to add a filename does not need to remember the rule.
