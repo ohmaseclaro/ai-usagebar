@@ -1014,9 +1014,39 @@ mod tests {
             primary_choices: VendorId::all().to_vec(),
             primary,
             keys: KEY_VENDORS.iter().map(|_| KeyInput::default()).collect(),
+            sync_categories: default_sync_rows(),
+            sync_last_sync: None,
+            sync_dirty: false,
             status: String::new(),
         }
     }
+
+    /// The sync rows a default `Config` produces — the shape every state
+    /// literal in these tests starts from.
+    fn default_sync_rows() -> Vec<(SyncCategory, bool)> {
+        let cfg = Config::default();
+        SyncCategory::ALL
+            .iter()
+            .map(|cat| (*cat, cfg.sync.includes(*cat)))
+            .collect()
+    }
+
+    fn sync_row_state(focus_index: usize) -> SettingsState {
+        let mut s = blank_state(VendorId::Anthropic);
+        s.focus = Focus::SyncCategory(focus_index);
+        s
+    }
+
+    fn on(state: &SettingsState, cat: SyncCategory) -> bool {
+        state
+            .sync_categories
+            .iter()
+            .find(|(c, _)| *c == cat)
+            .map(|(_, flag)| *flag)
+            .unwrap()
+    }
+
+    const TRANSCRIPTS: usize = 4;
 
     /// State with a Z.AI key and an OpenRouter key, both marked dirty.
     fn state_with(zai: &str, opr: &str, primary: VendorId) -> SettingsState {
@@ -1032,8 +1062,8 @@ mod tests {
     fn focus_cycles_through_primary_all_keys_and_save() {
         let mut f = Focus::Primary;
         let mut seen = vec![f];
-        // Full cycle = Primary + N key rows + Save.
-        for _ in 0..(KEY_VENDORS.len() + 2) {
+        // Full cycle = Primary + N key rows + 5 sync rows + Save.
+        for _ in 0..(KEY_VENDORS.len() + SyncCategory::ALL.len() + 2) {
             f = f.next();
             seen.push(f);
         }
@@ -1615,5 +1645,153 @@ enabled = true
             .unwrap_err()
             .to_string();
         assert!(error.contains("exceeds"));
+    }
+
+    // ─── Sync section ──────────────────────────────────────────────────────
+
+    #[test]
+    fn sync_rows_follow_the_canonical_category_order() {
+        let cfg = Config::default();
+        let s = SettingsState::from_config(&cfg);
+        assert_eq!(
+            s.sync_categories
+                .iter()
+                .map(|(cat, _)| *cat)
+                .collect::<Vec<_>>(),
+            SyncCategory::ALL.to_vec(),
+            "the overlay must list what `sync status` lists, in the same order"
+        );
+    }
+
+    #[test]
+    fn sync_rows_mirror_the_configs_own_selection() {
+        let cfg = Config::default();
+        let s = SettingsState::from_config(&cfg);
+        for (cat, flag) in &s.sync_categories {
+            assert_eq!(*flag, cfg.sync.includes(*cat), "{cat:?}");
+        }
+        // The default is the four cheap categories; transcripts is opt-in.
+        assert_eq!(s.sync_categories.iter().filter(|(_, f)| *f).count(), 4);
+        assert!(!on(&s, SyncCategory::Transcripts));
+        assert!(on(&s, SyncCategory::Credentials));
+    }
+
+    #[test]
+    fn an_empty_category_list_is_every_row_off_not_the_default_set() {
+        // "sync nothing" is a legal choice and must survive a round trip
+        // through the overlay rather than being silently re-defaulted.
+        let mut cfg = Config::default();
+        cfg.sync.categories.clear();
+        let s = SettingsState::from_config(&cfg);
+        assert_eq!(s.sync_categories.len(), SyncCategory::ALL.len());
+        assert!(s.sync_categories.iter().all(|(_, flag)| !flag));
+    }
+
+    #[test]
+    fn from_config_leaves_last_sync_unknown_and_the_sync_seam_carries_it() {
+        // `from_config` stays pure — no index, no clock, no $HOME.
+        let cfg = Config::default();
+        assert!(SettingsState::from_config(&cfg).sync_last_sync.is_none());
+
+        let at = chrono::DateTime::parse_from_rfc3339("2026-08-19T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let s = SettingsState::from_config_with_sync(&cfg, Some(at));
+        assert_eq!(s.sync_last_sync, Some(at));
+        // The seam changes nothing else about the state.
+        assert_eq!(s.sync_categories, SettingsState::from_config(&cfg).sync_categories);
+    }
+
+    #[test]
+    fn the_focus_walk_reaches_every_sync_row_and_stays_a_closed_cycle() {
+        let last_key = Focus::Key(KEY_VENDORS.len() - 1);
+        assert_eq!(last_key.next(), Focus::SyncCategory(0));
+        assert_eq!(Focus::SyncCategory(0).prev(), last_key);
+
+        let last_sync = Focus::SyncCategory(SyncCategory::ALL.len() - 1);
+        assert_eq!(last_sync.next(), Focus::Save);
+        assert_eq!(Focus::Save.prev(), last_sync);
+
+        // Every sync row is reachable, and next/prev are inverses on each.
+        for i in 0..SyncCategory::ALL.len() {
+            let f = Focus::SyncCategory(i);
+            assert_eq!(f.next().prev(), f, "row {i} is a trap going forward");
+            assert_eq!(f.prev().next(), f, "row {i} is a trap going backward");
+        }
+    }
+
+    #[test]
+    fn space_and_enter_toggle_exactly_the_focused_sync_row() {
+        for key in [KeyCode::Char(' '), KeyCode::Enter] {
+            let mut s = sync_row_state(TRANSCRIPTS);
+            let before = s.sync_categories.clone();
+            assert_eq!(
+                handle_key(&mut s, key, KeyModifiers::NONE),
+                Action::Continue
+            );
+            assert!(on(&s, SyncCategory::Transcripts), "{key:?} did not toggle");
+            assert!(s.sync_dirty, "{key:?} left the row unmarked as edited");
+            // Every other row is untouched.
+            for (i, (cat, flag)) in s.sync_categories.iter().enumerate() {
+                if i != TRANSCRIPTS {
+                    assert_eq!((*cat, *flag), before[i], "row {i} moved");
+                }
+            }
+            // And it flips back.
+            handle_key(&mut s, key, KeyModifiers::NONE);
+            assert!(!on(&s, SyncCategory::Transcripts));
+        }
+    }
+
+    #[test]
+    fn arrows_never_flip_a_sync_row() {
+        // Left/Right mean "cycle a choice" on the Primary row. A mis-aimed
+        // arrow must not change which credentials are eligible to leave.
+        for key in [KeyCode::Left, KeyCode::Right] {
+            let mut s = sync_row_state(TRANSCRIPTS);
+            handle_key(&mut s, key, KeyModifiers::NONE);
+            assert!(!on(&s, SyncCategory::Transcripts), "{key:?} flipped a row");
+            assert!(!s.sync_dirty);
+            assert_eq!(s.focus, Focus::SyncCategory(TRANSCRIPTS));
+        }
+    }
+
+    #[test]
+    fn a_modifier_chord_on_a_sync_row_is_a_no_op() {
+        for mods in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER,
+        ] {
+            let mut s = sync_row_state(TRANSCRIPTS);
+            handle_key(&mut s, KeyCode::Char(' '), mods);
+            assert!(!on(&s, SyncCategory::Transcripts), "{mods:?} flipped a row");
+            assert!(!s.sync_dirty);
+        }
+    }
+
+    #[test]
+    fn esc_and_ctrl_c_keep_their_meaning_on_a_sync_row() {
+        let mut s = sync_row_state(0);
+        assert_eq!(
+            handle_key(&mut s, KeyCode::Esc, KeyModifiers::NONE),
+            Action::Close
+        );
+        let mut s = sync_row_state(0);
+        assert_eq!(
+            handle_key(&mut s, KeyCode::Char('c'), KeyModifiers::CONTROL),
+            Action::Quit
+        );
+        assert!(!s.sync_dirty);
+    }
+
+    #[test]
+    fn tab_still_moves_off_a_sync_row_in_both_directions() {
+        let mut s = sync_row_state(0);
+        handle_key(&mut s, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(s.focus, Focus::SyncCategory(1));
+        handle_key(&mut s, KeyCode::BackTab, KeyModifiers::NONE);
+        assert_eq!(s.focus, Focus::SyncCategory(0));
+        assert!(!s.sync_dirty, "moving focus is not an edit");
     }
 }
