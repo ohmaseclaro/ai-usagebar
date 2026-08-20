@@ -40,7 +40,7 @@ use crate::error::{AppError, Result};
 use crate::sync::crypto::{KdfParams, Keyfile};
 use crate::sync::index::Index;
 use crate::sync::passphrase::{self, Strength};
-use crate::sync::report::{self, DryRunReport};
+use crate::sync::report::{self, DryRunReport, Style};
 use crate::sync::{SyncRoots, plan};
 
 use super::gate;
@@ -76,6 +76,17 @@ pub trait SetupPrompt {
     /// order.
     fn categories(&mut self, current: &[SyncCategory]) -> Result<Vec<SyncCategory>>;
 
+    /// The palette this flow narrates in.
+    ///
+    /// A seam exactly like [`kdf`](SetupPrompt::kdf) and for the same reason:
+    /// the decision needs a terminal and the process environment, neither of
+    /// which anything under `src/sync/` may reach for. `TtyPrompt` carries what
+    /// `sync::cli` resolved; every test double takes the default and therefore
+    /// asserts against the unstyled wording it always did.
+    fn style(&self) -> Style {
+        Style::PLAIN
+    }
+
     /// The KDF cost a new keyfile is written at.
     ///
     /// A seam, not a question: the shipped default is 1 GiB and takes about a
@@ -108,9 +119,17 @@ pub trait SetupPrompt {
 /// The production implementation. Untested by construction — it is the only
 /// thing in this file that reads stdin.
 #[derive(Debug, Default)]
-pub struct TtyPrompt;
+pub struct TtyPrompt {
+    style: Style,
+}
 
 impl TtyPrompt {
+    /// With the palette `sync::cli` resolved for standard output — which is
+    /// where every line below is printed.
+    pub fn new(style: Style) -> TtyPrompt {
+        TtyPrompt { style }
+    }
+
     fn line(&self) -> Result<String> {
         let mut buf = String::new();
         std::io::stdin()
@@ -121,6 +140,10 @@ impl TtyPrompt {
 }
 
 impl SetupPrompt for TtyPrompt {
+    fn style(&self) -> Style {
+        self.style
+    }
+
     fn say(&mut self, line: &str) {
         println!("{line}");
     }
@@ -196,6 +219,28 @@ pub struct SetupOutcome {
     pub would_send: u64,
 }
 
+/// `N/5  …` — the step markers were always there and simply did not stand out.
+///
+/// The accent on the marker is the only one in the whole flow, which is what
+/// makes five steps read as five steps rather than as one wall of text; the
+/// body is dim because the marker is the thing being scanned for.
+///
+/// **Narration only.** It reformats the line it is handed and knows nothing
+/// about which step it is or what comes next.
+fn step(style: Style, marker: &str, text: &str) -> String {
+    format!(
+        "{}  {}",
+        style.head(marker),
+        style.dim(&report::reflow(style, text, 5))
+    )
+}
+
+/// An indented continuation under a step marker, at the same depth the flow has
+/// always used.
+fn under(style: Style, text: &str) -> String {
+    format!("     {}", style.dim(&report::reflow(style, text, 5)))
+}
+
 /// The five steps, in order.
 ///
 /// A refusal after step 1 has cost the user the category question and nothing
@@ -210,6 +255,10 @@ pub async fn run(
     prompt: &mut dyn SetupPrompt,
     now: DateTime<Utc>,
 ) -> Result<SetupOutcome> {
+    // Resolved once, before the first line is narrated. Nothing below branches
+    // on it except for weight.
+    let style = prompt.style();
+
     // ---- Preconditions: local, and reached before any prompt -------------
     // T-3-38 first, and before anything asks the user for anything: this is a
     // fact about *this machine*, not about the repository, and a run that is
@@ -255,7 +304,12 @@ pub async fn run(
     // Reordering rather than re-asserting is deliberate: a recompute-and-check
     // closes the window but leaves two evaluations to keep in agreement, which
     // is the shape that produced the hole. There is now exactly one.
-    prompt.say("1/5  What gets bundled. `credentials` is the deliberate one — turning it on syncs saved logins.");
+    prompt.say(&step(
+        style,
+        "1/5",
+        "What gets bundled. `credentials` is the deliberate one — turning it on \
+         syncs saved logins.",
+    ));
     let categories = prompt.categories(&cfg.categories)?;
     let chosen_cfg = SyncConfig {
         categories: categories.clone(),
@@ -282,11 +336,19 @@ pub async fn run(
     warnings.extend(gate_warnings);
 
     prompt.say(&format!(
-        "\n2/5  {repo} is {} — the gate passed.",
-        facts.visibility
+        "\n{}  {repo} is {} — the gate {}.",
+        style.head("2/5"),
+        // Remote-supplied, so it is sanitized on the way through `Style` before
+        // it is allowed anywhere near an escape sequence.
+        style.good(&facts.visibility),
+        style.good("passed"),
     ));
     for warning in &warnings {
-        prompt.say(&format!("     warning: {warning}"));
+        prompt.say(&format!(
+            "     {} {}",
+            style.bold("warning:"),
+            style.dim(&report::reflow(style, warning, 5))
+        ));
     }
     if drift.first_contact {
         // F-5. Deleting the pairing record makes `check_drift` skip the
@@ -295,30 +357,57 @@ pub async fn run(
         // like a first-ever setup. Say it, with the ids, and say what it means
         // if it is a surprise.
         prompt.say(&format!(
-            "     first contact: pairing with repository id {} owned by {} (id {}). \
-             Nothing was compared, because there was no pairing record to compare against.",
-            facts.id, facts.owner_login, facts.owner_id
+            "     {} {}",
+            style.bold("first contact:"),
+            style.dim(&report::reflow(
+                style,
+                &format!(
+                    "pairing with repository id {} owned by {} (id {}). Nothing was \
+                     compared, because there was no pairing record to compare against.",
+                    facts.id, facts.owner_login, facts.owner_id
+                ),
+                5,
+            ))
         ));
-        prompt.say(
-            "     If this machine was already paired, that record did not remove itself — \
+        prompt.say(&under(
+            style,
+            "If this machine was already paired, that record did not remove itself — \
              treat its disappearance as an incident, and confirm those ids are the \
              repository you mean before going on.",
-        );
+        ));
     } else {
-        prompt.say(
-            "     this machine is already paired with it; reusing that pairing rather than \
+        prompt.say(&under(
+            style,
+            "this machine is already paired with it; reusing that pairing rather than \
              issuing a second one.",
-        );
+        ));
     }
 
     // ---- Step 3: the passphrase, and the keyfile -------------------------
     let kdf = prompt.kdf();
     let generated = passphrase::generate()?;
-    prompt.say("\n3/5  A sync password protects the bundle.");
-    prompt.say(passphrase::NO_RECOVERY);
-    prompt.say(passphrase::OFFLINE_ATTACK_NOTE);
+    prompt.say(&format!(
+        "\n{}",
+        step(style, "3/5", "A sync password protects the bundle.")
+    ));
+    // **Bold, and the only prose on the screen that is.** Of everything setup
+    // says, this is the sentence whose cost is unrecoverable, and in the run the
+    // user reported it read at exactly the same weight as the rest.
+    prompt.say(&style.bold(&report::reflow(style, passphrase::NO_RECOVERY, 0)));
+    prompt.say(&report::reflow(style, passphrase::OFFLINE_ATTACK_NOTE, 0));
     // Shown exactly once — not re-displayed on a re-prompt below.
-    prompt.say(&format!("\n     generated passphrase:  {}\n", &*generated));
+    //
+    // The accent goes on the passphrase itself: it is the one thing on this
+    // screen the user has to act on, and this is the only place in the whole
+    // tool that prints a secret — deliberately, once. `Style::head` sanitizes
+    // what it wraps, which for a generated passphrase is a no-op over an
+    // alphabet that holds no control byte; the transient copy it makes dies with
+    // the `format!` result the unstyled line already built.
+    prompt.say(&format!(
+        "\n     {}  {}\n",
+        style.dim("generated passphrase:"),
+        style.head(&generated)
+    ));
 
     let chosen_pw = loop {
         let candidate = prompt.passphrase(&generated)?;
@@ -328,9 +417,13 @@ pub async fn run(
             candidate
         };
         match passphrase::check(&candidate, kdf) {
-            Strength::Rejected(why) => prompt.say(&format!("     refused: {why}")),
+            Strength::Rejected(why) => prompt.say(&format!(
+                "     {} {}",
+                style.bad("refused:"),
+                style.dim(&report::reflow(style, why, 5))
+            )),
             Strength::Weak(why) => {
-                prompt.say(&format!("     {why}"));
+                prompt.say(&under(style, why));
                 break candidate;
             }
             Strength::Strong => break candidate,
@@ -362,13 +455,26 @@ pub async fn run(
         sync_plan.total_new_stored_bytes,
     );
 
-    prompt.say("\n4/5  What a first push would send:");
+    prompt.say(&format!(
+        "\n{}",
+        step(style, "4/5", "What a first push would send:")
+    ));
     // The dry-run's own renderer over the dry-run's own plan — so the number
     // here and the number `sync push --dry-run` prints cannot disagree.
-    prompt.say(&report::render_dry_run(&DryRunReport {
-        status: report::build_status(roots, &chosen_cfg, Some(&index), now, Some(sync_plan), None),
-        no_key: None,
-    }));
+    prompt.say(&report::render_dry_run_styled(
+        &DryRunReport {
+            status: report::build_status(
+                roots,
+                &chosen_cfg,
+                Some(&index),
+                now,
+                Some(sync_plan),
+                None,
+            ),
+            no_key: None,
+        },
+        style,
+    ));
     if !prompt.confirm("     Pair this machine with that scope?", true)? {
         return Err(AppError::Other(
             "setup stopped at the size confirmation. Nothing was uploaded — this command \
@@ -383,12 +489,19 @@ pub async fn run(
     // can abort, so it is the last thing before the first write (F-10).
     write_keyfile(&keyfile_path, &keyfile)?;
     prompt.say(&format!(
-        "\n5/5  keyfile written: {}",
-        keyfile_path.display()
+        "\n{}",
+        step(
+            style,
+            "5/5",
+            &format!("keyfile written: {}", keyfile_path.display())
+        )
     ));
     if categories != cfg.categories {
         write_categories(&roots.config_file, &categories)?;
-        prompt.say(&format!("     saved to {}", roots.config_file.display()));
+        prompt.say(&under(
+            style,
+            &format!("saved to {}", roots.config_file.display()),
+        ));
     }
     let stored_at = prompt.store_token(&keep, &token_file).map_err(|e| {
         AppError::Other(format!(
@@ -560,6 +673,9 @@ fn write_categories(config_file: &Path, categories: &[SyncCategory]) -> Result<(
 pub(crate) struct Script {
     pub reached: Vec<String>,
     pub said: Vec<String>,
+    /// Defaults to [`Style::PLAIN`], which is why every existing test in this
+    /// crate still asserts against the wording it always did.
+    pub style: Style,
     /// Answers for `passphrase`, in order. Exhausted ⇒ the generated one.
     pub passphrases: Vec<String>,
     /// `None` keeps whatever the config already had.
@@ -588,6 +704,9 @@ pub(crate) struct Double(pub std::rc::Rc<std::cell::RefCell<Script>>);
 
 #[cfg(test)]
 impl SetupPrompt for Double {
+    fn style(&self) -> Style {
+        self.0.borrow().style
+    }
     fn say(&mut self, line: &str) {
         self.0.borrow_mut().said.push(line.to_owned());
     }
@@ -750,6 +869,98 @@ mod tests {
         // The token never reaches the narration either, not even a prefix.
         assert!(!said.contains(FIXTURE), "{said}");
         assert!(!said.contains(&FIXTURE[..8]), "{said}");
+    }
+
+    /// The reported defect: five step headers that read as one wall, with the
+    /// two consequential lines at the same weight as everything else.
+    ///
+    /// **Narration only.** Nothing below asserts on the order or on which
+    /// methods ran — that is the test above — only on which words carry weight.
+    #[tokio::test]
+    async fn the_steps_and_the_two_lines_that_matter_carry_the_only_weight() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("config.toml"), "[sync]\n").unwrap();
+        let script = Script::new();
+        script.borrow_mut().style = Style::color(true);
+
+        drive(&cfg_for(Some("o/n")), &dir, PRIVATE, 200, &script)
+            .await
+            .unwrap();
+        let said = script.borrow().said.join("\n");
+
+        // Every step marker wears the one accent, and nothing else does.
+        for marker in ["1/5", "2/5", "3/5", "4/5", "5/5"] {
+            assert!(
+                said.contains(&format!("\x1b[1;36m{marker}\x1b[0m")),
+                "{marker} does not stand out:\n{said}"
+            );
+        }
+        assert_eq!(
+            said.matches("\x1b[1;36m").count(),
+            6,
+            "five markers and the generated passphrase, and nothing else"
+        );
+
+        // The two lines that matter most, at a weight nothing else has.
+        assert!(
+            said.contains(&format!("\x1b[1m{}", &passphrase::NO_RECOVERY[..40])),
+            "the no-recovery warning is not bold:\n{said}"
+        );
+        let generated = said
+            .split("generated passphrase:\x1b[0m  \x1b[1;36m")
+            .nth(1)
+            .and_then(|rest| rest.split("\x1b[0m").next())
+            .expect("the generated passphrase is shown once, in the accent");
+        assert!(generated.len() >= 20, "{generated:?}");
+
+        // …and it is still shown exactly once, and is still the only secret on
+        // the screen.
+        assert_eq!(said.matches(generated).count(), 1, "shown once");
+        assert!(!said.contains(FIXTURE), "no token: {said}");
+        assert!(!said.contains(&FIXTURE[..8]), "no token prefix: {said}");
+
+        // Nothing here opens a sequence it does not close.
+        let closes = said.matches("\x1b[0m").count();
+        assert_eq!(
+            said.matches("\x1b[").count(),
+            closes * 2,
+            "unbalanced:\n{said}"
+        );
+    }
+
+    /// The wording is the contract every other test in this crate asserts
+    /// against, so the unstyled flow must still say exactly what it said.
+    #[tokio::test]
+    async fn the_unstyled_flow_says_the_same_words_the_styled_one_does() {
+        let plain = {
+            let dir = TempDir::new().unwrap();
+            fs::write(dir.path().join("config.toml"), "[sync]\n").unwrap();
+            let script = Script::new();
+            script
+                .borrow_mut()
+                .passphrases
+                .push("a-supplied-passphrase-long-enough".into());
+            drive(&cfg_for(Some("o/n")), &dir, PRIVATE, 200, &script)
+                .await
+                .unwrap();
+            script.borrow().said.join("\n")
+        };
+        // Deliberately never printed on failure: the narration holds the
+        // generated passphrase, and a panic message is a transcript.
+        assert!(
+            !plain.contains('\x1b'),
+            "an escape reached the unstyled flow"
+        );
+        for wording in [
+            "1/5  What gets bundled.",
+            "     first contact: pairing with repository id ",
+            "\n3/5  A sync password protects the bundle.",
+            "     generated passphrase:  ",
+            "\n4/5  What a first push would send:",
+            "\n5/5  keyfile written: ",
+        ] {
+            assert!(plain.contains(wording), "{wording:?} moved");
+        }
     }
 
     /// T-3-36. Neither secret, nor an eight-character prefix of either, reaches
