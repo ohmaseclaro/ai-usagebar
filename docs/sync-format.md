@@ -12,6 +12,12 @@ them wrong produces a bundle that authenticates against nothing.
 The implementation lives in `src/sync/`, one module per concern, and
 `src/sync/crypto.rs` is the only file in it that imports a cryptographic crate.
 
+If you are here to *use* the feature rather than re-implement it, read
+[Encrypted sync](../README.md#encrypted-sync) in the README first — setup, the
+daily commands, the surfaces, and the honest limits in the form a user needs
+them. `sync-github.md` is the setup guide, and the measured sizes and timings
+are in [`sync-calibration.md`](sync-calibration.md).
+
 Primitives: **Argon2id** (RFC 9106), **XChaCha20-Poly1305**, **BLAKE3**
 (`keyed_hash` and `derive_key`), **zstd** level 3.
 
