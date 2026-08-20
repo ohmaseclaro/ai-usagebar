@@ -140,15 +140,34 @@ function selectedIndex(entries, selectedId) {
   return list.length > 0 ? 0 : -1
 }
 
-function preferredEntryId(entries, primaryProvider) {
+function preferredEntryId(entries, primaryProvider, rememberedEntryId) {
   var list = Array.isArray(entries) ? entries : []
   if (list.length === 0) return ""
+  var remembered = cleanText(rememberedEntryId, 180).trim().toLowerCase()
+  for (var r = 0; r < list.length; r++)
+    if (String(list[r].id).toLowerCase() === remembered) return list[r].id
   var primary = String(primaryProvider || "").toLowerCase()
   for (var i = 0; i < list.length; i++)
     if (String(list[i].id).toLowerCase() === primary) return list[i].id
   for (var j = 0; j < list.length; j++)
     if (baseProvider(list[j].id).toLowerCase() === primary) return list[j].id
   return list[0].id
+}
+
+function settingsWithSelectedEntry(settings, moduleName, entryId) {
+  var selected = cleanText(entryId, 180).trim()
+  if (selected === "") return null
+
+  var next = { id: cleanText(moduleName, 180).trim() }
+  var current = settings && typeof settings === "object" && !Array.isArray(settings)
+    ? settings : {}
+  for (var key in current) {
+    if (key === "id" || key === "__proto__" || key === "constructor" || key === "prototype")
+      continue
+    next[key] = current[key]
+  }
+  next.lastSelectedEntryId = selected
+  return next
 }
 
 function headline(entry) {
@@ -225,9 +244,20 @@ function errorMessage(value) {
   return message === "" ? "The usage command failed without an error message." : message
 }
 
+// The panel launches ai-usagebar through /usr/bin/env, so a missing binary
+// comes back as exit 127 instead of the process simply never starting.
+// Quickshell does not emit `exited` when it cannot launch a binary directly --
+// it only logs an internal warning -- which used to leave the widget stuck on
+// its loading state with no way to explain that the binary was not installed.
+function launchErrorMessage(exitCode, stderrText) {
+  if (Number(exitCode) === 127)
+    return "ai-usagebar is not installed. The plugin is only the display frontend. Install the binary with: omarchy pkg aur add ai-usagebar-bin"
+  return errorMessage(stderrText)
+}
+
 function settingsId(value) {
   var id = cleanText(value, 80).trim()
-  if (!/^[a-z0-9_]+$/.test(id)
+  if (!/^[a-z0-9_-]+$/.test(id)
       || id === "__proto__" || id === "constructor" || id === "prototype") return ""
   return id
 }

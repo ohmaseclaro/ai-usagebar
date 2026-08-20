@@ -29,12 +29,24 @@ assert.match(panelSource, /property\s+var\s+anchorItem:\s*null/);
 assert.match(panelSource, /property\s+var\s+hostWidget:\s*null/);
 assert.match(panelSource, /SettingsView\s*\{/);
 assert.match(panelSource, /function\s+openSettings\s*\(/);
+assert.match(panelSource, /setting\("lastSelectedEntryId",\s*""\)/);
+assert.match(panelSource, /function\s+persistSelection\s*\(/);
+assert.match(panelSource, /Model\.settingsWithSelectedEntry\(root\.settings,\s*root\.moduleName,\s*entryId\)/);
+assert.match(panelSource, /bar\.shell\.updateEntryInline\(root\.moduleName,\s*entry\)/);
+assert.match(panelSource, /persistSelection\(selectedEntryId\)/);
 
 const settingsViewSource = fs.readFileSync(new URL('./SettingsView.qml', import.meta.url), 'utf8');
 assert.match(settingsViewSource, /command:\s*\["ai-usagebar",\s*"settings",\s*"show"\]/);
 assert.match(settingsViewSource, /command:\s*\["ai-usagebar",\s*"settings",\s*"apply"\]/);
 assert.match(settingsViewSource, /stdinEnabled:\s*true/);
 assert.match(settingsViewSource, /write\(root\.pendingPayload\s*\+\s*"\\n"\)/);
+assert.match(settingsViewSource, /signal\s+nousLoginRequested\(\)/);
+assert.match(settingsViewSource, /Log in with Nous Research/);
+assert.match(settingsViewSource, /Leave the terminal open until login completes/);
+assert.match(settingsViewSource, /model:\s*root\.snapshot\.keys/);
+assert.match(panelSource, /function\s+openNousLogin\s*\(/);
+assert.match(panelSource, /ai-usagebar auth nous login/);
+assert.match(panelSource, /onNousLoginRequested/);
 assert.doesNotMatch(settingsViewSource, /command:\s*\[[^\]]*(?:api.?key|secret|pendingPayload)/i);
 
 const raw = JSON.stringify({primary: 'openai', entries: [
@@ -78,6 +90,39 @@ assert.equal(model.selectedIndex(parsed.entries, 'missing'), 0);
 assert.equal(model.preferredEntryId(parsed.entries, parsed.primary), 'openai');
 assert.equal(model.preferredEntryId(parsed.entries, 'anthropic'), 'anthropic@work');
 assert.equal(model.preferredEntryId(parsed.entries, 'missing'), 'anthropic@work');
+assert.equal(model.preferredEntryId(parsed.entries, parsed.primary, 'anthropic@work'), 'anthropic@work');
+assert.equal(model.preferredEntryId(parsed.entries, parsed.primary, '  ANTHROPIC@WORK  '), 'anthropic@work');
+assert.equal(model.preferredEntryId(parsed.entries, parsed.primary, 'missing'), 'openai');
+
+const openRouterAccounts = model.parseReport(JSON.stringify({entries: [{
+  id: 'openrouter@work', name: 'openrouter · work', display_name: 'OpenRouter · work',
+  error: null, sections: []
+}, {
+  id: 'openrouter@personal', name: 'openrouter · personal', display_name: 'OpenRouter · personal',
+  error: null, sections: []
+}]})).entries;
+assert.deepEqual(Array.from(model.filteredEntries(openRouterAccounts, 'openrouter')).map(entry => entry.id),
+  ['openrouter@work', 'openrouter@personal']);
+assert.equal(model.providerName(openRouterAccounts[0]), 'OpenRouter · work');
+assert.equal(model.preferredEntryId(openRouterAccounts, 'openrouter', 'openrouter@personal'),
+  'openrouter@personal');
+assert.equal(model.preferredEntryId(openRouterAccounts, 'openrouter', 'openrouter@missing'),
+  'openrouter@work');
+
+const priorWidgetSettings = {
+  provider: '', refreshIntervalSec: 90, futureSetting: {keep: true}, id: 'stale-id'
+};
+const selectedWidgetSettings = model.settingsWithSelectedEntry(
+  priorWidgetSettings, 'akitaonrails.ai-usagebar', 'openrouter@personal');
+assert.deepEqual(JSON.parse(JSON.stringify(selectedWidgetSettings)), {
+  id: 'akitaonrails.ai-usagebar',
+  provider: '',
+  refreshIntervalSec: 90,
+  futureSetting: {keep: true},
+  lastSelectedEntryId: 'openrouter@personal'
+});
+assert.equal(priorWidgetSettings.lastSelectedEntryId, undefined);
+assert.equal(model.settingsWithSelectedEntry({}, 'akitaonrails.ai-usagebar', ''), null);
 
 assert.equal(model.headline(parsed.entries[0]).text, '29%');
 assert.equal(model.headline(parsed.entries[1]).severity, 'critical');
@@ -112,6 +157,24 @@ assert.equal(model.providerName({id: 'anthropic', display_name: 'Claude · <b>wo
 assert.equal(model.providerName({id: 'openai', name: 'openai'}), 'openai');
 assert.equal(model.errorMessage(''), 'The usage command failed without an error message.');
 
+// A missing ai-usagebar binary must be reported as such, with the install
+// command, instead of surfacing the helper's raw "not found" text or leaving
+// the widget silently stuck on its loading state.
+assert.match(model.launchErrorMessage(127, 'env: ai-usagebar: No such file or directory'),
+  /ai-usagebar is not installed/);
+assert.match(model.launchErrorMessage(127, ''), /omarchy pkg aur add ai-usagebar-bin/);
+// Every other failure keeps the existing behaviour.
+assert.equal(model.launchErrorMessage(1, 'boom'), 'boom');
+assert.equal(model.launchErrorMessage(0, ''), 'The usage command failed without an error message.');
+
+// The usage command must stay behind a helper that can emit exit 127 when the
+// binary is absent, without opening a shell-injection boundary.
+assert.match(panelSource,
+  /command:\s*\["\/usr\/bin\/env",\s*"ai-usagebar",\s*"usage",\s*"--json"\]/);
+assert.doesNotMatch(panelSource, /command:\s*\["(?:\/usr\/bin\/)?(?:ba)?sh"/);
+assert.match(panelSource, /onExited:\s*function\(exitCode\)/);
+assert.match(panelSource, /Model\.launchErrorMessage\(/);
+
 const settingsRaw = JSON.stringify({
   schema_version: 1,
   primary: 'openai',
@@ -133,6 +196,17 @@ assert.equal(settings.primary_choices[0].label, 'Claude');
 assert.equal(settings.primary_choices[1].label, 'Codex');
 assert.equal(settings.keys[0].inline_configured, true);
 assert.equal(settings.keys[0].environment, 'KIMI_API_KEY');
+const opencodeSettings = model.parseSettingsSnapshot(JSON.stringify({
+  schema_version: 1,
+  primary: 'opencode-go',
+  primary_choices: [{id: 'opencode-go', label: 'OpenCode Go'}],
+  keys: [{id: 'opencode-go', label: 'OpenCode Go', environment: 'OPENCODE_GO_API_KEY',
+    note: 'usage quota', configured: false, inline_configured: false, environment_configured: false}]
+}));
+assert.equal(opencodeSettings.ok, true);
+assert.equal(opencodeSettings.primary, 'opencode-go');
+assert.equal(opencodeSettings.keys[0].id, 'opencode-go');
+assert.equal(opencodeSettings.keys[0].environment, 'OPENCODE_GO_API_KEY');
 assert.equal(model.parseSettingsSnapshot('{').ok, false);
 assert.equal(model.parseSettingsSnapshot(JSON.stringify({schema_version: 2, primary_choices: [], keys: []})).ok, false);
 const noEnabled = model.parseSettingsSnapshot(JSON.stringify({

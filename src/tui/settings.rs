@@ -113,6 +113,13 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
         section: "minimax",
         note: "Token Plan subscription key",
     },
+    KeyVendor {
+        id: VendorId::OpenCodeGo,
+        label: "OpenCode Go",
+        env: "OPENCODE_GO_API_KEY",
+        section: "opencode-go",
+        note: "usage quota",
+    },
 ];
 
 /// Read the inline `api_key` currently in config for a given section, so the
@@ -129,6 +136,7 @@ fn config_inline_key<'a>(cfg: &'a Config, section: &str) -> Option<&'a str> {
         "moonshot" => cfg.moonshot.api_key.as_deref(),
         "grok" => cfg.grok.api_key.as_deref(),
         "minimax" => cfg.minimax.api_key.as_deref(),
+        "opencode-go" => cfg.opencode_go.api_key.as_deref(),
         _ => None,
     }
 }
@@ -713,6 +721,7 @@ fn configured_key_env<'a>(cfg: &'a Config, section: &str, fallback: &'a str) -> 
         "moonshot" => &cfg.moonshot.api_key_env,
         "grok" => &cfg.grok.api_key_env,
         "minimax" => &cfg.minimax.api_key_env,
+        "opencode-go" => &cfg.opencode_go.api_key_env,
         _ => fallback,
     }
 }
@@ -1445,6 +1454,10 @@ plan_tier = "pro"
 [openrouter]
 enabled = true
 api_key_env = "OPENROUTER_API_KEY"
+
+[[openrouter.accounts]]
+label = "work"
+api_key_env = "OPENROUTER_WORK_API_KEY"
 "##,
         ));
 
@@ -1456,6 +1469,8 @@ api_key_env = "OPENROUTER_API_KEY"
         assert!(raw.contains("# pre-existing comment"));
         assert!(raw.contains("# tier comment"));
         assert!(raw.contains("api_key_env = \"ZAI_API_KEY\""));
+        assert!(raw.contains("[[openrouter.accounts]]"));
+        assert!(raw.contains("api_key_env = \"OPENROUTER_WORK_API_KEY\""));
         assert!(raw.contains("plan_tier = \"pro\""));
         assert!(raw.contains("primary = \"openrouter\""));
         assert!(raw.contains("api_key = \"zk2\""));

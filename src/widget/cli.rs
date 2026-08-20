@@ -116,11 +116,10 @@ pub struct Cli {
     #[arg(long, value_name = "FILE")]
     pub creds_path: Option<std::path::PathBuf>,
 
-    /// Select a named Anthropic account from `[[anthropic.accounts]]` in
-    /// config (issue #14). Without it, `--vendor anthropic` uses the default
-    /// account — the singular `[anthropic] credentials_path` — with unchanged
-    /// output and cache path. Anthropic only; conflicts with the lower-level
-    /// `--creds-path` (they both name a credentials file).
+    /// Select a named Claude or OpenRouter account from the matching
+    /// `[[...accounts]]` config array. Without it, the vendor's default account
+    /// and original cache path are unchanged. For Claude it conflicts with the
+    /// lower-level `--creds-path` because both select a credential source.
     #[arg(long, value_name = "LABEL", conflicts_with = "creds_path")]
     pub account: Option<String>,
 
@@ -161,6 +160,12 @@ pub enum Command {
     Sync {
         #[command(subcommand)]
         action: SyncAction,
+    },
+
+    /// Authenticate a provider without starting the widget.
+    Auth {
+        #[command(subcommand)]
+        provider: AuthProvider,
     },
 }
 
@@ -304,6 +309,22 @@ pub enum SyncAction {
 }
 
 #[derive(clap::Subcommand, Debug, Clone)]
+pub enum AuthProvider {
+    Nous {
+        #[command(subcommand)]
+        action: NousAuthAction,
+    },
+}
+
+#[derive(clap::Subcommand, Debug, Clone)]
+pub enum NousAuthAction {
+    /// Start the Nous Research OAuth device flow.
+    Login,
+    /// Remove only the Nous Research credential.
+    Logout,
+}
+
+#[derive(clap::Subcommand, Debug, Clone)]
 pub enum SettingsAction {
     /// Print a non-secret JSON settings description.
     Show,
@@ -418,6 +439,10 @@ pub enum Vendor {
     Cursor,
     Minimax,
     Kiro,
+    #[value(name = "nous")]
+    NousResearch,
+    #[value(name = "opencode-go")]
+    OpenCodeGo,
 }
 
 impl Vendor {
@@ -439,6 +464,8 @@ impl Vendor {
             Vendor::Cursor => crate::vendor::VendorId::Cursor,
             Vendor::Minimax => crate::vendor::VendorId::Minimax,
             Vendor::Kiro => crate::vendor::VendorId::Kiro,
+            Vendor::NousResearch => crate::vendor::VendorId::NousResearch,
+            Vendor::OpenCodeGo => crate::vendor::VendorId::OpenCodeGo,
         }
     }
 }
@@ -527,6 +554,8 @@ fn id_to_vendor(id: crate::vendor::VendorId) -> Vendor {
         crate::vendor::VendorId::Cursor => Vendor::Cursor,
         crate::vendor::VendorId::Minimax => Vendor::Minimax,
         crate::vendor::VendorId::Kiro => Vendor::Kiro,
+        crate::vendor::VendorId::NousResearch => Vendor::NousResearch,
+        crate::vendor::VendorId::OpenCodeGo => Vendor::OpenCodeGo,
     }
 }
 
@@ -656,6 +685,16 @@ mod tests {
             .to_string();
         assert!(help.contains("not revocation"), "{help}");
         assert!(help.contains("old password"), "{help}");
+    }
+
+    #[test]
+    fn new_vendor_values_and_auth_commands_parse_exactly() {
+        let nous = Cli::parse_from(["ai-usagebar", "--vendor", "nous"]);
+        assert_eq!(nous.vendor, Some(Vendor::NousResearch));
+        let opencode = Cli::parse_from(["ai-usagebar", "--vendor", "opencode-go"]);
+        assert_eq!(opencode.vendor, Some(Vendor::OpenCodeGo));
+        let login = Cli::parse_from(["ai-usagebar", "auth", "nous", "login"]);
+        assert!(matches!(login.command, Some(Command::Auth { .. })));
     }
 
     #[test]

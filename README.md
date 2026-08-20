@@ -1,6 +1,6 @@
 # ai-usagebar
 
-Native Omarchy Quattro panel, Waybar widget, and tabbed TUI for AI plan usage across **Claude**, **Codex/ChatGPT**, **Z.AI (GLM)**, **OpenRouter**, **DeepSeek**, **Kimi**, and other supported AI coding services.
+Native Omarchy Quattro panel, Waybar widget, and tabbed TUI for AI plan usage across **Claude**, **Codex/ChatGPT**, **Z.AI (GLM)**, **OpenRouter**, **DeepSeek**, **Kimi**, **Nous Research**, **OpenCode Go**, and other supported AI coding services.
 
 ai-usagebar began as a Rust port of
 [`claudebar`](https://github.com/mryll/claudebar) and remains drop-in
@@ -132,7 +132,7 @@ come from environment variables or `config.toml`.
 | Anthropic API | Organization Admin key | Opt in with `ANTHROPIC_ADMIN_KEY` or `[anthropic_api] api_key`. Inference and Claude Code keys do not work. |
 | Codex | OAuth, read from `~/.codex/auth.json` | Run `codex login` once. Token auto-refreshes. |
 | Z.AI | API key (`ZAI_API_KEY` env or `[zai] api_key` in config) | Set either. |
-| OpenRouter | API key (`OPENROUTER_API_KEY` env or `[openrouter] api_key` in config) | Set either. |
+| OpenRouter | API key (`OPENROUTER_API_KEY` env or `[openrouter] api_key` in config) | Set either. Named keys are supported. |
 | DeepSeek | API key (`DEEPSEEK_API_KEY` or config) | Set either and opt in. |
 | Kimi | API key (`KIMI_API_KEY` or config) | Set either and opt in. |
 | Kilo | API key (`KILO_API_KEY` env or `[kilo] api_key` in config) | Set either. Opt-in. For a team balance, also set `[kilo] organization_id`; omit it for the personal balance. |
@@ -144,6 +144,30 @@ come from environment variables or `config.toml`.
 | Google Antigravity | Local Antigravity server | Opt in and keep Antigravity or an interactive `agy` session running. |
 | Cursor | Existing Cursor IDE or `cursor-agent` login | Opt in and sign in once. `cursor-agent` is the headless fallback. |
 | Kiro CLI | Existing kiro-cli login | Opt in and run `kiro-cli login` once. ai-usagebar refreshes the session when needed. |
+| Nous Research | OAuth device flow | Enable `[nous]`, click **Log in with Nous Research** in the Omarchy settings panel, or run `ai-usagebar auth nous login`. Credentials are kept in ai-usagebar's separate platform config directory (`~/.config/ai-usagebar/credentials.json` on Linux). |
+| OpenCode Go | API key (`OPENCODE_GO_API_KEY` env or `[opencode-go] api_key` in config) | Enable `[opencode-go]`, then enter the key in the Omarchy settings panel or set the environment variable. |
+
+### Nous credits and OpenCode Go
+
+Nous usage percentage is calculated from the subscription-credit pool only:
+`(monthly subscription credits - subscription credits remaining) / monthly subscription credits`.
+Top-up/purchased credits are not mixed into that percentage. When the Portal
+reports them, the tooltip and TUI show subscription credits, top-up credits, and
+total usable credits as separate values.
+
+Nous login is interactive because the device code is authorized in the browser.
+Leave the terminal open until it reports that login completed, then refresh the
+Omarchy panel. The login never reads Hermes Agent credentials. On Unix, newly
+created credential directories use mode `0700`, and credential and lock files
+use mode `0600`; an existing current-user-owned config directory also works when
+it is not group- or world-writable. Windows uses the user's platform config
+directory and inherited per-user access controls.
+
+OpenCode Go uses the official usage endpoint and the `percent` field. Its key can
+be entered through the native Settings panel; stored values are sent to the Rust
+settings command over stdin and are never placed in QML command arguments. Cache
+entries are tied to the endpoint and a one-way key fingerprint, so changing
+accounts cannot reuse another account's fresh or stale usage.
 
 #### Grok: team-scoped vs organization-scoped keys
 
@@ -475,6 +499,9 @@ The widget reads the providers and accounts already enabled in
 - The gear or `s` opens QML settings.
 - Right-click launches the TUI.
 - Middle-click or the mouse wheel switches providers.
+- The selected provider or named account is remembered across shell reloads
+  and sleep/unlock cycles. If it is later disabled, the configured primary is
+  used instead.
 
 The [Omarchy plugin guide](omarchy/README.md) covers keyboard controls,
 credential handling, updates, and development checks.
@@ -616,6 +643,15 @@ Claude Desktop or CLI login. The dedicated
 - safe credential and cache isolation;
 - Waybar modules for personal and work subscriptions;
 - macOS Desktop and CLI switching, backups, and history conflicts.
+
+### Multiple OpenRouter accounts
+
+Add one `[[openrouter.accounts]]` entry per key, then select it with
+`--vendor openrouter --account <label>`. Named accounts appear separately in
+the TUI, native integrations, and `usage` reports. Each has its own cache, so
+one key's fresh data cannot be shown for another. See the
+[OpenRouter account guide](docs/openrouter-accounts.md) for the config and
+Waybar examples.
 
 ## Hyprland: float the TUI window
 

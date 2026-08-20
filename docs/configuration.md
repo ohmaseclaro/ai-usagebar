@@ -46,6 +46,12 @@ api_key_env = "ZAI_API_KEY"
 enabled = true
 api_key_env = "OPENROUTER_API_KEY"
 # api_key = "sk-or-v1-..."
+# show_default_account = false  # hide default when named accounts exist
+
+# [[openrouter.accounts]]
+# label = "work"
+# api_key_env = "OPENROUTER_WORK_API_KEY"
+# api_key = "sk-or-v1-..."      # optional fallback; chmod 600 if inline
 
 [deepseek]
 enabled = true             # disabled by default; enable once you add an API key
@@ -122,6 +128,10 @@ enabled = true             # disabled by default; enable once you've run `kiro-c
 # transcript_max_bytes = 2147483648   # 2 GiB backstop, when transcripts is on
 # keep_snapshots = 10             # must be >= 1; 0 is refused at load
 ```
+
+For more than one OpenRouter key, see the
+[OpenRouter account guide](openrouter-accounts.md). The existing singular
+`[openrouter]` key remains the default account and needs no migration.
 
 ## Sync configuration
 

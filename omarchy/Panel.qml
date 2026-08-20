@@ -31,6 +31,7 @@ Panel {
   property string commandStderr: ""
   property string commandStdout: ""
   property bool loading: true
+  property int lastExitCode: 0
   property bool refreshQueued: false
   property double lastSuccessfulMs: 0
   property double nowMs: Date.now()
@@ -40,6 +41,7 @@ Panel {
   readonly property int refreshIntervalSec: Math.max(30, Math.min(3600,
     Number(setting("refreshIntervalSec", 300)) || 300))
   readonly property string configuredProvider: String(setting("provider", "") || "").trim()
+  readonly property string rememberedEntryId: String(setting("lastSelectedEntryId", "") || "").trim()
   readonly property var visibleEntries: Model.filteredEntries(entries, configuredProvider)
   readonly property int entryIndex: Model.selectedIndex(visibleEntries, selectedEntryId)
   readonly property var entry: entryIndex >= 0 ? visibleEntries[entryIndex] : null
@@ -67,13 +69,36 @@ Panel {
     }
     for (var i = 0; i < visibleEntries.length; i++)
       if (visibleEntries[i].id === selectedEntryId) return
-    selectedEntryId = Model.preferredEntryId(visibleEntries, primaryProvider)
+    selectedEntryId = Model.preferredEntryId(visibleEntries, primaryProvider, rememberedEntryId)
+  }
+
+  function restoreRememberedSelection() {
+    if (visibleEntries.length === 0) return
+    selectedEntryId = Model.preferredEntryId(visibleEntries, primaryProvider, rememberedEntryId)
+  }
+
+  function persistSelection(entryId) {
+    if (String(entryId || "").trim() === rememberedEntryId) return
+
+    // Quattro persists inline widget settings in shell.json and pushes them
+    // live to every monitor. Keep every existing setting, including settings
+    // introduced by future versions, and add only the selected report id.
+    var entry = Model.settingsWithSelectedEntry(root.settings, root.moduleName, entryId)
+    if (!entry) return
+
+    // Apply locally first so selection remains responsive. Older compatible
+    // hosts without updateEntryInline still retain the choice for this session.
+    root.settings = entry
+    if (hostWidget && "settings" in hostWidget) hostWidget.settings = entry
+    if (bar && bar.shell && typeof bar.shell.updateEntryInline === "function")
+      bar.shell.updateEntryInline(root.moduleName, entry)
   }
 
   function selectEntry(index) {
     if (visibleEntries.length === 0) return
     var wrapped = ((index % visibleEntries.length) + visibleEntries.length) % visibleEntries.length
     selectedEntryId = visibleEntries[wrapped].id
+    persistSelection(selectedEntryId)
     if (providerList.visible) providerList.positionViewAtIndex(wrapped, ListView.Contain)
     if (panelFlick) panelFlick.contentY = 0
   }
@@ -100,7 +125,9 @@ Panel {
       syncSelection()
     } else {
       var detail = commandStderr.trim()
-      loadError = detail !== "" ? Model.errorMessage(detail) : parsed.error
+      loadError = lastExitCode === 127
+        ? Model.launchErrorMessage(lastExitCode, detail)
+        : (detail !== "" ? Model.errorMessage(detail) : parsed.error)
     }
     loading = false
     if (refreshQueued) Qt.callLater(startRefresh)
@@ -126,6 +153,11 @@ Panel {
       hostWidget.launchDashboard()
     else if (bar)
       bar.run("omarchy-launch-floating-terminal-with-presentation ai-usagebar-tui")
+  }
+
+  function openNousLogin() {
+    if (bar && typeof bar.run === "function")
+      bar.run("omarchy-launch-floating-terminal-with-presentation ai-usagebar auth nous login")
   }
 
   function switchPanel(direction) {
@@ -173,6 +205,7 @@ Panel {
 
   onEntriesChanged: Qt.callLater(syncSelection)
   onConfiguredProviderChanged: Qt.callLater(syncSelection)
+  onRememberedEntryIdChanged: Qt.callLater(restoreRememberedSelection)
   onOpenedChanged: {
     if (opened) {
       cursorActive = false
@@ -204,7 +237,9 @@ Panel {
   Process {
     id: usageProcess
     running: false
-    command: ["ai-usagebar", "usage", "--json"]
+    // /usr/bin/env always starts on Omarchy and reports a missing ai-usagebar
+    // as exit 127. Keep the command as structured argv: no shell is needed.
+    command: ["/usr/bin/env", "ai-usagebar", "usage", "--json"]
 
     stdout: StdioCollector {
       waitForEnd: true
@@ -218,7 +253,8 @@ Panel {
       onStreamFinished: root.commandStderr = text
     }
 
-    onExited: {
+    onExited: function(exitCode) {
+      root.lastExitCode = exitCode
       // Let both waitForEnd collectors publish their buffers first.
       Qt.callLater(function() { root.finishRefresh() })
     }
@@ -327,6 +363,7 @@ Panel {
             fontFamily: root.fontFamily
             onSaved: root.startRefresh()
             onFallbackRequested: root.openTerminalSettings()
+            onNousLoginRequested: root.openNousLogin()
             onCloseRequested: root.closeSettings()
           }
 
@@ -433,22 +470,27 @@ Panel {
                 required property var modelData
                 width: usageSection.width
 
+                // `visible` alone is not enough: QML evaluates the bindings of
+                // hidden items too, so every row used to be handed to all three
+                // components and the two that did not match read fields the row
+                // does not carry. A "spacer" row has no label or value, which is
+                // what produced the TypeError below on every report.
                 MetricRow {
                   visible: modelData.type === "metric"
                   width: parent.width
-                  row: modelData
+                  row: modelData.type === "metric" ? modelData : null
                 }
 
                 DetailRow {
                   visible: modelData.type === "text"
                   width: parent.width
-                  row: modelData
+                  row: modelData.type === "text" ? modelData : null
                 }
 
                 BlockRow {
                   visible: modelData.type === "block"
                   width: parent.width
-                  row: modelData
+                  row: modelData.type === "block" ? modelData : null
                 }
 
                 Item {
@@ -588,7 +630,7 @@ Panel {
       id: headingLabel
       visible: detailRow.heading
       width: parent.width
-      text: detailRow.row ? Model.autoTextSafe(detailRow.row.label.toUpperCase()) : ""
+      text: detailRow.row ? Model.autoTextSafe(String(detailRow.row.label || "").toUpperCase()) : ""
       foreground: root.foreground
       fontFamily: root.fontFamily
     }

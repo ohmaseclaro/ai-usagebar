@@ -1,6 +1,6 @@
 [package]
 name = "ai-usagebar"
-version = "1.2.0"
+version = "1.4.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -98,6 +98,9 @@ zeroize = "1.9"
 # The OS CSPRNG directly: 16 salt bytes, 24 nonce bytes, 32 master-key bytes.
 # No `rand`, no ThreadRng, no reseeding.
 getrandom = "0.4"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["process"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"

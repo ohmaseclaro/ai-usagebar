@@ -9,7 +9,7 @@ Each release is also published at
 
 ## [Unreleased]
 
-## [1.2.0] — 2026-08-20
+## [1.4.0] — 2026-08-20
 
 ### Added
 
@@ -167,6 +167,69 @@ is quiet about what it got wrong is not one worth trusting with a credential.
   ever read from a command-line argument or an environment variable, on any
   surface; the GitHub token is stored in the macOS Keychain or in a mode-0600
   file beside `config.toml`, never in `config.toml` itself.
+## [1.3.1] — 2026-08-19
+
+### Fixed
+
+- Omarchy remembers the exact provider or named account selected in the
+  Quattro panel and restores it after shell reloads, including sleep/unlock
+  cycles. If that entry is no longer available, the configured primary remains
+  the safe fallback.
+
+## [1.3.0] — 2026-08-19
+
+### Added
+
+- OpenRouter supports multiple named keys through `[[openrouter.accounts]]`.
+  Named accounts work with `--account`, appear separately in aggregate views,
+  and keep isolated caches; existing singular `[openrouter]` configs and cache
+  paths remain unchanged.
+- Z.AI and MiniMax now expose pace and elapsed-time placeholders
+  (`{zai_session_elapsed}`, `{zai_session_pace}`, `{zai_weekly_elapsed}`,
+  `{zai_weekly_pace}`, `{zai_mcp_elapsed}`, `{zai_mcp_pace}`,
+  `{minimax_session_elapsed}`, `{minimax_session_pace}`,
+  `{minimax_weekly_elapsed}`, `{minimax_weekly_pace}`,
+  `{minimax_video_elapsed}`, `{minimax_video_pace}`,
+  `{minimax_video_weekly_reset}`, `{minimax_video_weekly_elapsed}`,
+  `{minimax_video_weekly_pace}`, and their `_pace_indicator` variants), plus
+  the cross-vendor `{session_elapsed}` / `{weekly_elapsed}` aliases — the macOS
+  menu bar's pace marker now renders for both vendors the same way it already
+  does for Claude and Codex.
+
+### Fixed
+
+- Omarchy now reports a missing `ai-usagebar` binary with the required install
+  command instead of leaving the Quattro widget stuck in its loading state.
+- Omarchy's Quattro panel no longer evaluates hidden row components against
+  incompatible report rows, eliminating repeated QML type and string-binding
+  errors without changing the rendered layout.
+
+## [1.2.0] — 2026-08-18
+
+### Added
+
+- Added Nous Research subscription usage through its OAuth device flow and
+  OpenCode Go rolling, weekly, and monthly usage through its API key.
+
+### Fixed
+
+- Nous Research refreshes now send the refresh token in the form and the
+  required Portal header, work with existing safe configuration directories,
+  and use portable atomic credential replacement on Linux, macOS, and Windows.
+- Nous Research percentages now use subscription credits only. Purchased and
+  total usable credits remain separate balances instead of changing the plan
+  percentage.
+- OpenCode Go now rejects empty or unsupported usage responses and keeps live
+  and stale cache entries isolated by endpoint and API-key identity.
+
+### Security
+
+- Updated `h2` to 0.4.16 to bound empty DATA-frame processing
+  (`RUSTSEC-2026-0258`).
+- Nous browser launches no longer pass Portal URLs through the Windows command
+  shell, and OAuth traffic uses bounded requests with same-origin redirects.
+- OAuth fields and expiry arithmetic are bounded, and provider-specific error
+  classes are preserved without exposing credential-bearing response bodies.
 
 ## [1.1.0] — 2026-08-16
 
@@ -1668,7 +1731,10 @@ vendors. Highlights:
 - Live API smoke test suite (`make smoke`) that exercises the real
   undocumented endpoints to detect schema drift before users do.
 
-[Unreleased]: https://github.com/akitaonrails/ai-usagebar/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-usagebar/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/akitaonrails/ai-usagebar/compare/v1.3.1...v1.4.0
+[1.3.1]: https://github.com/akitaonrails/ai-usagebar/compare/v1.3.0...v1.3.1
+[1.3.0]: https://github.com/akitaonrails/ai-usagebar/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/akitaonrails/ai-usagebar/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/akitaonrails/ai-usagebar/compare/v1.0.3...v1.1.0
 [1.0.3]: https://github.com/akitaonrails/ai-usagebar/compare/v1.0.2...v1.0.3
