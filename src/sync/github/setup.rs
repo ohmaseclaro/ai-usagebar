@@ -31,7 +31,7 @@ use crate::sync::passphrase::{self, Strength};
 use crate::sync::report::{self, DryRunReport};
 use crate::sync::{SyncRoots, plan};
 
-use super::gate::{self, PushClearance};
+use super::gate;
 use super::pairing;
 use super::token::{self, TokenSource};
 use super::{Client, Endpoints, RepoRef};
@@ -147,8 +147,12 @@ impl SetupPrompt for TtyPrompt {
     }
 }
 
-/// What setup learned. Carries the [`PushClearance`] rather than a `bool`,
-/// because a `bool` is a cached check and D-04 forbids one.
+/// What setup learned.
+///
+/// **No [`PushClearance`](gate::PushClearance).** Setup has no consumer for one
+/// — the field was minted, moved in, and dropped — and carrying it would hand
+/// Phase 4 a stale capability that is easy to reach for (F-3). A push mints its
+/// own, immediately before its first byte, and spends it.
 ///
 /// Nothing here is a secret: the token is reported as a *source*, the
 /// passphrase is not represented at all, and no keyfile byte is carried.
@@ -162,7 +166,6 @@ pub struct SetupOutcome {
     pub stored_at: TokenSource,
     pub visibility: String,
     pub warnings: Vec<String>,
-    pub clearance: PushClearance,
     pub categories: Vec<SyncCategory>,
     /// The local keyfile. Still local — Phase 4 uploads it.
     pub keyfile: PathBuf,
@@ -211,7 +214,10 @@ pub async fn run(
     let record = pairing::read_from(&pairing_file)?;
     // check_drift first, then assert_pushable — that order, always.
     let drift = pairing::check_drift(record.as_ref(), &facts, credentials_in_bundle, now)?;
-    let (clearance, gate_warnings) =
+    // The clearance is dropped here, deliberately: `sync setup` uploads nothing
+    // (D-05), so the only thing keeping it could do is age. A push mints and
+    // spends its own — see `gate`'s Phase 4 contract.
+    let (_clearance, gate_warnings) =
         gate::assert_pushable(&facts, &repo, credentials_in_bundle, now)?;
 
     let mut warnings = drift.warnings.clone();
@@ -328,7 +334,6 @@ pub async fn run(
         stored_at,
         visibility: facts.visibility,
         warnings,
-        clearance,
         categories,
         keyfile: keyfile_path,
         reused_pairing: !drift.first_contact,

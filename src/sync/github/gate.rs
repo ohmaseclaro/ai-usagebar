@@ -7,10 +7,21 @@
 //! - [`assert_pushable`] is the **sole** constructor of [`PushClearance`], whose
 //!   field is private and which is neither `Clone` nor `Copy`. A clearance
 //!   cannot be forged, and cannot be duplicated into a cache.
-//! - [`PushClearance::assert_fresh`] turns "immediately" into arithmetic. Phase
-//!   4's upload entry point takes a clearance **by value**, calls `assert_fresh`
-//!   before the first byte, and re-runs [`fetch_facts`] + [`assert_pushable`]
-//!   inside the push rather than carrying one obtained at `sync setup`.
+//! - [`PushClearance::spend`] turns "immediately" into arithmetic that cannot be
+//!   skipped. It **consumes** the clearance and is the only way to obtain a
+//!   [`Pushing`], which every write verb takes. There is no `&self` freshness
+//!   check to forget: unforgeable and non-`Clone` stopped duplication, but
+//!   neither stopped *holding* — a clearance minted at `sync setup` could be
+//!   moved across any interval into a `fn push(clearance: PushClearance)` that
+//!   never looked at the clock (security finding F-3, whose `assert_fresh` had
+//!   zero production callers and read as wired because it had tests).
+//!
+//! **The contract for Phase 4's write path:** every verb that sends a byte takes
+//! a [`Pushing`] by value. A `Pushing` comes only from
+//! `assert_pushable(…)?.0.spend(now)?`, so the sequence
+//! [`fetch_facts`] → [`assert_pushable`] → [`PushClearance::spend`] runs inside
+//! the push, within [`MAX_CLEARANCE_AGE`] of the first byte — never carried over
+//! from `sync setup`, which no longer hands one out at all.
 //!
 //! Plan 3-04 filled [`assert_pushable`]'s remaining refusal conditions and its
 //! warning cases behind the signature frozen here, and added the REPO-03 guard
@@ -152,30 +163,43 @@ const VISIBILITY_INTERNAL: &str = "internal";
 /// a clearance that could be stashed and duplicated *is* a cached check, which
 /// is exactly what D-04 forbids.
 #[derive(Debug)]
+#[must_use = "a clearance that is not spent is a private-repo check nothing acted on"]
 pub struct PushClearance {
     checked_at: DateTime<Utc>,
 }
+
+/// Permission to send a byte, and the only thing that carries it.
+///
+/// Private field, no public constructor, no `Clone`: the sole way to hold one is
+/// [`PushClearance::spend`], which does the freshness arithmetic on the way
+/// through. A write verb that takes a `Pushing` therefore cannot be reached
+/// without a check that was fresh at the call — not by discipline, and not by a
+/// method someone remembers to invoke.
+#[derive(Debug)]
+#[must_use = "a Pushing is permission to upload; dropping one uploads nothing"]
+pub struct Pushing(());
 
 impl PushClearance {
     pub fn checked_at(&self) -> DateTime<Utc> {
         self.checked_at
     }
 
-    /// D-04's "immediately", as arithmetic Phase 4 can call.
+    /// D-04's "immediately", as arithmetic that cannot be skipped: this consumes
+    /// the clearance, so spending it *is* checking it.
     ///
     /// A clearance dated in the *future* fails too: that is a clock that moved,
     /// and an unbounded-looking age is not something to wave a push through on.
-    pub fn assert_fresh(&self, now: DateTime<Utc>, max_age: Duration) -> Result<()> {
+    pub fn spend(self, now: DateTime<Utc>) -> Result<Pushing> {
         let age = now.signed_duration_since(self.checked_at);
-        let fresh = age >= TimeDelta::zero() && age.to_std().is_ok_and(|a| a <= max_age);
+        let fresh = age >= TimeDelta::zero() && age.to_std().is_ok_and(|a| a <= MAX_CLEARANCE_AGE);
         if fresh {
-            return Ok(());
+            return Ok(Pushing(()));
         }
         Err(AppError::Other(format!(
             "the private-repo check is {}s old (limit {}s) — re-run it immediately before \
              pushing, because the repository can be made public at any moment",
             age.num_seconds(),
-            max_age.as_secs()
+            MAX_CLEARANCE_AGE.as_secs()
         )))
     }
 }
@@ -683,27 +707,60 @@ mod tests {
         }
     }
 
-    /// D-04's "immediately", enforceable rather than merely described.
+    /// D-04's "immediately", enforceable rather than merely described — and
+    /// spending is the *only* way to reach a [`Pushing`], so it cannot be
+    /// skipped by a caller who simply never calls it (F-3).
+    ///
+    /// A fresh clearance per case: `spend` consumes it, which is the point.
     #[test]
     fn a_clearance_goes_stale_and_a_clearance_from_the_future_is_refused() {
-        let (clearance, _) = assert_pushable(&facts(true), &repo(), true, now()).unwrap();
-        assert!(clearance.assert_fresh(now(), MAX_CLEARANCE_AGE).is_ok());
-        assert!(
-            clearance
-                .assert_fresh(now() + TimeDelta::seconds(5), MAX_CLEARANCE_AGE)
-                .is_ok()
-        );
+        let minted = || {
+            assert_pushable(&facts(true), &repo(), true, now())
+                .unwrap()
+                .0
+        };
 
-        let stale = clearance
-            .assert_fresh(now() + TimeDelta::seconds(31), MAX_CLEARANCE_AGE)
+        assert!(minted().spend(now()).is_ok());
+        assert!(minted().spend(now() + TimeDelta::seconds(5)).is_ok());
+
+        let stale = minted()
+            .spend(now() + TimeDelta::seconds(31))
             .expect_err("31s is past the 30s limit");
         assert!(stale.to_string().contains("immediately before"), "{stale}");
+        assert!(
+            stale
+                .to_string()
+                .contains(&MAX_CLEARANCE_AGE.as_secs().to_string()),
+            "{stale}"
+        );
 
         assert!(
-            clearance
-                .assert_fresh(now() - TimeDelta::seconds(1), MAX_CLEARANCE_AGE)
-                .is_err(),
+            minted().spend(now() - TimeDelta::seconds(1)).is_err(),
             "a clearance dated in the future is a clock that moved"
         );
+    }
+
+    /// F-3, as a standing check rather than a claim in a doc comment: nothing
+    /// but `spend` may hand out a `Pushing`, and `spend` is the only `&self`-free
+    /// exit from a `PushClearance`. A re-added `assert_fresh`-shaped method —
+    /// one that reports freshness without consuming the capability — puts the
+    /// forgettable path back, so the name is refused outright.
+    #[test]
+    fn freshness_is_the_only_exit_from_a_clearance() {
+        let source =
+            std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file!()))
+                .unwrap();
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        assert!(
+            code.contains("pub fn spend(self,"),
+            "spend must consume self"
+        );
+        assert!(
+            !code.contains("fn assert_fresh"),
+            "a &self freshness check is exactly the thing that had no callers"
+        );
+        // `Pushing`'s field is private and unit-typed, so `Pushing(())` outside
+        // this module does not compile; the only literal is inside `spend`.
+        assert_eq!(code.matches("Ok(Pushing(()))").count(), 1, "one mint site");
     }
 }
