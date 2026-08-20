@@ -1,15 +1,27 @@
 //! `ai-usagebar sync setup` — pair this machine with the private repository
 //! named in `[sync] repo`, in the five steps UX-03 asks for.
 //!
-//! **Uploads nothing** (D-05). The flow is: the repository and the gate, then
-//! the passphrase, then the categories, then the size, then "ready to push".
+//! **Uploads nothing** (D-05). The flow is: the categories, then the repository
+//! and the gate, then the passphrase, then the size, then everything that
+//! persists.
 //!
-//! **The ordering is the substance.** Step 1 refuses before [`SetupPrompt`] is
-//! touched at all, because asking someone to choose a passphrase for a
-//! repository that is about to be refused wastes their time and teaches them
-//! the refusal is negotiable. Every test drives a scripted prompt double that
-//! records which methods were reached, so that ordering is asserted rather than
-//! reviewed.
+//! **The ordering is the substance**, and it changed for a security reason.
+//! The categories come *first* because the credentials category is an input to
+//! the gate — the one deciding D-04's public-repo carve-out — and a gate
+//! answered before the question was settled was answered a question it was no
+//! longer being asked (F-2). Everything else still refuses as early as it can:
+//! the local preconditions and the whole gate run before a passphrase is
+//! generated, so nobody is asked to choose one for a repository that is about to
+//! be refused.
+//!
+//! **Nothing persists until the confirmation passes** (F-10). The keyfile, the
+//! `config.toml` write-back, the token and the pairing record are all written in
+//! step 5, after the last thing that can abort. A keyfile written earlier
+//! survived the decline and then refused the re-run, stranding the user behind a
+//! passphrase they were shown once.
+//!
+//! Every test drives a scripted prompt double that records which methods were
+//! reached, so that ordering is asserted rather than reviewed.
 //!
 //! `roots` is the **only** way this module reaches a filesystem path: the
 //! keyfile, the pairing record, the token file, the index, and the
@@ -181,6 +193,11 @@ pub struct SetupOutcome {
 }
 
 /// The five steps, in order.
+///
+/// A refusal after step 1 has cost the user the category question and nothing
+/// else — no passphrase, no file, no remote write. That is the price of asking
+/// the gate a settled question, and it is the right one: the alternative is a
+/// public repository cleared for a bundle it was never assessed against.
 pub async fn run(
     cfg: &SyncConfig,
     roots: &SyncRoots,
@@ -189,18 +206,21 @@ pub async fn run(
     prompt: &mut dyn SetupPrompt,
     now: DateTime<Utc>,
 ) -> Result<SetupOutcome> {
-    // ---- Step 1: the repository, and the gate ---------------------------
-    // Nothing below this block is reached by a refusal, and no prompt method is
-    // called inside it (T-3-35).
+    // ---- Preconditions: local, and reached before any prompt -------------
+    // T-3-38 first, and before anything asks the user for anything: this is a
+    // fact about *this machine*, not about the repository, and a run that is
+    // going to refuse should refuse before it costs a question. Overwriting a
+    // keyfile makes every bundle written under the old password permanently
+    // unreadable.
+    let keyfile_path = crate::sync::cli::keyfile_path(roots);
+    if keyfile_path.exists() {
+        return Err(AppError::Other(existing_keyfile_message(&keyfile_path)));
+    }
+
     let Some(configured) = cfg.repo.as_deref() else {
         return Err(AppError::Other(no_repo_message()));
     };
     let repo = RepoRef::parse(configured)?;
-
-    // Computed **once** and passed to both gate calls. Derived twice, plan
-    // 3-04's credentials-off carve-out dies: `check_drift` carves it out and
-    // `assert_pushable` would then overrule it.
-    let credentials_in_bundle = cfg.includes(SyncCategory::Credentials);
 
     let token_file = token_path(roots);
     let (value, source) = token::resolve(chain)?;
@@ -217,6 +237,33 @@ pub async fn run(
         }
     };
 
+    // ---- Step 1: the categories — the question the gate is asked ---------
+    //
+    // **This runs before the gate, and that ordering is the whole point.**
+    // `credentials_in_bundle` is the only gate input the user can change, and it
+    // is the one deciding D-04's public-repo carve-out. Asked afterwards, a
+    // public repository with `categories = ["config"]` took the carve-out, minted
+    // a clearance, and *then* had `credentials` added at this prompt — the dry
+    // run enumerated the credential files, the pairing record was written at
+    // `private: false`, and setup printed "paired and ready to push" (F-2).
+    // Nothing re-gated.
+    //
+    // Reordering rather than re-asserting is deliberate: a recompute-and-check
+    // closes the window but leaves two evaluations to keep in agreement, which
+    // is the shape that produced the hole. There is now exactly one.
+    prompt.say("1/5  What gets bundled. `credentials` is the deliberate one — turning it on syncs saved logins.");
+    let categories = prompt.categories(&cfg.categories)?;
+    let chosen_cfg = SyncConfig {
+        categories: categories.clone(),
+        ..cfg.clone()
+    };
+
+    // ---- Step 2: the repository, and the gate ----------------------------
+    // Computed **once**, from the categories just chosen, and passed to both
+    // gate calls. Derived twice, plan 3-04's credentials-off carve-out dies:
+    // `check_drift` carves it out and `assert_pushable` would then overrule it.
+    let credentials_in_bundle = chosen_cfg.includes(SyncCategory::Credentials);
+
     let pairing_file = pairing::default_path(roots);
     let record = pairing::read_from(&pairing_file)?;
     // check_drift first, then assert_pushable — that order, always.
@@ -231,28 +278,39 @@ pub async fn run(
     warnings.extend(gate_warnings);
 
     prompt.say(&format!(
-        "1/5  {repo} is {} — the gate passed.",
+        "\n2/5  {repo} is {} — the gate passed.",
         facts.visibility
     ));
     for warning in &warnings {
         prompt.say(&format!("     warning: {warning}"));
     }
-    if !drift.first_contact {
+    if drift.first_contact {
+        // F-5. Deleting the pairing record makes `check_drift` skip the
+        // owner_id/repo_id comparison entirely and report first contact — and
+        // with no positive line for it, a silently reset pairing looked exactly
+        // like a first-ever setup. Say it, with the ids, and say what it means
+        // if it is a surprise.
+        prompt.say(&format!(
+            "     first contact: pairing with repository id {} owned by {} (id {}). \
+             Nothing was compared, because there was no pairing record to compare against.",
+            facts.id, facts.owner_login, facts.owner_id
+        ));
+        prompt.say(
+            "     If this machine was already paired, that record did not remove itself — \
+             treat its disappearance as an incident, and confirm those ids are the \
+             repository you mean before going on.",
+        );
+    } else {
         prompt.say(
             "     this machine is already paired with it; reusing that pairing rather than \
              issuing a second one.",
         );
     }
 
-    // ---- Step 2: the passphrase, and the keyfile ------------------------
-    let keyfile_path = crate::sync::cli::keyfile_path(roots);
-    if keyfile_path.exists() {
-        return Err(AppError::Other(existing_keyfile_message(&keyfile_path)));
-    }
-
+    // ---- Step 3: the passphrase, and the keyfile -------------------------
     let kdf = prompt.kdf();
     let generated = passphrase::generate()?;
-    prompt.say("\n2/5  A sync password protects the bundle.");
+    prompt.say("\n3/5  A sync password protects the bundle.");
     prompt.say(passphrase::NO_RECOVERY);
     prompt.say(passphrase::OFFLINE_ATTACK_NOTE);
     // Shown exactly once — not re-displayed on a re-prompt below.
@@ -275,21 +333,11 @@ pub async fn run(
         }
     };
 
+    // Created, **not written**: see step 5. F-10 — the file used to land here,
+    // before the confirmation that can abort, and its own existence then refused
+    // the re-run, stranding a user who declined behind a passphrase they were
+    // shown once and told there is no recovery for.
     let (keyfile, keys) = Keyfile::create(chosen_pw.as_bytes(), kdf)?;
-    write_keyfile(&keyfile_path, &keyfile)?;
-    prompt.say(&format!("     keyfile written: {}", keyfile_path.display()));
-
-    // ---- Step 3: the categories -----------------------------------------
-    prompt.say("\n3/5  What gets bundled. `credentials` is the deliberate one — turning it on syncs saved logins.");
-    let categories = prompt.categories(&cfg.categories)?;
-    let chosen_cfg = SyncConfig {
-        categories: categories.clone(),
-        ..cfg.clone()
-    };
-    if categories != cfg.categories {
-        write_categories(&roots.config_file, &categories)?;
-        prompt.say(&format!("     saved to {}", roots.config_file.display()));
-    }
 
     // ---- Step 4: the size ------------------------------------------------
     let index = Index::at(&roots.index_file)?;
@@ -320,12 +368,24 @@ pub async fn run(
     if !prompt.confirm("     Pair this machine with that scope?", true)? {
         return Err(AppError::Other(
             "setup stopped at the size confirmation. Nothing was uploaded — this command \
-             never uploads — and the repository was not touched."
+             never uploads — the repository was not touched, and nothing was written here: \
+             no keyfile, no config change, no stored token. Re-run when you are ready."
                 .into(),
         ));
     }
 
-    // ---- Step 5: ready ---------------------------------------------------
+    // ---- Step 5: everything that persists --------------------------------
+    // Nothing above this line writes. The confirmation is the last thing that
+    // can abort, so it is the last thing before the first write (F-10).
+    write_keyfile(&keyfile_path, &keyfile)?;
+    prompt.say(&format!(
+        "\n5/5  keyfile written: {}",
+        keyfile_path.display()
+    ));
+    if categories != cfg.categories {
+        write_categories(&roots.config_file, &categories)?;
+        prompt.say(&format!("     saved to {}", roots.config_file.display()));
+    }
     let stored_at = prompt.store_token(&keep, &token_file).map_err(|e| {
         AppError::Other(format!(
             "could not save the GitHub sync token: {e}\n\
@@ -658,9 +718,11 @@ mod tests {
             .await
             .unwrap();
 
+        // Categories first: the gate cannot be asked before the question it is
+        // being asked is settled (F-2).
         let reached = script.borrow().reached.clone();
-        assert_eq!(reached[0], "passphrase", "{reached:?}");
-        assert_eq!(reached[1], "categories", "{reached:?}");
+        assert_eq!(reached[0], "categories", "{reached:?}");
+        assert_eq!(reached[1], "passphrase", "{reached:?}");
         assert!(reached[2].starts_with("confirm:"), "{reached:?}");
         assert_eq!(reached.len(), 3, "{reached:?}");
 
@@ -713,7 +775,13 @@ mod tests {
         assert!(!rendered.contains(wrapped), "{rendered}");
     }
 
-    /// T-3-35, the whole ordering claim: a refusal never reaches step 2.
+    /// T-3-35, the whole ordering claim: a refusal never reaches the password
+    /// step, and never leaves a keyfile behind.
+    ///
+    /// The category question is the one thing a gate refusal now costs, and it
+    /// has to: it is the gate's own input (F-2). Everything that is not a gate
+    /// input still refuses with no prompt at all — which is why the two
+    /// token/repository failures are asserted separately and more strictly.
     #[tokio::test]
     async fn every_refusal_stops_before_the_password_step_is_reached() {
         for (body, status) in [(PUBLIC, 200), ("{}", 404), ("{}", 401)] {
@@ -722,11 +790,17 @@ mod tests {
             let err = drive(&cfg_for(Some("o/n")), &dir, body, status, &script)
                 .await
                 .expect_err("this repository is not pairable");
+            let reached = script.borrow().reached.clone();
             assert!(
-                script.borrow().reached.is_empty(),
-                "status {status} reached {:?}",
-                script.borrow().reached
+                !reached.iter().any(|r| r == "passphrase"),
+                "status {status} reached {reached:?}"
             );
+            if status != 200 {
+                assert!(
+                    reached.is_empty(),
+                    "a failure that is not a gate decision asks nothing: {reached:?}"
+                );
+            }
             assert!(!crate::sync::cli::keyfile_path(&roots_at(&dir)).exists());
             let _ = err;
         }
@@ -1084,7 +1158,62 @@ mod tests {
             .await
             .expect_err("credentials are in the bundle by default");
         assert!(err.to_string().contains("REFUSING TO PUSH"), "{err}");
-        assert!(script.borrow().reached.is_empty());
+        assert_eq!(script.borrow().reached, ["categories"]);
+    }
+
+    /// F-2, the composed path, exactly as it was reachable with default
+    /// answers: config says `categories = ["config"]`, so the *old* order took
+    /// D-04's carve-out and minted a clearance — and the user then added
+    /// `credentials` at a prompt nothing re-gated. Setup stored the token, wrote
+    /// the pairing record at `private: false`, and printed "ready to push".
+    ///
+    /// The gate is now asked the question the user actually answered.
+    #[tokio::test]
+    async fn adding_credentials_at_the_prompt_re_decides_the_public_repository() {
+        let dir = TempDir::new().unwrap();
+        let roots = roots_at(&dir);
+        // The carve-out's own configuration, so a gate reading `cfg` rather than
+        // the answer would clear this run.
+        let cfg = SyncConfig {
+            repo: Some("o/n".into()),
+            categories: vec![SyncCategory::Config],
+            ..SyncConfig::default()
+        };
+        let script = Script::new();
+        script.borrow_mut().categories =
+            Some(vec![SyncCategory::Config, SyncCategory::Credentials]);
+
+        let err = drive(&cfg, &dir, PUBLIC, 200, &script)
+            .await
+            .expect_err("a public repository does not hold credentials");
+        assert!(err.to_string().contains("REFUSING TO PUSH"), "{err}");
+        assert!(err.to_string().contains("rotate"), "{err}");
+
+        // …and none of the things that made it look cleared happened.
+        assert!(script.borrow().stored.is_empty(), "no token was stored");
+        assert!(!pairing::default_path(&roots).exists(), "no pairing record");
+        assert!(
+            !crate::sync::cli::keyfile_path(&roots).exists(),
+            "no keyfile"
+        );
+        let said = script.borrow().said.join("\n");
+        assert!(!said.contains("the gate passed"), "{said}");
+    }
+
+    /// The carve-out still lives, from the other direction: config carries
+    /// `credentials`, the user turns it *off* at the prompt, and the same public
+    /// repository proceeds with the warning. One evaluation, of the answer.
+    #[tokio::test]
+    async fn removing_credentials_at_the_prompt_re_decides_it_too() {
+        let dir = TempDir::new().unwrap();
+        let script = Script::new();
+        script.borrow_mut().categories = Some(vec![SyncCategory::Config]);
+
+        let out = drive(&cfg_for(Some("o/n")), &dir, PUBLIC, 200, &script)
+            .await
+            .expect("credentials are off, so public is a warning");
+        assert_eq!(out.categories, vec![SyncCategory::Config]);
+        assert!(out.warnings.iter().any(|w| w.contains("public")), "{out:?}");
     }
 
     // ---- pairing reuse, and the filesystem boundary -----------------------
@@ -1160,10 +1289,34 @@ mod tests {
         let script = Script::new();
         script.borrow_mut().confirm = false;
 
+        let config = dir.path().join("config.toml");
+        fs::write(&config, "[sync]\n").unwrap();
+        let before = fs::read_to_string(&config).unwrap();
+        script.borrow_mut().categories = Some(vec![SyncCategory::Config]);
+
         let err = drive(&cfg_for(Some("o/n")), &dir, PRIVATE, 200, &script)
             .await
             .expect_err("the user declined");
         assert!(err.to_string().contains("Nothing was uploaded"), "{err}");
         assert!(!pairing::default_path(&roots_at(&dir)).exists());
+
+        // F-10: the keyfile used to be written before this confirmation, and
+        // then refused the re-run — stranding the user behind a passphrase they
+        // were shown once, with no recovery by design. Nothing persists until
+        // the last thing that can abort has passed.
+        let keyfile = crate::sync::cli::keyfile_path(&roots_at(&dir));
+        assert!(!keyfile.exists(), "a declined setup leaves no keyfile");
+        assert_eq!(
+            fs::read_to_string(&config).unwrap(),
+            before,
+            "and no config write-back either"
+        );
+        assert!(script.borrow().stored.is_empty(), "and no stored token");
+
+        // …so the flow can simply be re-run, which is the whole point.
+        let again = Script::new();
+        drive(&cfg_for(Some("o/n")), &dir, PRIVATE, 200, &again)
+            .await
+            .expect("a declined setup is re-runnable");
     }
 }
