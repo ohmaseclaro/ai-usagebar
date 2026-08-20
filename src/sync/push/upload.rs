@@ -1,33 +1,83 @@
-//! Pack assets on to the release.
-//!
-//! Plan 4-01 created this file with the straight-line case: upload each pack in
-//! turn and verify each one. **Plan 4-03 owns it** and adds the resume scan (D4:
-//! skip a pack already present at a matching size and state, delete a torn one
-//! first), the four-at-a-time `JoinSet`, and the per-asset progress calls.
+//! Pack assets on to the release: the resume scan, the bounded uploader, and
+//! the verification D3 makes a precondition of the flip.
 //!
 //! Nothing in this file prints. Rendering belongs to the [`Progress`]
 //! implementations, which keeps the uploader testable with
 //! [`Silent`](super::progress::Silent).
+//!
+//! # Why there is no `JoinSet` here
+//!
+//! Plan 4-03 was written against a `tokio::task::JoinSet` refilled to four.
+//! Two things merged since make that unimplementable rather than merely
+//! unattractive, and both are structural:
+//!
+//! - every write verb takes a [`gate::Pushing`] **by reference**, and `Pushing`
+//!   is not `Clone`. A spawned task must be `'static`, so it cannot hold the
+//!   borrow that proves the gate was earned. Minting a second permit here to
+//!   work around that would put gate logic in this module, which is exactly
+//!   what T-4-21 says must not exist.
+//! - [`PushCtx`] holds an `&Index`, whose `rusqlite::Connection` is `Send` but
+//!   not `Sync`, so a future borrowing the context is not `Send` and cannot be
+//!   spawned at all.
+//!
+//! What replaces it keeps the same semantics — up to four uploads outstanding,
+//! refilled as each completes — with a window of boxed futures polled by hand.
+//! Concurrency without `'static`: no crate is added, and the borrow of the
+//! permit survives.
+
+use std::future::{Future, poll_fn};
+use std::pin::Pin;
+use std::task::Poll;
 
 use crate::error::{AppError, Result};
-use crate::sync::crypto::content_address;
+use crate::sync::crypto::{Keyfile, content_address};
 use crate::sync::github::gate;
+use crate::sync::github::write::{ASSET_STATE_UPLOADED, Asset};
 
 use super::progress::Progress;
 use super::{BuiltPack, PushCtx, pack_asset_name};
 
+/// One outstanding upload: the pack's position in the pending list — which is
+/// what progress reports — and the future doing the work.
+type InFlight<'a> = (usize, Pin<Box<dyn Future<Output = Result<()>> + 'a>>);
+
+/// How many bodies may be on the wire at once.
+///
+/// The research's documented ceiling is 100 concurrent requests, but with
+/// `PACK_MAX`-sized bodies a push is bandwidth-bound long before it is
+/// request-bound, and a low cap keeps a laptop's uplink usable while it runs
+/// (T-4-23). Four 48 MiB bodies is also the memory ceiling of this module.
+const MAX_IN_FLIGHT: usize = 4;
+
 /// Upload `packs`, returning `(uploaded, skipped, bytes_uploaded)`.
 ///
-/// **Verification is D3's precondition for the flip**, not a nicety: every asset
-/// this run uploaded is fetched back and its content address compared against
-/// the pack's id. A mismatch fails this function, so the orchestrator never
-/// reaches the pointer `PUT` and no pointer can reference a pack that did not
-/// verify.
+/// **Step 1, the resume scan.** One `list_assets`, then a three-way decision
+/// per pack — see [`decide`]. Resume is free because a pack's name *is* its
+/// content address: a changed pack gets a different name, so "already
+/// uploaded" has an exact answer and no local record of what a previous run
+/// did is needed (D4, SYNC-05).
+///
+/// **Step 2, the uploads**, at most [`MAX_IN_FLIGHT`] at a time. Every request
+/// goes through `write::upload_asset`, which already routes through the shared
+/// retry helper, so D7's rate-limit discipline is inherited rather than
+/// re-implemented — there is deliberately no second retry loop here (T-4-24).
+///
+/// **Step 3, verification**, which D3 makes a precondition of the flip rather
+/// than a nicety: every asset this run uploaded is fetched back and its content
+/// address compared against the pack's id. A mismatch fails this function, so
+/// the orchestrator never reaches the pointer `PUT` and no pointer can
+/// reference a pack that did not verify (T-4-20).
 ///
 /// Say plainly what that check is and is not: a corrupt pack would in any case
 /// fail its per-blob Poly1305 tags on read, so this catches transport and
 /// packaging bugs, not attacks. It costs one extra download of newly-uploaded
-/// data — on a 115 MB first push, 115 MB — and that is the price D3 sets.
+/// data — on a 115 MB first push, 115 MB — and that is the price D3 sets. A
+/// later phase can drop it only if GitHub is found to populate the asset
+/// `digest` field, which the live probe in `tests/live.rs` is there to answer.
+///
+/// Skipped assets are **not** re-downloaded: they carry a content-addressed
+/// name, a torn upload is caught by the state check, and re-verifying data an
+/// earlier run already verified would double the traffic of every resume.
 ///
 /// `permit` is the gate's, minted inside the push. It authorises every write
 /// here; the flip gets a second one, minted by the re-gate afterwards.
@@ -38,45 +88,203 @@ pub async fn run(
     permit: &gate::Pushing,
     progress: &mut dyn Progress,
 ) -> Result<(usize, usize, u64)> {
-    let total_bytes: u64 = packs.iter().map(|p| p.bytes.len() as u64).sum();
-    progress.start(packs.len(), total_bytes);
+    let existing = ctx
+        .client
+        .list_assets(ctx.repo, release_id, ctx.now)
+        .await?;
 
-    let mut uploaded = 0usize;
-    let mut bytes = 0u64;
-    for (index, pack) in packs.iter().enumerate() {
+    let mut pending: Vec<&BuiltPack> = Vec::with_capacity(packs.len());
+    let mut skipped = 0usize;
+    for pack in packs {
         let name = pack_asset_name(&pack.id);
-        let asset = ctx
-            .client
-            .upload_asset(
-                ctx.repo,
-                release_id,
-                &name,
-                pack.bytes.clone(),
-                permit,
-                ctx.now,
-            )
-            .await?;
-
-        let fetched = ctx
-            .client
-            .download_asset(ctx.repo, asset.id, ctx.now)
-            .await?;
-        if content_address(&fetched) != pack.id {
-            return Err(AppError::Other(format!(
-                "the pack uploaded as {name} does not read back as the bytes that were sent. \
-                 Nothing was published — the snapshot pointer is untouched — and re-running \
-                 the command re-uploads it. If this repeats, report it at \
-                 https://github.com/akitaonrails/ai-usagebar/issues."
-            )));
+        match decide(&existing, &name, pack.bytes.len() as u64) {
+            Decision::Present => skipped += 1,
+            // GitHub creates the asset record before the body finishes, so an
+            // interrupted upload leaves a zombie whose name would collide
+            // forever. Deleting it is what makes a resume a continuation.
+            Decision::Torn(asset_id) => {
+                ctx.client
+                    .delete_asset(ctx.repo, asset_id, permit, ctx.now)
+                    .await?;
+                pending.push(pack);
+            }
+            Decision::Absent => pending.push(pack),
         }
-
-        uploaded += 1;
-        bytes += pack.bytes.len() as u64;
-        progress.asset_done(index, &name, pack.bytes.len() as u64);
     }
 
+    // Measured from the packs' own lengths, never from a projection.
+    let bytes: u64 = pending.iter().map(|p| p.bytes.len() as u64).sum();
+    progress.start(pending.len(), bytes);
+    let outcome = upload_all(ctx, release_id, &pending, permit, progress).await;
     progress.finish();
-    Ok((uploaded, 0, bytes))
+    outcome?;
+    Ok((pending.len(), skipped, bytes))
+}
+
+/// Publish the local keyfile asset if the release does not already carry it.
+///
+/// **Without this a first push publishes a pointer naming an asset that does
+/// not exist**, and a second machine cannot bootstrap from the bundle at all —
+/// which is the whole purpose of the milestone. `Pointer.keyfile` is set from a
+/// content address of the local keyfile, but before this function only `rekey`
+/// ever *uploaded* one. Plan 4-01 recorded the gap; it is closed here.
+///
+/// Idempotent by content address, which is what makes it safe to call on every
+/// push rather than only the first: the asset's name is
+/// [`keyfile_asset_name`] over the canonical serialization, so an unchanged
+/// keyfile always resolves to the same name and a listing that already shows it
+/// uploaded ends the function without a request body.
+///
+/// The bytes are the keyfile's **canonical** serialization —
+/// `serde_json::to_vec` of what is on disk, which is what
+/// `cli::keyfile_asset_for` addresses and what `rekey` uploads. Not the file's
+/// literal bytes: setup writes it pretty-printed, and uploading those would
+/// publish an asset whose name addresses different bytes than it holds. Nothing
+/// here re-wraps, re-derives or re-encrypts anything — getting a keyfile's bytes
+/// wrong is an unrecoverable bundle.
+///
+/// **Known sharp edge, for whoever wires the rekey path.** This publishes
+/// whatever keyfile is on *this* machine's disk. If another machine has rekeyed
+/// and this one still holds the superseded wrapper, calling this re-uploads it
+/// — D5 destroyed that asset deliberately. The pointer is unaffected (its
+/// `keyfile` comes from the arriving pointer), so the bundle stays readable, but
+/// the old wrapper comes back as an orphan asset prune never collects. Rekey
+/// must write the new keyfile to disk *before* calling this.
+pub async fn ensure_keyfile(
+    ctx: &PushCtx<'_>,
+    release_id: u64,
+    permit: &gate::Pushing,
+) -> Result<()> {
+    // Filled in by the next commit, against the tests that describe it.
+    let _ = (ctx, release_id, permit);
+    Ok(())
+}
+
+/// The local keyfile's canonical bytes, read through the injected
+/// [`SyncRoots`](crate::sync::SyncRoots) like every other collector — never
+/// from a resolver that reads a real `$HOME`.
+///
+/// Round-tripped through [`Keyfile`] rather than hashed as it sits on disk,
+/// because the on-disk form is pretty-printed and the asset name addresses the
+/// compact one. No password is involved: this reads the wrapped blob and does
+/// not open it.
+#[allow(dead_code)]
+fn canonical_keyfile(ctx: &PushCtx<'_>) -> Result<Vec<u8>> {
+    let path = crate::sync::cli::keyfile_path(ctx.roots);
+    let raw = std::fs::read(&path).map_err(|e| AppError::io_at(&path, e))?;
+    let keyfile: Keyfile = serde_json::from_slice(&raw).map_err(|_| {
+        AppError::Other(format!(
+            "{} is not a readable sync keyfile, so the bundle's keyfile asset cannot be \
+             published. Nothing was uploaded.",
+            path.display()
+        ))
+    })?;
+    serde_json::to_vec(&keyfile)
+        .map_err(|e| AppError::Other(format!("the sync keyfile could not be serialized: {e}")))
+}
+
+/// What the resume scan decided about one asset name.
+#[derive(Debug, PartialEq, Eq)]
+enum Decision {
+    /// Name, size and state all agree — skip it. All three, deliberately:
+    /// the name alone is attacker-supplied and a torn upload carries the right
+    /// one (T-4-19).
+    Present,
+    /// Present under the right name but not in the uploaded state, or at the
+    /// wrong size. Delete this asset id, then upload.
+    Torn(u64),
+    Absent,
+}
+
+fn decide(existing: &[Asset], name: &str, size: u64) -> Decision {
+    match existing.iter().find(|a| a.name == name) {
+        None => Decision::Absent,
+        Some(a) if a.size == size && a.state == ASSET_STATE_UPLOADED => Decision::Present,
+        Some(a) => Decision::Torn(a.id),
+    }
+}
+
+/// Up to [`MAX_IN_FLIGHT`] uploads outstanding, refilled as each completes.
+///
+/// A hand-polled window rather than a `JoinSet` — see the module docs for why
+/// spawning is not available here. Each slot is one boxed future borrowing the
+/// context and the permit; `poll_fn` polls every outstanding one and returns
+/// the first that is ready, which is `join_next` without the `'static` bound.
+/// The first failure returns, dropping — and so cancelling — the rest.
+async fn upload_all(
+    ctx: &PushCtx<'_>,
+    release_id: u64,
+    pending: &[&BuiltPack],
+    permit: &gate::Pushing,
+    progress: &mut dyn Progress,
+) -> Result<()> {
+    let mut queued = pending.iter().enumerate();
+    let mut in_flight: Vec<InFlight<'_>> = Vec::with_capacity(MAX_IN_FLIGHT);
+
+    loop {
+        while in_flight.len() < MAX_IN_FLIGHT {
+            let Some((index, pack)) = queued.next() else {
+                break;
+            };
+            in_flight.push((index, Box::pin(upload_one(ctx, release_id, pack, permit))));
+        }
+        if in_flight.is_empty() {
+            return Ok(());
+        }
+
+        let (slot, finished) = poll_fn(|cx| {
+            for (slot, (_, task)) in in_flight.iter_mut().enumerate() {
+                if let Poll::Ready(out) = task.as_mut().poll(cx) {
+                    return Poll::Ready((slot, out));
+                }
+            }
+            Poll::Pending
+        })
+        .await;
+
+        // Removed before the `?`: a future that returned `Ready` must never be
+        // polled again, and the early return drops the whole vector anyway.
+        let (index, _done) = in_flight.remove(slot);
+        finished?;
+        let pack = pending[index];
+        progress.asset_done(index, &pack_asset_name(&pack.id), pack.bytes.len() as u64);
+    }
+}
+
+/// One pack: upload it, fetch it back, and prove it is the bytes that were
+/// sent.
+async fn upload_one(
+    ctx: &PushCtx<'_>,
+    release_id: u64,
+    pack: &BuiltPack,
+    permit: &gate::Pushing,
+) -> Result<()> {
+    let name = pack_asset_name(&pack.id);
+    let asset = ctx
+        .client
+        .upload_asset(
+            ctx.repo,
+            release_id,
+            &name,
+            pack.bytes.clone(),
+            permit,
+            ctx.now,
+        )
+        .await?;
+
+    let fetched = ctx
+        .client
+        .download_asset(ctx.repo, asset.id, ctx.now)
+        .await?;
+    if content_address(&fetched) != pack.id {
+        return Err(AppError::Other(format!(
+            "the pack uploaded as {name} does not read back as the bytes that were sent. \
+             Nothing was published — the snapshot pointer is untouched — and re-running \
+             the command re-uploads it. If this repeats, report it at \
+             https://github.com/akitaonrails/ai-usagebar/issues."
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -244,7 +452,10 @@ mod tests {
             .create_async()
             .await;
         let download = server
-            .mock("GET", format!("/repos/o/n/releases/assets/{asset_id}").as_str())
+            .mock(
+                "GET",
+                format!("/repos/o/n/releases/assets/{asset_id}").as_str(),
+            )
             .with_status(200)
             .with_body(pack.bytes.clone())
             .create_async()
@@ -274,15 +485,9 @@ mod tests {
         let (c_up, _c_down) = mock_pack(&mut server, &packs[2], 102).await;
 
         let local = Local::at(&server.url());
-        let (uploaded, skipped, bytes) = run(
-            &local.ctx(),
-            RELEASE,
-            &packs,
-            &permit(),
-            &mut Silent,
-        )
-        .await
-        .unwrap();
+        let (uploaded, skipped, bytes) = run(&local.ctx(), RELEASE, &packs, &permit(), &mut Silent)
+            .await
+            .unwrap();
 
         assert_eq!((uploaded, skipped), (2, 1));
         // Measured from the packs' own lengths, never projected.
@@ -311,10 +516,9 @@ mod tests {
         let (upload, _download) = mock_pack(&mut server, &packs[0], 101).await;
 
         let local = Local::at(&server.url());
-        let (uploaded, skipped, _) =
-            run(&local.ctx(), RELEASE, &packs, &permit(), &mut Silent)
-                .await
-                .unwrap();
+        let (uploaded, skipped, _) = run(&local.ctx(), RELEASE, &packs, &permit(), &mut Silent)
+            .await
+            .unwrap();
 
         assert_eq!((uploaded, skipped), (1, 0));
         delete.assert_async().await;
@@ -387,6 +591,31 @@ mod tests {
         max: usize,
     }
 
+    /// Which pack an upload request names, by the `name=` in its query.
+    ///
+    /// The match lives **inside** the mock's own predicate rather than in a
+    /// `match_query` beside it, and that is not a style choice: mockito
+    /// evaluates every candidate mock's `match_request` closure while it looks
+    /// for one that matches, so a counter incremented in a closure that also
+    /// relies on a separate matcher counts requests the mock never answered.
+    /// One mock, one predicate, and the side effect happens only on a real hit.
+    fn upload_of(packs: &[(String, BuiltPack)], path_and_query: &str) -> Option<usize> {
+        packs
+            .iter()
+            .position(|(name, _)| path_and_query.contains(&format!("name={name}")))
+    }
+
+    /// Which pack a download request names, by the asset id in its path.
+    fn download_of(path: &str) -> Option<usize> {
+        let id: u64 = path
+            .strip_prefix("/repos/o/n/releases/assets/")?
+            .parse()
+            .ok()?;
+        id.checked_sub(FIRST_ASSET_ID).map(|i| i as usize)
+    }
+
+    const FIRST_ASSET_ID: u64 = 200;
+
     /// Six packs, four at a time. `started - finished` is the number of packs
     /// whose upload has reached the server and whose verifying download has
     /// not, which is exactly the window this function bounds.
@@ -396,49 +625,61 @@ mod tests {
         let packs: Vec<BuiltPack> = (1..=6u8).map(|i| pack(i, 10 + i as usize)).collect();
         let _list = mock_listing(&mut server, "[]".into()).await;
 
+        let named: Arc<Vec<(String, BuiltPack)>> = Arc::new(
+            packs
+                .iter()
+                .map(|p| (pack_asset_name(&p.id), p.clone()))
+                .collect(),
+        );
         let flight: Arc<Mutex<Flight>> = Arc::default();
-        let mut keep = Vec::new();
-        for (i, p) in packs.iter().enumerate() {
-            let asset_id = 200 + i as u64;
-            let name = pack_asset_name(&p.id);
-            let on_upload = Arc::clone(&flight);
-            keep.push(
-                server
-                    .mock("POST", "/repos/o/n/releases/9/assets")
-                    .match_query(Matcher::UrlEncoded("name".into(), name.clone()))
-                    .match_request(move |_| {
-                        let mut f = on_upload.lock().unwrap();
-                        f.started += 1;
-                        f.max = f.max.max(f.started - f.finished);
-                        true
-                    })
-                    .with_status(201)
-                    .with_body(asset_json(
-                        asset_id,
-                        &name,
-                        p.bytes.len(),
-                        ASSET_STATE_UPLOADED,
-                    ))
-                    .create_async()
-                    .await,
-            );
-            let on_download = Arc::clone(&flight);
-            keep.push(
-                server
-                    .mock(
-                        "GET",
-                        format!("/repos/o/n/releases/assets/{asset_id}").as_str(),
-                    )
-                    .match_request(move |_| {
-                        on_download.lock().unwrap().finished += 1;
-                        true
-                    })
-                    .with_status(200)
-                    .with_body(p.bytes.clone())
-                    .create_async()
-                    .await,
-            );
-        }
+
+        let counted = Arc::clone(&flight);
+        let matching = Arc::clone(&named);
+        let bodies = Arc::clone(&named);
+        let _upload = server
+            .mock("POST", Matcher::Any)
+            .match_request(move |req| {
+                if upload_of(&matching, req.path_and_query()).is_none() {
+                    return false;
+                }
+                let mut f = counted.lock().unwrap();
+                f.started += 1;
+                f.max = f.max.max(f.started - f.finished);
+                true
+            })
+            .with_status(201)
+            .with_body_from_request(move |req| {
+                let i = upload_of(&bodies, req.path_and_query()).expect("matched already");
+                let (name, p) = &bodies[i];
+                asset_json(
+                    FIRST_ASSET_ID + i as u64,
+                    name,
+                    p.bytes.len(),
+                    ASSET_STATE_UPLOADED,
+                )
+                .into_bytes()
+            })
+            .create_async()
+            .await;
+
+        let counted = Arc::clone(&flight);
+        let bodies = Arc::clone(&named);
+        let _download = server
+            .mock("GET", Matcher::Any)
+            .match_request(move |req| match download_of(req.path()) {
+                Some(_) => {
+                    counted.lock().unwrap().finished += 1;
+                    true
+                }
+                None => false,
+            })
+            .with_status(200)
+            .with_body_from_request(move |req| {
+                let i = download_of(req.path()).expect("matched already");
+                bodies[i].1.bytes.clone()
+            })
+            .create_async()
+            .await;
 
         let local = Local::at(&server.url());
         let (uploaded, _, _) = run(&local.ctx(), RELEASE, &packs, &permit(), &mut Silent)
@@ -446,9 +687,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(uploaded, 6);
+        // The literal, not `MAX_IN_FLIGHT`: asserted against the constant this
+        // test passes at any cap, because the observed maximum simply follows
+        // it. Raising the ceiling must turn this red and make someone justify
+        // the memory (T-4-23).
         assert_eq!(
             flight.lock().unwrap().max,
-            MAX_IN_FLIGHT,
+            4,
             "four bodies concurrent, and never a fifth"
         );
     }
