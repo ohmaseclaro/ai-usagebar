@@ -55,6 +55,7 @@ use zeroize::Zeroizing;
 
 use ai_usagebar::config::{SyncCategory, SyncConfig};
 use ai_usagebar::sync::SyncRoots;
+use ai_usagebar::sync::anchor::{self, Anchor};
 use ai_usagebar::sync::crypto::{
     ChunkId, KdfDoc, KdfParams, Keyfile, Keys, content_address, derive_kek,
 };
@@ -62,6 +63,7 @@ use ai_usagebar::sync::github::token::TokenSource;
 use ai_usagebar::sync::github::write::ASSET_STATE_UPLOADED;
 use ai_usagebar::sync::github::{Client, Endpoints, RepoRef, pairing};
 use ai_usagebar::sync::index::Index;
+use ai_usagebar::sync::model::Root;
 use ai_usagebar::sync::push::progress::Progress;
 use ai_usagebar::sync::push::{
     self, PRUNE_GRACE, Pointer, PushCtx, PushOutcome, SnapshotRecord, prune, rekey,
@@ -93,6 +95,20 @@ const NEW_PASSWORD: &[u8] = b"a different long enough sync password";
 
 /// Fixed and injected. Nothing here reads the wall clock.
 const NOW: DateTime<Utc> = match DateTime::from_timestamp(1_700_000_000, 0) {
+    Some(t) => t,
+    None => panic!("a fixed timestamp"),
+};
+
+/// **GitHub's clock, and it is deliberately not `NOW`.**
+///
+/// The fake used to stamp every upload at exactly `NOW` — zero skew, the single
+/// value that cannot expose a `created_at >= ctx.now` filter. Phase 4's audit
+/// found the incident cleanup selecting assets by comparing the remote's clock
+/// to this machine's, which deletes nothing whenever the local clock runs a few
+/// seconds fast (an incremental push is seconds long) and which a hostile remote
+/// disables outright by backdating. Two clocks are never equal; a fixture that
+/// pretends they are proves nothing about the code that compares them.
+const REMOTE_CLOCK: DateTime<Utc> = match DateTime::from_timestamp(1_700_000_000 - 90, 0) {
     Some(t) => t,
     None => panic!("a fixed timestamp"),
 };
@@ -271,6 +287,7 @@ impl Local {
             // Filled by `push::run` from the remote, after the gate. A caller
             // that populated it would have had to request before the gate.
             previous: None,
+            allow_rollback: false,
             now: NOW,
         }
     }
@@ -357,7 +374,8 @@ struct RemoteState {
     refuse_put: bool,
     /// The next pointer `PUT` answers 409, and this pointer becomes current.
     conflict_with: Option<Vec<u8>>,
-    /// Assets uploaded from here on are stamped with this instead of `NOW`.
+    /// Assets uploaded from here on are stamped with this instead of
+    /// [`REMOTE_CLOCK`].
     upload_clock: Option<DateTime<Utc>>,
 }
 
@@ -496,7 +514,7 @@ impl Remote {
                 let bytes = req.body().expect("an upload has a body").clone();
                 let mut st = s.lock().expect("lock");
                 st.note("POST", "/releases/9/assets");
-                let at = st.upload_clock.unwrap_or(NOW);
+                let at = st.upload_clock.unwrap_or(REMOTE_CLOCK);
                 let id = st.plant(&name, bytes, at);
                 let stored = st
                     .assets
@@ -732,6 +750,34 @@ async fn push(local: &Local, remote: &Remote) -> ai_usagebar::error::Result<Push
     let client = remote.client();
     let repo = repo();
     push::run(local.ctx(&client, &repo), &mut Recording::default()).await
+}
+
+/// One push through the real orchestrator, with `--allow-rollback`.
+async fn push_allowing_rollback(
+    local: &Local,
+    remote: &Remote,
+) -> ai_usagebar::error::Result<PushOutcome> {
+    let client = remote.client();
+    let repo = repo();
+    let mut ctx = local.ctx(&client, &repo);
+    ctx.allow_rollback = true;
+    push::run(ctx, &mut Recording::default()).await
+}
+
+/// The counter sealed inside every snapshot root the pointer carries, in
+/// pointer order. Read through the format's own reader, which is the only thing
+/// that makes a counter meaningful.
+fn counters(pointer: &Pointer, local: &Local) -> Vec<u64> {
+    pointer
+        .snapshots
+        .iter()
+        .map(|s| {
+            let framed = B64.decode(&s.root).expect("a base64 root");
+            Root::open(&local.keys, &framed, &push::repo_id_for(1))
+                .expect("a root this bundle's keys open")
+                .counter
+        })
+        .collect()
 }
 
 /// Every pack asset name the pointer's snapshots reference.
@@ -1052,6 +1098,272 @@ async fn a_stale_sha_conflict_re_plans_and_the_prune_spares_the_competitor() {
             "and it is still on the release"
         );
     });
+}
+
+// ---------------------------------------------------------------------------
+// The security audit's three blocking findings
+// ---------------------------------------------------------------------------
+
+/// **NEW-1.** Two machines, which is the entire point of this milestone.
+///
+/// A and B both read a pointer whose highest counter is `n` and both compute
+/// `n + 1`. A flips first; B gets a 409. The counter used to be derived where
+/// the *packer* ran — once, before the race — so B's re-`PUT` republished a
+/// second snapshot claiming `n + 1`. Two distinct snapshots at one counter make
+/// "select the newest by counter" ambiguous, and `anchor::accept` reads an equal
+/// counter as *a re-read of the snapshot already seen*: B's backup is silently
+/// dropped by the control built to protect backups. Rule 1's dedup compares root
+/// **bytes**, which differ, so it cannot see the collision.
+///
+/// The fix derives the counter inside the rebuild closure — the only code that
+/// runs again after the race — and re-seals the root with it.
+#[tokio::test]
+async fn a_flip_lost_to_another_machine_republishes_at_a_higher_counter_never_the_same_one() {
+    // Two machines: `wrap_by_hand` is deterministic, so both hold the same
+    // master key and the same keyfile address, and each has its own TempDir —
+    // its own index, its own pairing record, its own rollback anchor.
+    let a = Local::new();
+    let b = Local::new();
+    assert_eq!(a.keyfile_asset, b.keyfile_asset, "one bundle, two machines");
+    let remote = Remote::new().await;
+
+    a.seed("shared", &payload(11, 512 * 1024));
+    b.seed("shared", &payload(11, 512 * 1024));
+    push(&a, &remote).await.expect("the first push lands");
+
+    // Both machines are now looking at this pointer, whose highest counter is 1.
+    let contended = remote.with(|st| st.pointer.clone().expect("published"));
+    let seen: Pointer = serde_json::from_slice(&contended.1).expect("a stored pointer");
+    assert_eq!(counters(&seen, &a), vec![1]);
+
+    // A pushes and wins, producing counter 2.
+    a.seed("a-only", &payload(12, 512 * 1024));
+    push(&a, &remote).await.expect("machine A wins the race");
+    let winner = remote.with(|st| st.pointer.clone().expect("published"));
+
+    // Rewind the remote to what B read, and arm the 409 with A's pointer: B is
+    // about to discover it lost. B has no anchor — it has never pushed — so this
+    // is first contact for it, exactly as it would be for a genuine second
+    // machine, and not a rollback.
+    remote.with(|st| {
+        st.pointer = Some(contended.clone());
+        st.conflict_with = Some(winner.1.clone());
+    });
+
+    b.seed("b-only", &payload(13, 512 * 1024));
+    push(&b, &remote).await.expect("machine B survives the 409");
+
+    let landed = remote.with(|st| st.pointer_value().expect("published"));
+    let published = counters(&landed, &a);
+
+    let unique: BTreeSet<u64> = published.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        published.len(),
+        "no two snapshots may claim one counter: {published:?}"
+    );
+    assert_eq!(
+        published,
+        vec![1, 2, 3],
+        "the loser re-seals one above the winner rather than reusing its own"
+    );
+    assert_eq!(
+        landed.snapshots.len(),
+        3,
+        "and every machine's snapshot survives: {published:?}"
+    );
+
+    // Both snapshots survive an anchor round-trip. Read oldest to newest with
+    // the anchor advancing, every one is strictly newer than the mark — so none
+    // reads as "already seen", which is the failure the collision caused.
+    let mut mark = Anchor {
+        repo_id: push::repo_id_for(1),
+        counter: 0,
+    };
+    for counter in &published {
+        anchor::accept(Some(&mark), &mark.repo_id.clone(), *counter, false)
+            .unwrap_or_else(|e| panic!("counter {counter} must read as new: {e}"));
+        assert!(
+            *counter > mark.counter,
+            "{counter} is not strictly above the high-water mark {}",
+            mark.counter
+        );
+        mark.counter = *counter;
+    }
+}
+
+/// **NEW-2 / T-4-04.** The accept named a control that was not on this path.
+///
+/// An attacker with repo write — squarely in the declared model — replaces the
+/// pointer with an authentic *older* copy of itself. Every root in it opens,
+/// `repo_id` matches, nothing errors. The next honest push used to carry those
+/// records forward, append its own and flip, **laundering the rollback into a
+/// legitimately-written pointer** — and then prune computed liveness over the
+/// laundered pointer and deleted every pack the rollback orphaned. Those packs
+/// are older than 24 h, so `PRUNE_GRACE` does not cover them: reversible tamper
+/// became irreversible deletion, executed by the victim, exit 0.
+#[tokio::test]
+async fn a_pointer_rolled_back_to_an_authentic_older_copy_is_refused_rather_than_laundered() {
+    let local = Local::new();
+    local.seed("first", &payload(21, 512 * 1024));
+    let remote = Remote::new().await;
+
+    push(&local, &remote).await.expect("the first push lands");
+    let old = remote.with(|st| st.pointer.clone().expect("published"));
+
+    local.seed("second", &payload(22, 512 * 1024));
+    push(&local, &remote).await.expect("the second push lands");
+    let current = remote.with(|st| st.pointer_value().expect("published"));
+    assert_eq!(counters(&current, &local), vec![1, 2]);
+
+    // Age every pack past the grace window, so nothing but the pointer stands
+    // between prune and the data the rollback orphans.
+    remote.with(|st| {
+        for asset in &mut st.assets {
+            asset.created_at = NOW - TimeDelta::days(30);
+        }
+        // The tamper: an authentic older copy of the pointer, byte for byte.
+        st.pointer = Some(old.clone());
+        st.deleted.clear();
+    });
+    let doomed = referenced(&current);
+
+    local.seed("third", &payload(23, 512 * 1024));
+    let err = push(&local, &remote)
+        .await
+        .expect_err("a rolled-back pointer must not be pushed onto");
+    let text = err.to_string();
+    assert!(text.contains("rolled-back snapshot"), "{text}");
+    assert!(
+        text.contains("--allow-rollback"),
+        "the message names the escape, and the escape exists: {text}"
+    );
+
+    remote.with(|st| {
+        assert_eq!(
+            st.pointer.clone().expect("still published"),
+            old,
+            "nothing was laundered: the tampered pointer was not republished"
+        );
+        assert!(
+            st.deleted.is_empty(),
+            "and prune never ran, so nothing was deleted: {:?}",
+            st.deleted
+        );
+        for name in &doomed {
+            assert!(
+                st.live_names().contains(name),
+                "{name} was orphaned by the rollback and is still on the release"
+            );
+        }
+    });
+
+    // The on-demand prune is the path that would perform the deletion, and it
+    // refuses on the same evidence rather than trusting the pointer it is
+    // handed.
+    let client = remote.client();
+    let repo = repo();
+    let refused = prune::run_on_demand(&local.ctx(&client, &repo), 10)
+        .await
+        .expect_err("prune must not compute liveness over a rolled-back pointer");
+    assert!(refused.to_string().contains("rolled-back snapshot"));
+
+    // And the escape is real: a user who knows why the remote went back gets
+    // through, which is what keeps the refusal's message honest.
+    push_allowing_rollback(&local, &remote)
+        .await
+        .expect("--allow-rollback is the documented way through");
+}
+
+/// **NEW-3 / T-4-45.** A rekey has to stick across machines, or it is cosmetic.
+///
+/// Machine A rekeys: it uploads the new wrapper, flips, deletes the old one and
+/// re-lists to confirm — truthfully, at that instant. Machine B, which has not
+/// rekeyed, then runs an ordinary push, and `ensure_keyfile` used to publish
+/// **whatever keyfile is on this machine's disk** — putting the wrapper A
+/// destroyed straight back on the release, where the old password opens it.
+/// Prune calls it an orphan, but `PRUNE_GRACE` holds it 24 h and B's next push
+/// resets `created_at`, so it is never collected.
+#[tokio::test]
+async fn a_machine_that_missed_a_rekey_refuses_rather_than_republishing_the_old_wrapper() {
+    let a = Local::at(FLOOR);
+    let b = Local::at(FLOOR);
+    a.seed("shared", &payload(31, 256 * 1024));
+    b.seed("shared", &payload(31, 256 * 1024));
+    let remote = Remote::new().await;
+
+    push(&a, &remote).await.expect("A's first push lands");
+    let old_wrapper = remote.with(|st| st.pointer_value().expect("published").keyfile);
+    assert_eq!(old_wrapper, b.keyfile_asset, "B holds the same wrapper");
+
+    let client = remote.client();
+    let repo = repo();
+    let new_wrapper = rekey::run(
+        &a.ctx(&client, &repo),
+        &Zeroizing::new(String::from_utf8(PASSWORD.to_vec()).expect("ascii")),
+        &Zeroizing::new(String::from_utf8(NEW_PASSWORD.to_vec()).expect("ascii")),
+    )
+    .await
+    .expect("A changes the sync password");
+    assert!(
+        !remote.with(|st| st.live_names().contains(&old_wrapper)),
+        "D5: A verifiably deleted the old wrapper"
+    );
+
+    remote.with(|st| {
+        st.requests.clear();
+        st.deleted.clear();
+    });
+    b.seed("b-only", &payload(32, 256 * 1024));
+    let err = push(&b, &remote)
+        .await
+        .expect_err("a stale machine must not publish the superseded wrapper");
+
+    let text = err.to_string();
+    assert!(
+        text.contains("changed on another machine"),
+        "the user is told plainly what happened: {text}"
+    );
+    assert!(
+        text.contains(&new_wrapper) && text.contains(&old_wrapper),
+        "and which wrapper is which: {text}"
+    );
+    assert!(
+        text.contains("copy") && text.contains("keyfile.json"),
+        "and how to catch this machine up: {text}"
+    );
+    assert!(
+        text.contains("re-encrypts no"),
+        "and that the data is unaffected: {text}"
+    );
+
+    remote.with(|st| {
+        assert!(
+            !st.live_names().contains(&old_wrapper),
+            "the wrapper the rekey destroyed is not resurrected"
+        );
+        assert_eq!(
+            st.pointer_value().expect("published").keyfile,
+            new_wrapper,
+            "and the pointer still names the new one"
+        );
+        assert_eq!(
+            st.uploads(),
+            0,
+            "the refusal comes before a byte is sent: {:?}",
+            st.requests
+        );
+    });
+
+    // The catch-up the message names actually works: copy A's keyfile onto B.
+    let caught_up: Keyfile = serde_json::from_slice(
+        &std::fs::read(keyfile_path(&a.roots)).expect("A's rewrapped keyfile"),
+    )
+    .expect("a keyfile");
+    write_keyfile(&b.roots, &caught_up);
+    push(&b, &remote)
+        .await
+        .expect("B pushes once it holds the current wrapper");
 }
 
 // ---------------------------------------------------------------------------
@@ -1388,6 +1700,10 @@ async fn a_long_push_reports_advancing_counts_and_every_failure_names_an_action(
         "nothing was flipped"
     );
     let (deleted, live) = remote.with(|st| (st.deleted.clone(), st.live_names()));
+    // **F-4.** Every asset this run uploaded, selected from what `upload::run`
+    // observed itself sending — not from a `created_at >= now` comparison
+    // between GitHub's clock and this machine's, which `REMOTE_CLOCK` would
+    // now make a guaranteed no-op.
     assert!(
         !deleted.is_empty(),
         "the incident path deletes what this run uploaded"

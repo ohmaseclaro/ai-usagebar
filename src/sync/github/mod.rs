@@ -382,9 +382,7 @@ mod tests {
     #[test]
     fn no_third_http_client_is_built_under_src_sync() {
         let needle = format!("reqwest::{}::", "Client");
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sync");
-        let mut files = Vec::new();
-        collect_rs(&root, &mut files);
+        let files = crate::sync::guard::rs_files_in("src/sync");
 
         // Shipped code only, and the marker is the whole `mod tests` header
         // rather than the bare attribute: the bare form also occurs inside a doc
@@ -417,17 +415,6 @@ mod tests {
              authenticated one in github/mod.rs and the token-free storage one in \
              github/write.rs. Found: {sites:#?}"
         );
-    }
-
-    fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                collect_rs(&path, out);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                out.push(path);
-            }
-        }
     }
 
     #[test]

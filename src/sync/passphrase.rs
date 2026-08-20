@@ -419,29 +419,45 @@ mod tests {
         }
     }
 
+    /// **The whole of `src/sync/`, walked — not a list of files.**
+    ///
+    /// argv and the environment are readable by any local user through /proc,
+    /// environment values are inherited by children, and both land in crash
+    /// dumps. The three sanctioned input paths are a reader, a mode-0600 file,
+    /// and a TTY prompt owned by the calling surface.
+    ///
+    /// This used to iterate three hand-written names. Phase 3's F-8 found the
+    /// list had not been extended when `github/setup.rs` grew a passphrase
+    /// surface, and the remediation *added setup.rs to the list*. Phase 4 then
+    /// added `push/rekey.rs` — the file T-4-47 (critical) is about, and the one
+    /// that holds two live passwords — and the list was not extended again;
+    /// the audit proved it by putting `std::env::var("SYNC_PW")` in `rekey.rs`
+    /// and watching this test pass. A guard that enumerates what to check fails
+    /// open on everything written after it, so this one enumerates the
+    /// *exemptions* instead and scans everything else.
     #[test]
     fn no_password_input_path_reads_the_process_environment() {
-        // argv and the environment are readable by any local user through
-        // /proc, and environment values are inherited by children and captured
-        // in crash dumps. The three sanctioned input paths are a reader, a
-        // mode-0600 file, and a TTY prompt owned by the calling surface.
-        //
-        // Resolved from CARGO_MANIFEST_DIR so the gate is independent of the
-        // working directory and survives the AUR `srcdir` layout.
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        // `setup.rs` owns a passphrase surface as of plan 3-07 (`SetupPrompt::
-        // passphrase` and the generated-passphrase display) and was not added
-        // to this list then. It passes today; the list is what keeps it passing.
-        for name in [
-            "src/sync/passphrase.rs",
-            "src/sync/anchor.rs",
-            "src/sync/github/setup.rs",
-        ] {
-            let source = std::fs::read_to_string(root.join(name)).expect("module must exist");
-            // Prose may discuss the rule freely, and the test module below may
-            // name the needles; only shipped code is scanned.
-            let code = source.split("#[cfg(test)]").next().unwrap_or_default();
-            for line in code.lines() {
+        // The one exemption, and it is not a password path: `token::resolve`
+        // reads the GitHub *token* from the environment on purpose, which is a
+        // documented and deliberately different rule (a token is revocable; a
+        // sync password is not). Anything else added to this list needs the same
+        // kind of justification written next to it.
+        const EXEMPT: &str = "src/sync/github/token.rs";
+
+        let mut scanned = 0usize;
+        let mut skipped = 0usize;
+        for path in crate::sync::guard::rs_files_in("src/sync") {
+            if path.ends_with(std::path::Path::new(EXEMPT).file_name().unwrap())
+                && path.to_string_lossy().contains("github")
+            {
+                skipped += 1;
+                continue;
+            }
+            scanned += 1;
+            let source = std::fs::read_to_string(&path).expect("readable module");
+            // Prose may discuss the rule freely, and test modules may name the
+            // needles; only shipped code is scanned.
+            for line in crate::sync::guard::production_code(&source).lines() {
                 let trimmed = line.trim_start();
                 if trimmed.starts_with("//") {
                     continue;
@@ -449,11 +465,14 @@ mod tests {
                 for needle in ["std::env", "env::var", "var_os", "clap", "Arg::new"] {
                     assert!(
                         !trimmed.contains(needle),
-                        "{name} takes a password from {needle} — only a reader, a \
-                         mode-0600 file, and a TTY prompt are sanctioned input paths"
+                        "{} reads {needle} — only a reader, a mode-0600 file, and a \
+                         TTY prompt are sanctioned password input paths",
+                        path.display()
                     );
                 }
             }
         }
+        assert_eq!(skipped, 1, "the token reader is exempted exactly once");
+        assert!(scanned >= 20, "only {scanned} files walked under src/sync");
     }
 }

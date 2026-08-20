@@ -7,7 +7,7 @@
 //! a false hit would silently omit a changed file from the snapshot, which is
 //! the one failure this module exists to prevent.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -413,13 +413,6 @@ impl Index {
         found
     }
 
-    /// The subset of `ids` this index has a location for — the membership-only
-    /// view of [`Index::chunk_locations`], for a caller that only needs to know
-    /// whether a chunk has to be sealed again.
-    pub fn known_chunks(&self, ids: &[ChunkId]) -> HashSet<ChunkId> {
-        self.chunk_locations(ids).into_keys().collect()
-    }
-
     /// Drop every row naming one of `packs`, after those packs are actually gone
     /// from the remote, so the index never claims a chunk lives somewhere it
     /// does not.
@@ -601,6 +594,7 @@ fn create_private(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use tempfile::TempDir;
 
     fn entry(path: &Path, size: u64, mtime_ns: i128, inode: u64) -> FileEntry {
@@ -899,7 +893,6 @@ mod tests {
             1
         );
 
-        assert_eq!(index.known_chunks(&[cid(1), cid(2)]), [cid(1)].into());
         assert_eq!(
             index.chunk_locations(&[cid(1)]).get(&cid(1)),
             Some(&ChunkLocation {
@@ -947,10 +940,10 @@ mod tests {
             .collect();
         assert_eq!(index.record_chunks(&rows).unwrap(), 2_000);
 
-        let known = index.known_chunks(&many);
+        let known = index.chunk_locations(&many);
         assert_eq!(known.len(), 2_000);
-        assert!(known.contains(&many[1_999]));
-        assert!(!known.contains(&many[2_000]));
+        assert!(known.contains_key(&many[1_999]));
+        assert!(!known.contains_key(&many[2_000]));
     }
 
     #[test]
@@ -967,7 +960,10 @@ mod tests {
 
         assert_eq!(index.forget_chunks(&[cid(9)]).unwrap(), 2);
         assert_eq!(
-            index.known_chunks(&[cid(1), cid(2), cid(3)]),
+            index
+                .chunk_locations(&[cid(1), cid(2), cid(3)])
+                .into_keys()
+                .collect::<HashSet<_>>(),
             [cid(3)].into()
         );
     }
@@ -989,10 +985,9 @@ mod tests {
             index.record_chunks(&[(cid(1), cid(9), 0, 10, 8)]).unwrap();
             index.conn.execute(damage, []).unwrap();
             assert!(
-                index.known_chunks(&[cid(1)]).is_empty(),
+                index.chunk_locations(&[cid(1)]).is_empty(),
                 "{damage} must read as absent"
             );
-            assert!(index.chunk_locations(&[cid(1)]).is_empty(), "{damage}");
         }
     }
 
@@ -1012,7 +1007,7 @@ mod tests {
         assert!(index.was_rebuilt());
         // …and both halves work on the rebuilt file, rather than erroring.
         index.record_chunks(&[(cid(1), cid(9), 0, 10, 8)]).unwrap();
-        assert_eq!(index.known_chunks(&[cid(1)]), [cid(1)].into());
+        assert!(index.chunk_locations(&[cid(1)]).contains_key(&cid(1)));
     }
 
     #[test]
@@ -1021,7 +1016,6 @@ mod tests {
         let index = open(&dir);
         index.record_chunks(&[(cid(1), cid(9), 0, 10, 8)]).unwrap();
         index.conn.execute("DROP TABLE chunk", []).unwrap();
-        assert!(index.known_chunks(&[cid(1)]).is_empty());
         assert!(index.chunk_locations(&[cid(1)]).is_empty());
     }
 
@@ -1039,6 +1033,6 @@ mod tests {
         index.bump_generation().unwrap();
         index.bump_generation().unwrap();
         assert_eq!(index.evict_unseen(1).unwrap(), 1);
-        assert!(index.known_chunks(&[cid(1)]).is_empty());
+        assert!(index.chunk_locations(&[cid(1)]).is_empty());
     }
 }

@@ -131,6 +131,8 @@ Things worth knowing about the shape of a push:
 - **It uploads several assets, not one.** Your files are packed into large objects, and the bundle's own manifest and index travel in packs alongside them — so even a one-file bundle produces more than one. A separate small asset carries your wrapped master key; it is published after the second privacy check, not before, because it is the most sensitive object in the bundle.
 - **It is a handful of requests, not one per file.** A push of ~190 chunks costs 13 HTTP requests in total: nine fixed, plus one upload and one verifying download per pack. The very first push against a repository costs one more, because the release has to be created before anything can hang off it. The count tracks packs, never your data.
 - **`--dry-run` shows what a push would send** without sending it, and needs no network.
+- **It refuses a bundle that went backwards.** Each machine remembers the highest snapshot counter it has seen published in this repository. A remote offering a *lower* one is an older snapshot replayed to hide a newer one — the one kind of tampering that authenticates perfectly, because the old data really was written by your key. The push stops before anything is packed. If you know why the remote went back — you rebuilt the bundle from scratch, or restored an older one on purpose — `ai-usagebar sync push --allow-rollback` is the way through. `sync prune` and `sync rekey` refuse the same input and offer no override; neither is a command you reach for when you mean to move the bundle backwards.
+- **It refuses if another machine changed the password and this one has not caught up.** See below.
 
 ### Re-running an interrupted push
 
@@ -208,6 +210,14 @@ Not one pack byte moves. That is the point — a password change costs 48 rewrit
 Anyone holding a copy of the old keyfile can still open the bundle with the old password — **including data written after the change**, because the data keys never changed. Deleting the remote asset removes the copy this tool published; it cannot reach one somebody already took. Real revocation means a new master key and re-encrypting the entire bundle, which is exactly the whole-bundle re-upload this command exists to avoid. See `docs/sync-format.md` §9.
 
 If this bundle has never published a pointer, `sync rekey` changes the password locally and uploads nothing — there is no remote wrapper to replace yet. The next successful push publishes the new keyfile through the ordinary path.
+
+### After a rekey, catch up your other machines
+
+A rekey changes the password for the *bundle*, and the machine that ran it. Every other machine still holds the superseded keyfile on disk, and that file is exactly what the rekey destroyed remotely.
+
+So a push from a machine that missed the rekey **refuses**, before it sends a byte, and tells you so. It will not publish its own wrapper over the current one: doing that would put the old wrapper back on the remote, where the old password opens it again — and the password change would have been cosmetic.
+
+Nothing is wrong with that machine's data. A rekey rewraps the master key and re-encrypts nothing, so every byte it has already pushed is still readable under the new password. To catch it up, copy the keyfile from the machine where you changed the password — it sits next to `config.toml`, at `sync/keyfile.json` — onto the stale machine, replacing the local file. Then re-run the push.
 
 Check the status of your pairing with:
 

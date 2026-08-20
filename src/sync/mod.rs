@@ -208,6 +208,61 @@ impl SyncRoots {
     }
 }
 
+/// The one recursive source walk every structural guard in this module tree
+/// uses.
+///
+/// **It exists because two guards were blind and nobody could see it.** Phase
+/// 4's audit found `crypto.rs`'s crypto-import invariant walking `src/sync` with
+/// a non-recursive `read_dir`, leaving `push/` and `github/` — 11,500 lines —
+/// entirely outside the invariant whose stated value is "what lets a security
+/// auditor read one file instead of six"; and `passphrase.rs`'s
+/// environment-read guard iterating a **hand-maintained list** of three files
+/// that had not been extended to `push/rekey.rs`, the file its own critical
+/// threat is about. That second one was Phase 3's F-8 recurring verbatim, one
+/// phase later, because the remediation had added a file to the list rather than
+/// making the list unnecessary.
+///
+/// A guard that enumerates what to check fails open on everything added after
+/// it. A guard that walks fails *closed*: a new file is scanned by default and
+/// an exemption has to be written down.
+#[cfg(test)]
+pub(crate) mod guard {
+    use std::path::{Path, PathBuf};
+
+    /// Every `.rs` file under `dir`, recursively.
+    pub(crate) fn rs_files(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        walk(dir, &mut out);
+        out
+    }
+
+    /// Every `.rs` file under `CARGO_MANIFEST_DIR`-relative `rel`.
+    ///
+    /// Resolved from the manifest directory rather than from a relative path, so
+    /// a guard is independent of the working directory and survives the AUR
+    /// `srcdir` layout.
+    pub(crate) fn rs_files_in(rel: &str) -> Vec<PathBuf> {
+        rs_files(&Path::new(env!("CARGO_MANIFEST_DIR")).join(rel))
+    }
+
+    /// Everything before a file's own `#[cfg(test)]`. A test that names a needle
+    /// is a test, not a violation.
+    pub(crate) fn production_code(source: &str) -> &str {
+        source.split("#[cfg(test)]").next().unwrap_or_default()
+    }
+
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("a readable source directory") {
+            let path = entry.expect("a readable directory entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

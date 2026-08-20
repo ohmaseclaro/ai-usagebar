@@ -1286,20 +1286,21 @@ mod tests {
         assert_ne!(keys().chunk_id(public_bytes), keys().chunk_id(public_bytes));
     }
 
+    /// **Recursive.** It used to be a flat `read_dir` over `src/sync`, which
+    /// left `src/sync/push/` and `src/sync/github/` — 11,500 lines, the two
+    /// directories Phase 4 created — entirely invisible to the invariant whose
+    /// stated value is "what lets a security auditor read one file instead of
+    /// six". Phase 4's audit proved it by adding
+    /// `use chacha20poly1305::XChaCha20Poly1305;` to `push/packer.rs` and
+    /// watching this test pass. The walk is shared (`sync::guard`) so the next
+    /// directory is covered on the day it is created.
     #[test]
     fn only_the_crypto_module_imports_the_cryptographic_crates() {
-        // Resolved from CARGO_MANIFEST_DIR, not a relative path, so the test is
-        // independent of the working directory and survives the AUR `srcdir`
-        // layout. This invariant is what lets a security auditor read one file
-        // instead of six.
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sync");
         let mut checked = 0;
-        for entry in std::fs::read_dir(&dir).expect("src/sync must exist") {
-            let path = entry.expect("readable directory entry").path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
+        let mut skipped = 0;
+        for path in crate::sync::guard::rs_files_in("src/sync") {
             if path.file_name().and_then(|n| n.to_str()) == Some("crypto.rs") {
+                skipped += 1;
                 continue;
             }
             checked += 1;
@@ -1321,9 +1322,9 @@ mod tests {
                 }
             }
         }
-        assert!(
-            checked >= 6,
-            "expected mod.rs plus the five sibling modules"
-        );
+        // Non-vacuity: a guard asserting an absence must prove it looked, and
+        // the count is the flat walk's plus both subdirectories.
+        assert_eq!(skipped, 1, "crypto.rs must be excluded exactly once");
+        assert!(checked >= 20, "only {checked} files walked under src/sync");
     }
 }
