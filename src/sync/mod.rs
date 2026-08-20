@@ -127,6 +127,118 @@ pub fn check_version(found: u32, ceiling: u32, object: &str) -> Result<()> {
     )))
 }
 
+/// A fixed file or directory name that a security predicate compares an
+/// attacker-supplied name against — and that can **only** be compared the way
+/// the filesystem itself compares it.
+///
+/// # Why this is a type and not a `to_lowercase()` at each call site
+///
+/// macOS ships APFS case-insensitive by default (HFS+ was too) and Windows is
+/// case-insensitive everywhere, so `.Credentials.json` and `.credentials.json`
+/// are **one file**. A byte-exact `==` against a fixed name is therefore a hole
+/// a tampered bundle opens with one capital letter: the classifier answers "not
+/// a credential" while `symlink_metadata` at the very same path finds the live
+/// credential. Phase 5's audit defeated the credential gate (F-1) and D4's
+/// machine-bound exclusion list (F-2) with exactly that byte, and neither
+/// needed anything else.
+///
+/// Folding at each call site would be three patches and a fourth bug later —
+/// which is how the sibling defect in `guard::production_code` came back after
+/// being learned and fixed once already. So the fix is structural: a
+/// `FixedName` has no `PartialEq<str>`, no `Deref<Target = str>` and no
+/// accessor handing back a comparable `&str`, so `name == CREDENTIAL_FILE` and
+/// `EXCLUDED_NAMES.contains(&name)` **do not compile**. The only way to ask the
+/// question is [`FixedName::matches`], and it folds. A future byte-exact
+/// comparison against one of these names is a build failure, not a test
+/// failure, and not a shipped hole.
+///
+/// # Where it deliberately is not used
+///
+/// [`restore::layout`]'s root-prefix table is matched byte-exactly on purpose:
+/// a prefix that does not match is a *refusal*, so folding there would only
+/// admit more bundles, and the push side emits exactly one spelling.
+///
+/// # Ceiling
+///
+/// ponytail: this covers case folding, which is the defect. Windows'
+/// *other* name canonicalisations — trailing dots and spaces, 8.3 short names,
+/// `:` alternate data streams — are a separate class this does not close; the
+/// sync feature's users are macOS and Linux. If Windows ever becomes a restore
+/// target, that wants its own normalisation at [`restore::layout`]'s boundary,
+/// not more cases here.
+#[derive(Debug, Clone, Copy)]
+pub struct FixedName(&'static str);
+
+impl FixedName {
+    /// The name must be written in its own folded spelling — asserted by
+    /// [`FixedName::is_folded`] in each owning module's tests, because a
+    /// `const fn` cannot check it.
+    pub const fn new(name: &'static str) -> Self {
+        Self(name)
+    }
+
+    /// Does `candidate` name this file, as the filesystem would decide?
+    pub fn matches(self, candidate: &str) -> bool {
+        if candidate.is_ascii() {
+            candidate.eq_ignore_ascii_case(self.0)
+        } else {
+            fold(candidate) == self.0
+        }
+    }
+
+    /// Does `candidate` begin with this name?
+    pub fn is_prefix_of(self, candidate: &str) -> bool {
+        if candidate.is_ascii() {
+            // `candidate` is ASCII, so every byte index is a char boundary.
+            candidate.len() >= self.0.len()
+                && candidate[..self.0.len()].eq_ignore_ascii_case(self.0)
+        } else {
+            fold(candidate).starts_with(self.0)
+        }
+    }
+
+    /// Does `candidate` end with this name?
+    pub fn is_suffix_of(self, candidate: &str) -> bool {
+        if candidate.is_ascii() {
+            candidate.len() >= self.0.len()
+                && candidate[candidate.len() - self.0.len()..].eq_ignore_ascii_case(self.0)
+        } else {
+            fold(candidate).ends_with(self.0)
+        }
+    }
+
+    /// A name not written in its own folded spelling can never match anything.
+    /// The guard against a future `FixedName::new(".Stale")`.
+    pub fn is_folded(self) -> bool {
+        fold(self.0) == self.0
+    }
+}
+
+impl std::fmt::Display for FixedName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+/// Fold a name the way a case-insensitive filesystem folds it before comparing.
+///
+/// [`str::to_lowercase`] is full Unicode lowercasing, which already covers the
+/// one exotic character that matters here: U+212A KELVIN SIGN lowercases to
+/// `k`, and both `backups` and `.lock` contain one. U+017F LATIN SMALL LETTER
+/// LONG S is the only other code point that case-*folds* onto a single ASCII
+/// character while already being lowercase, so it is mapped explicitly.
+///
+/// ponytail: two characters hand-mapped rather than an ICU fold or a new
+/// dependency. Every [`FixedName`] in this crate is ASCII, and those are the
+/// only two non-ASCII code points whose fold is one ASCII character. A
+/// non-ASCII fixed name would want `unicase` instead.
+fn fold(name: &str) -> String {
+    name.chars()
+        .flat_map(char::to_lowercase)
+        .map(|c| if c == 'ſ' { 's' } else { c })
+        .collect()
+}
+
 /// Every filesystem root the collectors are allowed to look at.
 ///
 /// The same seam as [`crate::claude_desktop::Paths`]: [`SyncRoots::at`] is what
@@ -299,6 +411,43 @@ mod tests {
         assert!(check_version(1, 1, "keyfile").is_ok());
         let err = check_version(2, 1, "keyfile").expect_err("above the ceiling must be refused");
         assert!(err.to_string().contains("upgrade ai-usagebar"));
+    }
+
+    /// The whole point of the type: the spellings a case-insensitive volume
+    /// treats as one file compare as one name.
+    #[test]
+    fn a_fixed_name_matches_every_spelling_the_filesystem_folds_together() {
+        let credential = FixedName::new(".credentials.json");
+        for spelling in [
+            ".credentials.json",
+            ".Credentials.json",
+            ".CREDENTIALS.JSON",
+            ".cReDeNtIaLs.JsOn",
+            // U+017F LATIN SMALL LETTER LONG S, which folds onto `s`.
+            ".credential\u{17f}.json",
+        ] {
+            assert!(
+                credential.matches(spelling),
+                "{spelling:?} would have slipped past the credential gate"
+            );
+        }
+        assert!(!credential.matches(".credentials.jsonx"));
+        assert!(!credential.matches("credentials.json"));
+
+        // U+212A KELVIN SIGN, which lowercases to `k` — and `backups` has one.
+        let backups = FixedName::new("backups");
+        assert!(backups.matches("Bac\u{212a}ups"));
+        assert!(FixedName::new(".lock").is_suffix_of("index.LOC\u{212a}"));
+        assert!(FixedName::new(".tmp.").is_prefix_of(".TMP.credentials"));
+        assert!(!FixedName::new(".tmp.").is_prefix_of(".tmp"));
+    }
+
+    /// A name written in any other spelling can never match, so it is a dead
+    /// entry in a security list — caught here rather than in production.
+    #[test]
+    fn a_fixed_name_written_unfolded_is_reported_as_such() {
+        assert!(FixedName::new("bridge-state.json").is_folded());
+        assert!(!FixedName::new("Bridge-State.json").is_folded());
     }
 
     /// F-4: prose is not code, so a doc comment naming the marker must not
