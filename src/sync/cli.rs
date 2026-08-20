@@ -466,7 +466,15 @@ pub(crate) fn keyfile_path(roots: &SyncRoots) -> PathBuf {
     roots.config_dir.join("sync").join("keyfile.json")
 }
 
-/// Open the keyfile at `path` with a password read from stdin.
+/// Open the keyfile at `path` with a password read from stdin — **never
+/// prompting**, because the only caller is [`try_plan`].
+///
+/// `sync status` and `sync push --dry-run` want the third column *if* a
+/// password happens to be there and print the report without it if not
+/// (`DryRunReport::no_key`). Asking for one would turn a read-only command that
+/// answers instantly into a command that blocks a terminal, so `may_prompt` is
+/// `false` here and the old "must be piped in on stdin" refusal is what a
+/// terminal still gets.
 ///
 /// The password arrives on stdin only — never argv, never an environment
 /// variable (T-2-29) — is held in a `Zeroizing<String>`, and never reaches an
@@ -474,7 +482,7 @@ pub(crate) fn keyfile_path(roots: &SyncRoots) -> PathBuf {
 /// refusal. Neither the keyfile's bytes nor any derived key is formatted into
 /// the `String` this returns.
 fn keys_at(path: &Path) -> std::result::Result<Keys, String> {
-    local_keyfile(path).map(|k| k.keys)
+    local_keyfile(path, false).map(|k| k.keys)
 }
 
 /// Everything the push path needs out of the local keyfile, from one read.
@@ -490,7 +498,23 @@ pub(crate) struct LocalKeyfile {
     pub asset: String,
 }
 
-fn local_keyfile(path: &Path) -> std::result::Result<LocalKeyfile, String> {
+/// The refusal `keys_at`'s optional read still gets on a terminal.
+const NO_PROMPT_HERE: &str = "the sync password must be piped in on stdin; this command \
+                              does not ask for one";
+
+/// The local keyfile, opened with the sync password.
+///
+/// `may_prompt` is the difference between the two readers of this file. `sync
+/// push`, `sync prune` and `sync rekey` **need** the password, so on a terminal
+/// they ask for it through [`sync_password`] — the same read `sync pull` has
+/// used since Phase 5, and the behaviour `docs/sync-github.md` has documented
+/// for `ai-usagebar sync push` all along. [`keys_at`] passes `false`: it only
+/// *wants* the password, and a read-only report must not block on a question.
+///
+/// Nothing here reads the password from anywhere but the caller's stdin.
+fn local_keyfile(path: &Path, may_prompt: bool) -> std::result::Result<LocalKeyfile, String> {
+    // Before any password is wanted: a machine with no keyfile is told so
+    // rather than asked for a password it would then discard.
     let raw = std::fs::read_to_string(path).map_err(|_| {
         format!(
             "this bundle has no sync keyfile yet ({} is absent)\n\
@@ -502,20 +526,11 @@ fn local_keyfile(path: &Path) -> std::result::Result<LocalKeyfile, String> {
     let keyfile: Keyfile = serde_json::from_str(&raw)
         .map_err(|_| format!("{} is not a readable sync keyfile", path.display()))?;
 
-    if std::io::stdin().is_terminal() {
-        return Err(
-            "the sync password must be piped in on stdin; this build has no interactive \
-             prompt"
-                .into(),
-        );
+    let interactive = std::io::stdin().is_terminal();
+    if interactive && !may_prompt {
+        return Err(NO_PROMPT_HERE.into());
     }
-    let pw = passphrase::read_line(std::io::stdin().lock()).map_err(|e| e.to_string())?;
-    // Not merely a nicety: without this an unattended run with stdin on
-    // /dev/null would spend a gibibyte and a second and a half hashing the
-    // empty string before being told it was wrong.
-    if pw.is_empty() {
-        return Err("no sync password arrived on stdin".into());
-    }
+    let pw = sync_password(interactive)?;
     open_keyfile(keyfile, &pw)
 }
 
@@ -638,7 +653,7 @@ fn push(
     };
     parts.index = rehashing(parts.index, recovery.rehash);
     let parts = &parts;
-    match local_keyfile(&keyfile_path(roots)) {
+    match local_keyfile(&keyfile_path(roots), true) {
         Ok(keyfile) => push_with_parts(cfg, roots, parts, &keyfile, allow_rollback, now),
         Err(why) => refuse(&why),
     }
@@ -693,7 +708,7 @@ fn prune(
         Ok(parts) => parts,
         Err(why) => return refuse(&why),
     };
-    let keyfile = match local_keyfile(&keyfile_path(roots)) {
+    let keyfile = match local_keyfile(&keyfile_path(roots), true) {
         Ok(k) => k,
         Err(why) => return refuse(&why),
     };
@@ -802,26 +817,43 @@ struct PullIo<'a> {
     gate: Option<&'a mut dyn std::io::BufRead>,
 }
 
-/// The sync password for a restore.
+/// Announced before an interactive read, because the password is echoed.
+const ECHOED_PROMPT: &str = "The sync password for this bundle. It is echoed — this build \
+                             has no hidden-input dependency.";
+
+/// The message when the stream ended without one.
+const NO_PASSWORD: &str = "no sync password arrived on stdin";
+
+/// **The one place either arm of this command reads the sync password.**
 ///
-/// **The keyfile a pull opens comes off the remote, not off this disk.** A
-/// second machine has none — that is the whole point of a restore — so unlike
-/// [`local_keyfile`] there is no local file to read here, and [`keyfile_path`]
-/// is not consulted at all. Only the password that unwraps the *published*
-/// wrapper is needed, and it arrives the same way it always has: stdin only,
-/// never argv, never an environment variable (T-5-66).
+/// A pull opens a keyfile that comes off the remote, not off this disk — a
+/// second machine has none, which is the whole point of a restore — while a
+/// push opens the local one through [`local_keyfile`]. Different keyfiles, one
+/// password, and one read: they used to be two, and they had drifted. The pull
+/// arm asked on a terminal (Phase 5) and the push arm refused on one (Phase 2),
+/// so `ai-usagebar sync push` typed at a prompt — the invocation
+/// `docs/sync-github.md` documents — answered "this build has no interactive
+/// prompt" and could not be run by hand at all.
+///
+/// It arrives the same way it always has: stdin only, never argv, never an
+/// environment variable (T-2-29, T-5-66).
 fn sync_password(interactive: bool) -> std::result::Result<zeroize::Zeroizing<String>, String> {
     if interactive {
-        eprintln!(
-            "The sync password for this bundle. It is echoed — this build has no \
-             hidden-input dependency."
-        );
+        eprintln!("{ECHOED_PROMPT}");
     }
-    let pw = passphrase::read_line(std::io::stdin().lock()).map_err(|e| e.to_string())?;
+    sync_password_from(std::io::stdin().lock())
+}
+
+/// [`sync_password`] over an injected reader — the tested half, so neither arm
+/// needs a terminal or the process's real stdin to be covered.
+fn sync_password_from(
+    r: impl std::io::BufRead,
+) -> std::result::Result<zeroize::Zeroizing<String>, String> {
+    let pw = passphrase::read_line(r).map_err(|e| e.to_string())?;
     // Without this an unattended run with stdin on /dev/null would spend a
     // gibibyte and a second and a half hashing the empty string first.
     if pw.is_empty() {
-        return Err("no sync password arrived on stdin".into());
+        return Err(NO_PASSWORD.into());
     }
     Ok(pw)
 }
@@ -2372,6 +2404,75 @@ mod tests {
             ),
             "the printed command must be the applying pull, not something else"
         );
+    }
+
+    /// The one read both arms share, driven over an injected reader so neither
+    /// a terminal nor the process's real stdin is involved.
+    ///
+    /// The empty case is the one that matters: without it an unattended run
+    /// with stdin on `/dev/null` spends a gibibyte and a second and a half
+    /// hashing the empty string before being told it was wrong.
+    #[test]
+    fn the_sync_password_is_one_line_off_the_reader_and_an_empty_stream_is_refused() {
+        assert_eq!(
+            *sync_password_from(&b"correct horse battery\n"[..]).unwrap(),
+            "correct horse battery"
+        );
+        // Only the first line. The second belongs to whichever gate reads next.
+        assert_eq!(
+            *sync_password_from(&b"first\nsecond\n"[..]).unwrap(),
+            "first"
+        );
+
+        for empty in [&b""[..], &b"\n"[..]] {
+            let err = sync_password_from(empty).expect_err("an empty stream is not a password");
+            assert_eq!(err, NO_PASSWORD);
+        }
+
+        // No refusal on this path echoes what it read.
+        let secret = "a-password-that-must-not-travel";
+        let err = sync_password_from(format!("{secret}\n").as_bytes())
+            .map(|_| String::new())
+            .unwrap_or_else(|e| e);
+        assert!(!err.contains(secret));
+    }
+
+    /// **Every refusal that does not need a password comes first.** A machine
+    /// with no keyfile is told so rather than asked for a password it would
+    /// then discard — which is also why this test cannot hang: neither arm
+    /// reaches a read.
+    #[test]
+    fn a_missing_or_unreadable_keyfile_is_refused_before_any_password_is_wanted() {
+        let dir = TempDir::new().unwrap();
+        let absent = dir.path().join("keyfile.json");
+        for may_prompt in [true, false] {
+            // `.err()` rather than `expect_err`: `LocalKeyfile` holds live keys and
+            // must never gain a `Debug` a panic message could print.
+            let err = local_keyfile(&absent, may_prompt)
+                .err()
+                .expect("no keyfile, no open");
+            assert!(err.contains("has no sync keyfile yet"), "{err}");
+        }
+
+        let junk = dir.path().join("junk.json");
+        std::fs::write(&junk, b"not json at all").unwrap();
+        for may_prompt in [true, false] {
+            let err = local_keyfile(&junk, may_prompt)
+                .err()
+                .expect("junk is not a keyfile");
+            assert!(err.contains("not a readable sync keyfile"), "{err}");
+        }
+    }
+
+    /// `sync status` and `sync push --dry-run` want the third column and do not
+    /// need it, so they must never block a terminal on a question. The refusal
+    /// they keep is deliberately *not* the one a push gets.
+    #[test]
+    fn the_read_only_report_says_it_does_not_ask_rather_than_asking() {
+        assert!(NO_PROMPT_HERE.contains("does not ask"));
+        assert!(!NO_PROMPT_HERE.contains("no interactive prompt"));
+        // The push/prune/rekey arm announces the echo instead of refusing.
+        assert!(ECHOED_PROMPT.contains("echoed"));
     }
 
     /// `--apply` and `--dry-run` together are an error, never a guess.
