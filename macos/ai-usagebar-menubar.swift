@@ -1030,6 +1030,123 @@ func accountsSummaryLine(_ s: AccountStatus) -> String {
     return parts.joined(separator: "   ·   ")
 }
 
+// ─── Sync state (6-01) ────────────────────────────────────────────────────
+//
+// D-01: this side parses and displays, nothing more. The crypto, the transport
+// and the index all live in Rust, and the only thing reached from here is
+// `ai-usagebar sync status --json` — a read that uploads nothing, writes
+// nothing, and (unlike the human rendering) builds no plan, so it never wants
+// a password on a stdin a subprocess cannot answer.
+//
+// There is deliberately no action on this row. `sync push` and `sync pull`
+// carry confirmations this surface cannot ask for, so they stay in 6-02 behind
+// their own flow; a row that can be clicked before that exists is a row that
+// can push by accident.
+
+struct SyncCategoryLine: Equatable {
+    var category: String
+    var enabled: Bool
+    var files: Int
+    var bytes: Int
+}
+
+struct SyncStatus: Equatable {
+    var lastSync: Date?
+    /// Three states, exactly as the binary reports them: pending, not pending,
+    /// and **unknown** — the local index would not open. Flattening nil into
+    /// false would draw a stale backup as an up-to-date one, which is the one
+    /// thing surfacing sync state exists to prevent (D-04).
+    var pending: Bool?
+    var pendingFiles: Int?
+    var pendingBytes: Int?
+    /// The frozen contract, parsed so 6-02 does not have to re-derive it when
+    /// it attaches the push/pull actions. Nothing on this surface renders them
+    /// yet, and nothing here reaches an NSMenuItem.
+    var categories: [SyncCategoryLine] = []
+    var warnings: [String] = []
+}
+
+/// `chrono`'s `to_rfc3339` emits up to nanosecond precision, which
+/// `ISO8601DateFormatter`'s fractional-seconds mode does not accept. A row that
+/// reads "há 2 h" has no use for the fraction, so it is dropped and the rest
+/// parsed with one formatter rather than guessed at with two.
+private let ISO_SYNC: ISO8601DateFormatter = {
+    let f = ISO8601DateFormatter()
+    f.formatOptions = [.withInternetDateTime]
+    return f
+}()
+
+private let RELATIVE_SYNC: RelativeDateTimeFormatter = {
+    let f = RelativeDateTimeFormatter()
+    f.unitsStyle = .abbreviated
+    return f
+}()
+
+private let BYTES_SYNC: ByteCountFormatter = {
+    let f = ByteCountFormatter()
+    f.countStyle = .binary
+    f.allowedUnits = [.useKB, .useMB, .useGB]
+    return f
+}()
+
+/// "3 pendentes (99 MB)" when the binary said how much is waiting, plain
+/// "pendente" when it only said that something is. How much is not backed up
+/// is the half of D-04 a bare marker leaves out.
+private func pendingLabel(_ s: SyncStatus) -> String {
+    guard let files = s.pendingFiles, files > 0 else { return "pendente" }
+    let noun = files == 1 ? "pendente" : "pendentes"
+    guard let bytes = s.pendingBytes, bytes > 0 else { return "\(files) \(noun)" }
+    return "\(files) \(noun) (\(BYTES_SYNC.string(fromByteCount: Int64(bytes))))"
+}
+
+func parseSyncDate(_ s: String) -> Date? {
+    ISO_SYNC.date(from: s.replacingOccurrences(of: #"\.\d+"#, with: "",
+                                               options: .regularExpression))
+}
+
+/// Parse `sync status --json`, built exactly like `parseAccountStatus`: every
+/// field read through an optional cast with a default, a non-object rejected.
+/// An older binary that does not know `--json` prints an error and nothing
+/// usable, and that must hide the row rather than break the menu.
+func parseSyncStatus(_ data: Data) -> SyncStatus? {
+    guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        return nil
+    }
+    let categories = (root["categories"] as? [[String: Any]] ?? [])
+        .compactMap { row -> SyncCategoryLine? in
+            guard let category = row["category"] as? String else { return nil }
+            return SyncCategoryLine(category: category,
+                                    enabled: row["enabled"] as? Bool ?? false,
+                                    files: row["files"] as? Int ?? 0,
+                                    bytes: row["bytes"] as? Int ?? 0)
+        }
+    // An unknown key is ignored rather than rejected, which is what lets a
+    // later phase add one without breaking a menu bar already shipped.
+    return SyncStatus(lastSync: (root["last_sync"] as? String).flatMap(parseSyncDate),
+                      pending: root["pending"] as? Bool,
+                      pendingFiles: root["pending_files"] as? Int,
+                      pendingBytes: root["pending_bytes"] as? Int,
+                      categories: categories,
+                      warnings: root["warnings"] as? [String] ?? [])
+}
+
+/// The one dim row: when sync last ran, and whether anything local is not in it
+/// yet. Pure, and "" for a nil status so the caller can hide the row entirely
+/// rather than show a bare label.
+func syncSummaryLine(_ status: SyncStatus?, now: Date = Date()) -> String {
+    guard let s = status else { return "" }
+    let when = s.lastSync.map { RELATIVE_SYNC.localizedString(for: $0, relativeTo: now) }
+    var parts = ["Sync: " + (when ?? "nunca")]
+    switch s.pending {
+    case .some(true): parts.append(pendingLabel(s))
+    case .some(false): break
+    // Unknown is not "up to date". The binary says why in `warnings`; that text
+    // arrives from a subprocess, so it is stripped before display.
+    case .none: parts.append(stripMarkup(s.warnings.first ?? "estado desconhecido"))
+    }
+    return parts.joined(separator: "   ·   ")
+}
+
 /// `-y` because the menu has already asked; without it the binary would prompt
 /// on a stdin that is not a terminal and abort.
 func switchArgs(label: String, desktop: Bool, deleting: [String] = []) -> [String] {
@@ -1600,6 +1717,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var lastAccountStatus: AccountStatus?
     var accountStatusFetchedAt = Date.distantPast
     var accountStatusGeneration = 0
+    /// When sync last ran and whether anything local is not backed up yet. One
+    /// dim row, disabled and hidden until `sync status --json` answers, so a
+    /// binary that predates the flag shows exactly the menu it always did.
+    let syncInfoItem = NSMenuItem()
+    var lastSyncStatus: SyncStatus?
+    var syncStatusFetchedAt = Date.distantPast
+    var syncStatusGeneration = 0
     /// A switch runs a subprocess that quits and reopens another app; both
     /// submenus grey out until it returns so it cannot be fired twice.
     var accountSwitchInFlight = false
@@ -1886,6 +2010,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         accountsInfoItem.isEnabled = false
         accountsInfoItem.isHidden = true
         menu.addItem(accountsInfoItem)
+        // Sync state, one line lower. Disabled and actionless on purpose: the
+        // push/pull triggers are 6-02's, behind the confirmation this surface
+        // cannot ask for.
+        syncInfoItem.isEnabled = false
+        syncInfoItem.isHidden = true
+        menu.addItem(syncInfoItem)
         // One hidden slot per built-in vendor for Overview mode. Named accounts
         // can take the total higher; renderOverview grows the pool on demand.
         for _ in 0..<VENDOR_AUTH.count {
@@ -1928,6 +2058,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuWillOpen(_ menu: NSMenu) {
         if Date().timeIntervalSince(accountStatusFetchedAt) >= 5 { fetchAccountStatus() }
+        if Date().timeIntervalSince(syncStatusFetchedAt) >= 5 { fetchSyncStatus() }
     }
 
     func addAction(_ menu: NSMenu, _ title: String, _ sel: Selector, _ key: String) {
@@ -2522,6 +2653,59 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 me.applyAccountStatus(status)
             }
         }
+    }
+
+    /// Ask the binary about sync. The same shape as `fetchAccountStatus` — a
+    /// generation counter, `.utility`, the `REFRESH_TIMEOUT` watchdog, the pipe
+    /// read before `waitUntilExit`, and a main-thread hop guarded by the
+    /// generation so a slow reply cannot overwrite a newer one (T-6-04).
+    ///
+    /// stdin is /dev/null: `sync status --json` never reads it, and pinning
+    /// that here means a future build that did could not hang the menu (D-02).
+    func fetchSyncStatus() {
+        guard let bin = resolveBinary("ai-usagebar") else { return }
+        syncStatusFetchedAt = Date()
+        syncStatusGeneration += 1
+        let generation = syncStatusGeneration
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: bin)
+            p.arguments = ["sync", "status", "--json"]
+            let pipe = Pipe()
+            p.standardOutput = pipe
+            p.standardError = FileHandle.nullDevice
+            p.standardInput = FileHandle.nullDevice
+
+            let watchdog = DispatchWorkItem { if p.isRunning { p.terminate() } }
+            DispatchQueue.global(qos: .utility)
+                .asyncAfter(deadline: .now() + REFRESH_TIMEOUT, execute: watchdog)
+            var data = Data()
+            do {
+                try p.run()
+                data = pipe.fileHandleForReading.readDataToEndOfFile()  // read before wait
+                p.waitUntilExit()
+            } catch {
+                watchdog.cancel()
+                return
+            }
+            watchdog.cancel()
+            // A non-zero exit or an unparseable body leaves the previous value
+            // alone, exactly as the account fetch does.
+            guard p.terminationStatus == 0, let status = parseSyncStatus(data) else { return }
+            DispatchQueue.main.async {
+                guard let me = self, generation == me.syncStatusGeneration else { return }
+                me.lastSyncStatus = status
+                me.renderSyncRow()
+            }
+        }
+    }
+
+    /// Nil means the binary predates `--json`: leave the menu exactly as it was
+    /// before this row existed.
+    func renderSyncRow() {
+        let line = syncSummaryLine(lastSyncStatus)
+        syncInfoItem.isHidden = line.isEmpty
+        syncInfoItem.attributedTitle = run(line, .secondaryLabelColor)
     }
 
     func applyAccountStatus(_ status: AccountStatus) {

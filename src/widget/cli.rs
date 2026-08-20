@@ -168,7 +168,14 @@ pub enum Command {
 pub enum SyncAction {
     /// What sync would carry: per-category file counts and raw bytes, plus
     /// when it last ran. Reads only — nothing is uploaded or written.
-    Status,
+    Status {
+        /// Machine-readable output, consumed by the macOS menu bar.
+        ///
+        /// Answers from the stat sweep alone: it builds no plan and contacts no
+        /// network, so it never wants a password and never blocks on one.
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Pair this machine with the private GitHub repository named in
     /// `[sync] repo`.
@@ -572,7 +579,16 @@ mod tests {
         assert!(matches!(
             status.command,
             Some(Command::Sync {
-                action: SyncAction::Status
+                action: SyncAction::Status { json: false }
+            })
+        ));
+
+        // 6-01: opt-in, and only on this variant — the macOS menu bar's read.
+        let machine = Cli::parse_from(["ai-usagebar", "sync", "status", "--json"]);
+        assert!(matches!(
+            machine.command,
+            Some(Command::Sync {
+                action: SyncAction::Status { json: true }
             })
         ));
 

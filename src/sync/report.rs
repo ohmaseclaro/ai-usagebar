@@ -22,6 +22,30 @@ use crate::sync::plan::{CategoryPlan, SyncPlan};
 use crate::sync::scope;
 use crate::sync::{SyncRoots, scope::CategoryScan};
 
+/// The one thing `sync status` can say about the index that is not a count.
+///
+/// A fixed vocabulary rather than free text, and deliberately carries no `{}`:
+/// [`StatusReport::warnings`] is serialized into a machine-readable document
+/// that promises to carry counts, labels and paths only, and a format string
+/// with a caller-supplied hole in it is how a file's bytes would reach it
+/// (T-6-01). A new warning is a new constant, added to [`WARNINGS`] too.
+pub const WARN_INDEX_UNAVAILABLE: &str =
+    "the local index is unavailable, so last-sync and pending changes are unknown";
+
+/// Every string that may appear in [`StatusReport::warnings`].
+pub const WARNINGS: [&str; 1] = [WARN_INDEX_UNAVAILABLE];
+
+/// What a push would have to look at, counted without opening anything.
+///
+/// Files the local index does not vouch for, and the local bytes attributable
+/// to them. Not a promise about what would go on the wire — that is the
+/// dry-run's third column, and it costs a key and a read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PendingSummary {
+    pub files: usize,
+    pub bytes: u64,
+}
+
 /// One category's row in `sync status`.
 #[derive(Debug, Clone)]
 pub struct CategoryLine {
@@ -88,6 +112,16 @@ pub struct StatusReport {
     /// The repository half. `None` only for `push --dry-run`, which contacts no
     /// network at all.
     pub repo: Option<RepoSection>,
+    /// What is not backed up yet. `None` means the index was not available,
+    /// which is a **third** state and must never be flattened into "nothing
+    /// pending" — a backup nobody can tell is stale is what D-04 exists to
+    /// prevent.
+    pub pending: Option<PendingSummary>,
+    /// Drawn from [`WARNINGS`]. Only the JSON rendering reads it; the text
+    /// rendering has already said the same thing on stderr, and a consumer that
+    /// never saw it would draw "last sync: never" for a machine that syncs
+    /// hourly.
+    pub warnings: Vec<String>,
 }
 
 impl StatusReport {
@@ -146,12 +180,26 @@ pub fn build_status(
     plan: Option<SyncPlan>,
     repo: Option<RepoSection>,
 ) -> StatusReport {
-    let lines = match &plan {
-        Some(p) => p.categories.iter().map(|c| line_of(c, cfg)).collect(),
-        None => SyncCategory::ALL
-            .iter()
-            .map(|&category| line(scope::collect(category, roots, cfg, now), cfg))
-            .collect(),
+    // `pending` is `None` whenever the index is, in both arms: without one
+    // there is nothing to compare against, and a confident zero would be a lie.
+    let (lines, pending) = match &plan {
+        Some(p) => (
+            p.categories.iter().map(|c| line_of(c, cfg)).collect(),
+            index.map(|_| pending_of_plan(p)),
+        ),
+        None => {
+            // Collected once and reused: a second walk of the same tree costs
+            // as much as the first and could disagree with it.
+            let scans: Vec<CategoryScan> = SyncCategory::ALL
+                .iter()
+                .map(|&category| scope::collect(category, roots, cfg, now))
+                .collect();
+            let pending = index.map(|i| pending_of_scans(&scans, i));
+            (
+                scans.into_iter().map(|scan| line(scan, cfg)).collect(),
+                pending,
+            )
+        }
     };
     StatusReport {
         lines,
@@ -161,7 +209,86 @@ pub fn build_status(
         index_path: index.map(|i| i.path().to_path_buf()).unwrap_or_default(),
         plan,
         repo,
+        pending,
+        // The index is the only thing this builder can fail to have, so it is
+        // the only warning it can raise — and raising it here rather than at
+        // each call site is what keeps `pending: None` and the explanation for
+        // it from ever disagreeing.
+        warnings: match index {
+            Some(_) => Vec::new(),
+            None => vec![WARN_INDEX_UNAVAILABLE.to_string()],
+        },
     }
+}
+
+/// **Never opens a file body.** `sync status` is advertised as costing a stat
+/// sweep, and a status call that hashed a 50 MB transcript to draw a menu row
+/// would break that promise silently — so this asks the same metadata-only
+/// question the planner's short-circuit asks, and nothing more.
+fn pending_of_scans(scans: &[CategoryScan], index: &Index) -> PendingSummary {
+    let mut summary = PendingSummary::default();
+    for entry in scans.iter().flat_map(|scan| &scan.files) {
+        if index.lookup(entry).is_none() {
+            summary.files += 1;
+            summary.bytes += entry.size;
+        }
+    }
+    summary
+}
+
+/// The same count, read off a plan the caller already built rather than by
+/// re-asking the index: [`FilePlan::reused`](crate::sync::plan::FilePlan)
+/// records that exact short-circuit hitting.
+fn pending_of_plan(plan: &SyncPlan) -> PendingSummary {
+    plan.file_plans.iter().filter(|f| !f.reused).fold(
+        PendingSummary::default(),
+        |mut summary, f| {
+            summary.files += 1;
+            summary.bytes += f.new_bytes;
+            summary
+        },
+    )
+}
+
+/// The machine-readable rendering — the macOS menu bar's whole read of sync.
+///
+/// Pure, and derived from the same [`StatusReport`] [`render_status`] draws, so
+/// the two cannot disagree. **Every key is present on every run**, so a
+/// consumer never has to tell "absent" from "null", and the object stays open:
+/// a reader that ignores unknown keys is what lets a later phase add one.
+///
+/// Carries counts, byte totals, category labels, the index path, and warnings
+/// from [`WARNINGS`]. There is no key here that could hold a file's contents,
+/// which is a cheaper guarantee than remembering not to add one (T-6-01).
+pub fn status_json(report: &StatusReport) -> serde_json::Value {
+    let categories: Vec<serde_json::Value> = report
+        .lines
+        .iter()
+        .map(|l| {
+            serde_json::json!({
+                "category": l.category.label(),
+                "enabled": l.enabled,
+                "files": l.files,
+                "bytes": l.bytes,
+                "capped": l.capped,
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        // Null, never the string "never": the wording belongs to whoever draws
+        // the row, and this document is read by more than one surface.
+        "last_sync": report.last_sync.map(|t| t.to_rfc3339()),
+        "pending": report.pending.map(|p| p.files > 0),
+        "pending_files": report.pending.map(|p| p.files),
+        "pending_bytes": report.pending.map(|p| p.bytes),
+        "categories": categories,
+        "total_files": report.total_files(),
+        "total_bytes": report.total_bytes(),
+        "index": (!report.index_path.as_os_str().is_empty())
+            .then(|| report.index_path.display().to_string()),
+        "warnings": report.warnings,
+    })
 }
 
 fn line(scan: CategoryScan, cfg: &SyncConfig) -> CategoryLine {
@@ -523,6 +650,8 @@ mod tests {
             index_path: PathBuf::from("/nowhere/index.sqlite3"),
             plan,
             repo: None,
+            pending: None,
+            warnings: Vec::new(),
         }
     }
 
@@ -839,5 +968,240 @@ mod tests {
         assert_eq!(human_bytes(1024), "1.0 KiB");
         assert_eq!(human_bytes(4 * 1024 * 1024), "4.0 MiB");
         assert_eq!(human_bytes(2 * 1024 * 1024 * 1024), "2.0 GiB");
+    }
+
+    // ---- 6-01: the machine-readable rendering ----------------------------
+
+    /// Never the wall clock. `now` is only the transcripts bounds' reference
+    /// point, and a test that reads the clock is a test that can fail on a date
+    /// nobody chose.
+    fn fixed_now() -> DateTime<Utc> {
+        DateTime::from_timestamp(1_760_000_000, 0).unwrap()
+    }
+
+    /// Microseconds, not a gibibyte: the AUR `check()` runs this.
+    fn cheap_keys() -> crate::sync::crypto::Keys {
+        use crate::sync::crypto::{KdfParams, Keyfile};
+        let cheap = KdfParams {
+            m_kib: 8,
+            t: 1,
+            p: 1,
+        };
+        Keyfile::create_with_floor(b"a-test-passphrase", cheap, cheap.m_kib)
+            .unwrap()
+            .1
+    }
+
+    fn walk_strings(v: &serde_json::Value, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::String(s) => out.push(s.clone()),
+            serde_json::Value::Array(a) => a.iter().for_each(|x| walk_strings(x, out)),
+            serde_json::Value::Object(o) => o.values().for_each(|x| walk_strings(x, out)),
+            _ => {}
+        }
+    }
+
+    /// The key set 6-02 parses. Named once, here, because renaming one of these
+    /// after a menu bar has shipped against it is a compatibility break.
+    #[test]
+    fn status_json_carries_the_last_sync_the_pending_summary_and_one_line_per_category() {
+        let mut report = report_of(vec![a_line(SyncCategory::Config, 3, 2048)], None);
+        report.pending = Some(PendingSummary {
+            files: 3,
+            bytes: 4096,
+        });
+
+        let v = status_json(&report);
+        assert_eq!(v["last_sync"], "2026-08-19T12:00:00+00:00");
+        assert_eq!(v["index"], "/nowhere/index.sqlite3");
+        assert_eq!(v["total_files"], 3);
+        assert_eq!(v["total_bytes"], 2048);
+        assert_eq!(v["pending"], true);
+        assert_eq!(v["pending_files"], 3);
+        assert_eq!(v["pending_bytes"], 4096);
+        assert_eq!(v["warnings"], serde_json::json!([]));
+
+        let cats = v["categories"].as_array().unwrap();
+        assert_eq!(cats.len(), 1);
+        assert_eq!(cats[0]["category"], "config");
+        assert_eq!(cats[0]["enabled"], true);
+        assert_eq!(cats[0]["files"], 3);
+        assert_eq!(cats[0]["bytes"], 2048);
+        assert_eq!(cats[0]["capped"], false);
+    }
+
+    /// Every key on every run, so a consumer never has to tell "absent" from
+    /// "null" — and `last_sync` is JSON `null`, never the string "never": the
+    /// wording belongs to whoever draws the row.
+    #[test]
+    fn every_key_is_present_even_when_its_value_is_null() {
+        let mut report = report_of(Vec::new(), None);
+        report.last_sync = None;
+        report.index_path = PathBuf::new();
+
+        let v = status_json(&report);
+        for key in [
+            "last_sync",
+            "pending",
+            "pending_files",
+            "pending_bytes",
+            "categories",
+            "total_files",
+            "total_bytes",
+            "index",
+            "warnings",
+        ] {
+            assert!(v.get(key).is_some(), "missing {key}: {v}");
+        }
+        assert_eq!(v["last_sync"], serde_json::Value::Null);
+        assert_eq!(v["index"], serde_json::Value::Null);
+    }
+
+    /// An index that would not open is a warning the JSON consumer must see:
+    /// without it a machine that syncs hourly renders as "never synced".
+    #[test]
+    fn an_unavailable_index_yields_a_null_index_and_says_so_in_warnings() {
+        let dir = TempDir::new().unwrap();
+        let report = build_status(
+            &roots_at(&dir),
+            &SyncConfig::default(),
+            None,
+            fixed_now(),
+            None,
+            None,
+        );
+
+        let v = status_json(&report);
+        assert_eq!(v["index"], serde_json::Value::Null);
+        assert_eq!(v["last_sync"], serde_json::Value::Null);
+        assert_eq!(v["pending"], serde_json::Value::Null);
+        assert_eq!(v["warnings"], serde_json::json!([WARN_INDEX_UNAVAILABLE]));
+    }
+
+    #[test]
+    fn status_json_is_a_pure_function_of_the_report() {
+        let report = report_of(vec![a_line(SyncCategory::Config, 1, 10)], None);
+        assert_eq!(status_json(&report), status_json(&report));
+    }
+
+    /// D-04's three states. "Unknown" is not "nothing pending": a backup nobody
+    /// can tell is stale is exactly what surfacing this exists to prevent.
+    #[test]
+    fn pending_is_true_false_or_unknown_and_never_flattens_the_third() {
+        let mut report = report_of(vec![a_line(SyncCategory::Config, 3, 4096)], None);
+
+        report.pending = Some(PendingSummary {
+            files: 3,
+            bytes: 4096,
+        });
+        assert_eq!(status_json(&report)["pending"], true);
+
+        report.pending = Some(PendingSummary::default());
+        let v = status_json(&report);
+        assert_eq!(v["pending"], false);
+        assert_eq!(v["pending_files"], 0);
+        assert_eq!(v["pending_bytes"], 0);
+
+        report.pending = None;
+        let v = status_json(&report);
+        assert_eq!(v["pending"], serde_json::Value::Null);
+        assert_eq!(v["pending_files"], serde_json::Value::Null);
+        assert_eq!(v["pending_bytes"], serde_json::Value::Null);
+    }
+
+    /// T-6-01. This document promises counts, byte totals, category labels, an
+    /// index path and a fixed warning vocabulary — nothing else. Walk it and
+    /// fail on any other string, so a future field that carries a file's
+    /// contents has to break this test before it can ship.
+    #[test]
+    fn every_string_in_the_document_is_a_label_a_path_a_timestamp_or_a_known_warning() {
+        let dir = TempDir::new().unwrap();
+        seed(dir.path(), "config.toml", "a-secret-that-must-not-travel");
+        seed(dir.path(), "accounts/work/.credentials.json", "{}");
+        let index = Index::at(&dir.path().join("index.sqlite3")).unwrap();
+        let report = build_status(
+            &roots_at(&dir),
+            &SyncConfig::default(),
+            Some(&index),
+            fixed_now(),
+            None,
+            None,
+        );
+
+        let document = status_json(&report);
+        let rendered = document.to_string();
+        assert!(
+            !rendered.contains("a-secret-that-must-not-travel"),
+            "{rendered}"
+        );
+
+        let mut leaves = Vec::new();
+        walk_strings(&document, &mut leaves);
+        assert!(!leaves.is_empty(), "nothing was walked: {document}");
+        for leaf in leaves {
+            let known = SyncCategory::ALL.iter().any(|c| c.label() == leaf)
+                || WARNINGS.contains(&leaf.as_str())
+                || DateTime::parse_from_rfc3339(&leaf).is_ok()
+                || Path::new(&leaf).is_absolute();
+            assert!(known, "unexpected string in the JSON: {leaf:?}");
+        }
+    }
+
+    /// Where the first two pending states come from: the index either vouches
+    /// for a file or it does not.
+    #[test]
+    fn pending_counts_the_files_the_index_does_not_vouch_for() {
+        let dir = TempDir::new().unwrap();
+        seed(dir.path(), "config.toml", "[sync]\n");
+        seed(dir.path(), "accounts/work/.credentials.json", "{}");
+        let roots = roots_at(&dir);
+        let cfg = SyncConfig::default();
+        let index = Index::at(&dir.path().join("index.sqlite3")).unwrap();
+
+        let before = build_status(&roots, &cfg, Some(&index), fixed_now(), None, None);
+        let p = before
+            .pending
+            .expect("an opened index is never the unknown state");
+        assert_eq!((p.files, p.bytes), (2, 9));
+
+        // Record them exactly as the planner does; then nothing is pending —
+        // via the scan, and via a plan whose files were all short-circuited.
+        let keys = cheap_keys();
+        plan::build_with_keys(&roots, &cfg, &index, fixed_now(), &keys).unwrap();
+        let after = build_status(&roots, &cfg, Some(&index), fixed_now(), None, None);
+        assert_eq!(after.pending, Some(PendingSummary::default()));
+
+        let reused = plan::build_with_keys(&roots, &cfg, &index, fixed_now(), &keys).unwrap();
+        assert_eq!(reused.files_opened, 0);
+        let with_plan = build_status(&roots, &cfg, Some(&index), fixed_now(), Some(reused), None);
+        assert_eq!(with_plan.pending, Some(PendingSummary::default()));
+    }
+
+    /// `sync status` is advertised as costing a stat sweep. A file whose body
+    /// cannot be read at all is still counted, because nothing on this path
+    /// opens one — a status call that hashed a 50 MB transcript to draw a menu
+    /// row would break that promise silently.
+    #[cfg(unix)]
+    #[test]
+    fn the_pending_count_never_opens_a_file_body() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        seed(dir.path(), "config.toml", "[sync]\n");
+        let unreadable = dir.path().join("config.toml");
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let index = Index::at(&dir.path().join("index.sqlite3")).unwrap();
+        let report = build_status(
+            &roots_at(&dir),
+            &SyncConfig::default(),
+            Some(&index),
+            fixed_now(),
+            None,
+            None,
+        );
+        assert_eq!(report.pending.map(|p| p.files), Some(1));
+
+        // …and give it back a mode the TempDir can clean up.
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o600)).unwrap();
     }
 }
