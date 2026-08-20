@@ -201,6 +201,21 @@ pub enum SyncAction {
         /// restored an older one.
         #[arg(long)]
         allow_rollback: bool,
+
+        /// Throw away the local change-detection index and start it empty.
+        ///
+        /// The index is a cache under `~/.cache`, never part of the bundle.
+        /// Discarding it costs one slow sync and changes nothing about what is
+        /// uploaded.
+        #[arg(long)]
+        rebuild_index: bool,
+
+        /// Ignore every cached hash for this run: open and re-read every file.
+        ///
+        /// Suppresses cache *reads* and deletes nothing — the rows are rewritten
+        /// with what this run actually found, so the next run is fast again.
+        #[arg(long)]
+        force_rehash: bool,
     },
 
     /// Delete remote data no kept snapshot still references.
@@ -219,6 +234,66 @@ pub enum SyncAction {
     /// with the old password, forever. It stops future readers of the
     /// repository, not past ones.
     Rekey,
+
+    /// Restore this machine from the snapshot on the private remote.
+    ///
+    /// **A dry run by default.** It reads the remote, works out what would
+    /// change here, prints it per item, and writes nothing at all. `--apply` —
+    /// or answering the confirmation on a terminal — is the only way a byte
+    /// reaches this disk.
+    ///
+    /// An item whose local copy is newer than the snapshot is *skipped* and
+    /// named, never silently replaced. Before the first write, everything the
+    /// restore is about to overwrite is archived, and the one command that puts
+    /// it all back is printed when the run ends.
+    Pull {
+        /// Write. Without it, and without an answered confirmation, nothing is
+        /// written.
+        #[arg(long)]
+        apply: bool,
+
+        /// Plan and report only — which is already the default. Accepted for
+        /// symmetry with `push --dry-run`, and refused alongside `--apply` so a
+        /// run that passes both is an error rather than a guess.
+        #[arg(long, conflicts_with = "apply")]
+        dry_run: bool,
+
+        /// Overwrite items whose local copy is newer than the snapshot.
+        ///
+        /// It prints what it is about to lose. It does **not** cover
+        /// credentials — those need `--force-credentials` as well.
+        #[arg(long)]
+        force: bool,
+
+        /// The second, separate consent for a locally-newer **credential**.
+        ///
+        /// Requires `--force`, and `--force` alone never grants it: restoring an
+        /// older token over a live one silently signs this machine out until you
+        /// log in again.
+        #[arg(long, requires = "force")]
+        force_credentials: bool,
+
+        /// Accept a snapshot older than the one this machine has already seen.
+        ///
+        /// Never waives the bundle-identity check: a counter borrowed from a
+        /// *different* bundle is refused with this flag exactly as without it.
+        #[arg(long)]
+        allow_rollback: bool,
+
+        /// Answer the confirmation affirmatively. It does **not** answer the
+        /// credential question, which has its own flag.
+        #[arg(short = 'y', long)]
+        yes: bool,
+
+        /// Throw away the local change-detection index and start it empty.
+        ///
+        /// Push-side recovery, offered here because a machine that just lost
+        /// everything is running `pull`. It changes nothing about what this
+        /// restore writes — the restore hashes what is on disk and never asks
+        /// the index.
+        #[arg(long)]
+        rebuild_index: bool,
+    },
 }
 
 #[derive(clap::Subcommand, Debug, Clone)]
@@ -515,7 +590,9 @@ mod tests {
             Some(Command::Sync {
                 action: SyncAction::Push {
                     dry_run: true,
-                    allow_rollback: false
+                    allow_rollback: false,
+                    rebuild_index: false,
+                    force_rehash: false
                 }
             })
         ));
@@ -527,7 +604,9 @@ mod tests {
             Some(Command::Sync {
                 action: SyncAction::Push {
                     dry_run: false,
-                    allow_rollback: false
+                    allow_rollback: false,
+                    rebuild_index: false,
+                    force_rehash: false
                 }
             })
         ));

@@ -661,6 +661,97 @@ mod tests {
         assert_eq!(second.total_new_bytes, 15);
     }
 
+    // ---- 5-07: the index is a hint, and both escapes prove it ----------
+
+    /// `--force-rehash` is the *whole* index-loss behaviour, reproduced without
+    /// losing the index: the plan a rehashing handle builds is equal — field for
+    /// field, ids included — to the plan a machine that deleted its index builds.
+    ///
+    /// Asserted through `files_opened` and `PartialEq`, never through timing.
+    #[test]
+    fn a_rehashing_plan_is_the_plan_a_deleted_index_would_have_produced() {
+        let dir = TempDir::new().unwrap();
+        seed_tree(dir.path());
+        let roots = roots_at(dir.path());
+
+        // Warm the cache, then plan again with every cached read suppressed.
+        let warm = index_at(dir.path());
+        build(&roots, &cfg(), &warm, now(), toy_id).unwrap();
+        let rehashed = build(&roots, &cfg(), &warm.rehashing(), now(), toy_id).unwrap();
+
+        // The same tree, planned by a machine whose index is simply not there.
+        let lost = Index::at(&dir.path().join("no-index-here.sqlite3")).unwrap();
+        let cold = build(&roots, &cfg(), &lost, now(), toy_id).unwrap();
+
+        assert_eq!(rehashed.files_opened, 2, "every file is opened again");
+        assert_eq!(
+            rehashed, cold,
+            "--force-rehash must reproduce the lost-index plan exactly"
+        );
+    }
+
+    /// The other half, so the assertion above cannot pass vacuously: without the
+    /// flag a warm index still opens nothing at all (Phase 2's SYNC-02).
+    #[test]
+    fn the_same_index_without_the_flag_still_opens_nothing() {
+        let dir = TempDir::new().unwrap();
+        seed_tree(dir.path());
+        let roots = roots_at(dir.path());
+        let index = index_at(dir.path());
+
+        build(&roots, &cfg(), &index, now(), toy_id).unwrap();
+        assert_eq!(
+            build(&roots, &cfg(), &index, now(), toy_id)
+                .unwrap()
+                .files_opened,
+            0
+        );
+    }
+
+    /// T-5-65: a run under the flag leaves the cache intact, so the *next* run
+    /// is fast again. Degraded to slow for one run, never emptied.
+    #[test]
+    fn a_rehashing_run_leaves_the_cache_warm_for_the_next_one() {
+        let dir = TempDir::new().unwrap();
+        seed_tree(dir.path());
+        let roots = roots_at(dir.path());
+        let path = dir.path().join("index.sqlite3");
+
+        let warm = Index::at(&path).unwrap();
+        build(&roots, &cfg(), &warm, now(), toy_id).unwrap();
+        build(&roots, &cfg(), &warm.rehashing(), now(), toy_id).unwrap();
+
+        let after = Index::at(&path).unwrap();
+        assert_eq!(
+            build(&roots, &cfg(), &after, now(), toy_id)
+                .unwrap()
+                .files_opened,
+            0,
+            "the rows survived the rehash"
+        );
+    }
+
+    /// `--rebuild-index` is the destructive one, and the damage it does is
+    /// bounded to *slow*: the next plan re-reads everything and reaches the same
+    /// answer.
+    #[test]
+    fn a_reset_index_costs_one_slow_plan_and_changes_no_answer() {
+        let dir = TempDir::new().unwrap();
+        seed_tree(dir.path());
+        let roots = roots_at(dir.path());
+        let path = dir.path().join("index.sqlite3");
+
+        let warm = Index::at(&path).unwrap();
+        let first = build(&roots, &cfg(), &warm, now(), toy_id).unwrap();
+        drop(warm);
+
+        let fresh = crate::sync::index::reset_at(&path).unwrap();
+        let after = build(&roots, &cfg(), &fresh, now(), toy_id).unwrap();
+
+        assert_eq!(after.files_opened, 2, "an emptied index re-reads the tree");
+        assert_eq!(after, first, "and lands on the same plan");
+    }
+
     #[test]
     fn a_file_under_the_chunk_size_becomes_exactly_one_chunk() {
         let dir = TempDir::new().unwrap();
