@@ -890,7 +890,11 @@ pub fn run_cli(action: &crate::widget::cli::SettingsAction) -> i32 {
 
 /// Render the modal overlay over `area`.
 pub fn render(f: &mut Frame, area: Rect, state: &SettingsState, theme: &Theme) {
-    let modal = centered_rect(74, 88, area);
+    // 96 rather than 88: the Sync block added nine lines, and a modal whose
+    // Save row falls off the bottom of a short terminal is worse than a thin
+    // margin. Below roughly 30 rows the Paragraph still truncates — it does
+    // not scroll, and it does not panic.
+    let modal = centered_rect(74, 96, area);
     f.render_widget(Clear, modal);
 
     let bubble = bubble_theme(theme);
@@ -919,6 +923,10 @@ pub fn render(f: &mut Frame, area: Rect, state: &SettingsState, theme: &Theme) {
         let focused = state.focus == Focus::Key(i);
         lines.push(key_row(kv, &state.keys[i], focused, &bubble));
     }
+    lines.push(Line::from(""));
+
+    // — Sync —
+    lines.extend(sync_lines(state, &bubble));
     lines.push(Line::from(""));
 
     // — Save + status —
@@ -1059,6 +1067,90 @@ fn value_text(input: &KeyInput, focused: bool) -> String {
     let pos = input.cursor.min(chars.len());
     chars.insert(pos, '‸');
     chars.into_iter().collect()
+}
+
+/// The Sync block — a pure function of the state and theme.
+///
+/// No filesystem read, no clock read, no index open: the last-sync value
+/// arrives on the state. A status panel that stat-walked a multi-gigabyte
+/// transcript tree on every keypress would freeze the render loop (T-6-23),
+/// so the per-category counts are *pointed at* rather than computed.
+fn sync_lines(state: &SettingsState, theme: &BubbleTheme) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        section_header(
+            "Sync",
+            "what encrypted sync carries — space/enter toggles a row",
+            theme,
+        ),
+        Line::from(vec![
+            theme.span("     "),
+            theme.muted(format!("last sync: {}", last_sync_text(state))),
+        ]),
+        Line::from(vec![
+            theme.span("     "),
+            theme.muted("file counts and sizes: ai-usagebar sync status"),
+        ]),
+    ];
+    for (i, (cat, on)) in state.sync_categories.iter().enumerate() {
+        lines.push(sync_row(
+            *cat,
+            *on,
+            state.focus == Focus::SyncCategory(i),
+            theme,
+        ));
+    }
+    lines
+}
+
+/// `never` is both the never-synced answer and the could-not-read-the-index
+/// answer — the same conflation `ai-usagebar sync status` already prints.
+fn last_sync_text(state: &SettingsState) -> String {
+    state
+        .sync_last_sync
+        .map_or_else(|| "never".to_string(), |at| at.to_rfc3339())
+}
+
+/// What each category costs or carries, in the user's terms. Transcripts is
+/// called out because it is the one toggle that turns a ~30 MB bundle into a
+/// multi-gigabyte one; it must not look like every other row.
+fn sync_note(cat: SyncCategory) -> &'static str {
+    match cat {
+        SyncCategory::Config => "this file, inline keys included",
+        SyncCategory::Credentials => "saved logins — encrypted before anything leaves",
+        SyncCategory::Routines => "scheduled tasks",
+        SyncCategory::ChatIndex => "Claude Desktop session index",
+        SyncCategory::Transcripts => "opt-in · large — gigabytes of local JSONL",
+    }
+}
+
+fn sync_row(cat: SyncCategory, on: bool, focused: bool, theme: &BubbleTheme) -> Line<'static> {
+    let mark = if on { "[x]" } else { "[ ]" };
+    let label = format!("{:<12}", cat.label());
+    let note = format!("  {}", sync_note(cat));
+    if focused {
+        Line::from(vec![
+            theme.span("  "),
+            Span::styled("▸ ", theme.accent.add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!(" {mark} "),
+                theme
+                    .selected
+                    .add_modifier(Modifier::REVERSED | Modifier::BOLD),
+            ),
+            Span::styled(label, theme.title.add_modifier(Modifier::BOLD)),
+            theme.muted(note),
+        ])
+    } else {
+        Line::from(vec![
+            theme.span("     "),
+            Span::styled(
+                format!("{mark} "),
+                if on { theme.accent } else { theme.muted },
+            ),
+            Span::styled(label, theme.text),
+            theme.muted(note),
+        ])
+    }
 }
 
 fn save_line(focused: bool, theme: &BubbleTheme) -> Line<'static> {
@@ -2079,5 +2171,97 @@ categories = [\"config\"]
             std::fs::read(&path).unwrap(),
             "save is not idempotent"
         );
+    }
+
+    // ─── Sync section: rendering ───────────────────────────────────────────
+
+    fn rendered(state: &SettingsState) -> Vec<String> {
+        // Theme::default() is pure — no Omarchy file, no $XDG read.
+        let theme = bubble_theme(&Theme::default());
+        sync_lines(state, &theme)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_block_shows_one_row_per_category_in_canonical_order() {
+        let s = SettingsState::from_config(&Config::default());
+        let lines = rendered(&s);
+        // header + last-sync + the pointer + one row each.
+        assert_eq!(lines.len(), 3 + SyncCategory::ALL.len());
+        for (i, cat) in SyncCategory::ALL.iter().enumerate() {
+            assert!(
+                lines[3 + i].contains(cat.label()),
+                "row {i} is not {cat:?}: {}",
+                lines[3 + i]
+            );
+        }
+    }
+
+    #[test]
+    fn a_row_shows_its_own_on_off_state() {
+        let mut s = SettingsState::from_config(&Config::default());
+        assert!(rendered(&s)[3 + TRANSCRIPTS].contains("[ ]"));
+        s.focus = Focus::SyncCategory(TRANSCRIPTS);
+        handle_key(&mut s, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert!(rendered(&s)[3 + TRANSCRIPTS].contains("[x]"));
+        // Flipping one row did not flip the drawing of another.
+        assert!(rendered(&s)[3].contains("[x]"), "config is on by default");
+    }
+
+    #[test]
+    fn transcripts_is_flagged_as_the_expensive_opt_in() {
+        let s = SettingsState::from_config(&Config::default());
+        let row = &rendered(&s)[3 + TRANSCRIPTS];
+        assert!(row.contains("opt-in"), "{row}");
+        assert!(row.contains("large"), "{row}");
+        // and it is the only row carrying that flag.
+        assert_eq!(
+            rendered(&s).iter().filter(|l| l.contains("opt-in")).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_focused_row_is_the_only_one_marked() {
+        let mut s = SettingsState::from_config(&Config::default());
+        s.focus = Focus::SyncCategory(1);
+        let marked: Vec<usize> = rendered(&s)
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains('▸'))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(marked, vec![3 + 1]);
+    }
+
+    #[test]
+    fn last_sync_reads_never_until_the_caller_supplies_one() {
+        let cfg = Config::default();
+        let s = SettingsState::from_config(&cfg);
+        assert!(rendered(&s)[1].contains("last sync: never"));
+
+        let at = chrono::DateTime::parse_from_rfc3339("2026-08-19T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let s = SettingsState::from_config_with_sync(&cfg, Some(at));
+        assert!(
+            rendered(&s)[1].contains(&at.to_rfc3339()),
+            "{}",
+            rendered(&s)[1]
+        );
+    }
+
+    #[test]
+    fn the_counts_the_block_does_not_compute_are_named_not_left_blank() {
+        // A user who sees no numbers and is told nothing assumes it is broken.
+        let s = SettingsState::from_config(&Config::default());
+        assert!(rendered(&s)[2].contains("ai-usagebar sync status"));
     }
 }
