@@ -97,8 +97,36 @@ pub fn read_raw_for(config_dir: &Path) -> Result<Option<String>> {
 }
 
 pub(crate) fn read_raw_service(service: &str) -> Result<Option<String>> {
+    find_generic_password(service, true)
+}
+
+/// Is the item there — without asking for what it holds?
+///
+/// `find-generic-password` **without `-w`** returns the item's attributes and
+/// never its data, so macOS does not consult the item's ACL and cannot raise
+/// the "ai-usagebar wants to use your confidential information" prompt. That is
+/// what makes an existence check payable by `ai-usagebar sync status`, which
+/// the macOS menu bar runs on every menu open, when a value read is not.
+///
+/// ponytail: an item that exists but holds an empty value answers `true`
+/// here and is skipped by the planner, which reads values. Establishing that
+/// difference costs the value, and therefore the prompt.
+pub fn has_raw() -> Result<bool> {
+    find_generic_password(SERVICE, false).map(|found| found.is_some())
+}
+
+/// `security find-generic-password`, selecting exactly the item the write path
+/// updates. `with_value` adds `-w` — the flag that asks for the secret, and
+/// therefore the only reason macOS consults the item's ACL.
+///
+/// `Ok(None)` is `errSecItemNotFound` and nothing else; every other failure is
+/// an `Err` so a locked Keychain never reads as "not logged in".
+fn find_generic_password(service: &str, with_value: bool) -> Result<Option<String>> {
     let mut cmd = Command::new("/usr/bin/security");
-    cmd.args(["find-generic-password", "-s", service, "-w"]);
+    cmd.args(["find-generic-password", "-s", service]);
+    if with_value {
+        cmd.arg("-w");
+    }
     if let Some(acct) = account() {
         cmd.args(["-a", &acct]);
     }

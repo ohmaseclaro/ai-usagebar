@@ -255,6 +255,67 @@ impl Client {
         )
     }
 
+    /// Does this repository have **no commits at all**?
+    ///
+    /// The state `gh repo create --private` leaves behind, and therefore the
+    /// ordinary first-run one. It matters because a repository with no commits
+    /// cannot be tagged, so [`Client::ensure_release`] is answered with a bare
+    /// 422 in the middle of a push — see [`first_commit_command`].
+    ///
+    /// A read, so no [`Pushing`]: asking whether a private repository has
+    /// commits is not a write. `GET …/commits` is GitHub's own answer to the
+    /// question — 409 `Git Repository is empty.` and nothing else returns it on
+    /// this endpoint.
+    ///
+    /// **Fail-safe rather than fail-closed, and it returns a `bool` to say so.**
+    /// Anything that is not GitHub's 409 reads as "not empty", because being
+    /// wrong that way costs nothing — the push path already explains the 422 —
+    /// while being wrong the other way offers to write a commit into a
+    /// repository that did not need one.
+    pub async fn repo_has_no_commits(&self, repo: &RepoRef) -> bool {
+        let path = format!("/repos/{}/{}/commits?per_page=1", repo.owner, repo.name);
+        matches!(self.get_json(&path).await, Ok((StatusCode::CONFLICT, _, _)))
+    }
+
+    /// Give an empty repository the one commit a release needs to hang off.
+    ///
+    /// **Only ever reached from an explicit yes.** `sync setup` asks before
+    /// calling this; it is the user's repository, and this is the first thing
+    /// the tool would ever put in it.
+    ///
+    /// It is a `Contents` write and nothing more. The token deliberately holds
+    /// no `Administration: write`, so REPO-03's guarantee — that this tool
+    /// cannot bring a *public* repository into existence — is untouched by it:
+    /// a repository that does not exist still gets
+    /// [`missing_repo_message`](super::gate::missing_repo_message) and the
+    /// `gh repo create --private` line, never an API call.
+    pub async fn init_first_commit(
+        &self,
+        repo: &RepoRef,
+        permit: &Pushing,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        // Redundant with `put_contents`'s own check, and kept anyway: every verb
+        // here that takes a `Pushing` proves its subject locally, so the
+        // property is readable in one function rather than inferred through a
+        // delegation — which is the guard `gate.rs` enforces.
+        permit.covers(repo)?;
+        self.put_contents(
+            repo,
+            INIT_PATH,
+            INIT_COMMIT_MESSAGE,
+            INIT_README.as_bytes(),
+            // No `sha`: create, and fail if something is already there. The
+            // repository was just observed empty, so anything at this path is a
+            // race worth refusing rather than overwriting.
+            None,
+            permit,
+            now,
+        )
+        .await
+        .map(|_sha| ())
+    }
+
     /// The release the whole bundle lives in, created on first use.
     ///
     /// One published release under one fixed tag, never a draft: a draft release
@@ -316,14 +377,14 @@ impl Client {
                 // cannot find is a commit to tag.
                 return Err(GithubError::NotFound {
                     message: format!(
-                        "{}/{} has no commits yet, so GitHub will not create the release \
-                     the packs hang off.\n\
-                     Give it one — a README is enough — and re-run this command:\n\
-                     \x20 gh api repos/{}/{}/contents/README.md -X PUT \\\n\
-                     \x20   -f message=init -f content=\"$(printf '# sync' | base64)\"\n\
-                     Nothing was uploaded. A repository created with `--add-readme` \
-                     does not hit this.",
-                        repo.owner, repo.name, repo.owner, repo.name
+                        "{repo} has no commits yet, so GitHub will not create the release \
+                         the packs hang off.\n\
+                         Give it one — a README is enough — and re-run this command:\n\
+                         {}\n\
+                         Nothing was uploaded. `ai-usagebar sync setup` offers to do this \
+                         for you, and a repository created with `--add-readme` never \
+                         reaches it.",
+                        first_commit_command(repo)
                     ),
                 });
             }
@@ -695,6 +756,30 @@ impl Client {
 /// tool and nothing about the machine that wrote it.
 const RELEASE_NOTE: &str = "Encrypted ai-usagebar sync data. Written by `ai-usagebar sync push`; not meant to be \
      downloaded by hand.";
+
+/// Where [`Client::init_first_commit`] puts the first commit. A fixed literal:
+/// nothing in this path comes from a remote, a config file, or a user.
+const INIT_PATH: &str = "README.md";
+
+/// Its commit message, and its body. Both land in the repository's git history
+/// in the clear forever, so — like [`RELEASE_NOTE`] — they name the tool and
+/// say nothing about the machine that wrote them.
+const INIT_COMMIT_MESSAGE: &str = "Initialise ai-usagebar sync repository";
+const INIT_README: &str = "# ai-usagebar sync\n\n\
+     This repository holds ciphertext managed by `ai-usagebar sync`.\n\
+     Do not edit it by hand.\n";
+
+/// What to run to give a repository its first commit by hand — the answer to
+/// both "a push found it empty" and "setup offered and you said no".
+///
+/// One function rather than the same two lines in two places: they drifted once
+/// already, and a command a user pastes is exactly the text that must not.
+pub(crate) fn first_commit_command(repo: &RepoRef) -> String {
+    format!(
+        "\x20 gh api repos/{repo}/contents/README.md -X PUT \\\n\
+         \x20   -f message=init -f content=\"$(printf '# sync' | base64)\""
+    )
+}
 
 #[derive(Deserialize)]
 struct ReleaseRef {
@@ -1487,5 +1572,129 @@ mod tests {
         let rendered = format!("{err} {err:?}");
         assert!(!rendered.contains(TOKEN), "{rendered}");
         assert!(!rendered.contains(&TOKEN[..8]), "{rendered}");
+    }
+
+    // ---- 6-11: the repository with no commits yet -------------------------
+
+    /// GitHub's own answer, and the only one that means "empty" on this
+    /// endpoint. It is what `gh repo create --private` leaves behind.
+    #[tokio::test]
+    async fn a_409_on_the_commits_endpoint_is_an_empty_repository() {
+        let mut server = mockito::Server::new_async().await;
+        let probe = server
+            .mock("GET", "/repos/o/n/commits")
+            .match_query(mockito::Matcher::Any)
+            .with_status(409)
+            .with_body(r#"{"message":"Git Repository is empty."}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        assert!(client_at(&server.url()).repo_has_no_commits(&repo()).await);
+        probe.assert_async().await;
+    }
+
+    /// **Fail-safe.** Anything that is not the 409 reads as "not empty":
+    /// being wrong that way costs a message the push path already prints,
+    /// while being wrong the other way offers to write a commit into a
+    /// repository that did not need one.
+    #[tokio::test]
+    async fn anything_but_the_409_reads_as_a_repository_that_has_commits() {
+        for (status, body) in [
+            (200, r#"[{"sha":"abc"}]"#),
+            (500, r#"{"message":"boom"}"#),
+            (403, r#"{"message":"nope"}"#),
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let _m = server
+                .mock("GET", "/repos/o/n/commits")
+                .match_query(mockito::Matcher::Any)
+                .with_status(status)
+                .with_body(body)
+                .create_async()
+                .await;
+            assert!(
+                !client_at(&server.url()).repo_has_no_commits(&repo()).await,
+                "HTTP {status} must not read as an empty repository"
+            );
+        }
+
+        // …including a dead port, which is the transport failure.
+        assert!(
+            !client_at("http://127.0.0.1:1")
+                .repo_has_no_commits(&repo())
+                .await
+        );
+    }
+
+    /// The first commit is created, never overwritten: no `sha` is sent, so a
+    /// `README.md` that appeared between the probe and the write is a refusal
+    /// rather than a clobber. Nothing in the path or the body comes from a
+    /// remote, a config file, or a user.
+    #[tokio::test]
+    async fn the_first_commit_creates_a_readme_and_refuses_to_overwrite_one() {
+        let mut server = mockito::Server::new_async().await;
+        let put = server
+            .mock("PUT", "/repos/o/n/contents/README.md")
+            // The whole request: the fixed message, the fixed body, and no
+            // `sha` — create, never replace. `PartialJsonString` would pass a
+            // request that also carried a `sha`, so the match is exact.
+            .match_body(mockito::Matcher::JsonString(format!(
+                r#"{{"message":"{INIT_COMMIT_MESSAGE}","content":"{}"}}"#,
+                B64.encode(INIT_README)
+            )))
+            .with_status(201)
+            .with_body(r#"{"content":{"sha":"a-blob-sha"}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        client_at(&server.url())
+            .init_first_commit(&repo(), &permit(), NOW)
+            .await
+            .unwrap();
+        put.assert_async().await;
+
+        // …and a path that is already there answers 422, which `put_contents`
+        // classifies as the conflict it is.
+        let mut taken = mockito::Server::new_async().await;
+        let _m = taken
+            .mock("PUT", "/repos/o/n/contents/README.md")
+            .with_status(422)
+            .with_body(r#"{"message":"Invalid request."}"#)
+            .create_async()
+            .await;
+        client_at(&taken.url())
+            .init_first_commit(&repo(), &permit(), NOW)
+            .await
+            .expect_err("something is already at that path");
+    }
+
+    /// The README lands in the repository's git history in the clear forever,
+    /// so — like the release note — it names the tool and nothing about the
+    /// machine that wrote it.
+    #[test]
+    fn the_first_commit_says_what_the_repository_is_and_nothing_about_the_machine() {
+        assert!(INIT_README.contains("ai-usagebar sync"));
+        assert!(INIT_README.contains("Do not edit it by hand"));
+        assert!(INIT_README.contains("ciphertext"));
+        for host in ["$HOME", "/Users/", "/home/", "hostname"] {
+            assert!(!INIT_README.contains(host), "{INIT_README}");
+        }
+    }
+
+    /// One function, two call sites: the 422 a push hits and the decline a
+    /// setup prints. They drifted once already, and a command a user pastes is
+    /// exactly the text that must not.
+    #[test]
+    fn the_push_refusal_prints_the_same_command_the_setup_decline_does() {
+        let command = first_commit_command(&repo());
+        assert!(command.contains("gh api repos/o/n/contents/README.md -X PUT"));
+
+        let err = GithubError::NotFound {
+            message: format!("x\n{command}"),
+        }
+        .to_string();
+        assert!(err.contains(&command), "{err}");
     }
 }

@@ -130,6 +130,11 @@ impl Store {
 pub struct Fixture {
     creds: BTreeMap<Store, Zeroizing<String>>,
     safe_key: Option<safe_storage::Key>,
+    /// Injected "this machine cannot say" — a locked Keychain, a denied ACL.
+    /// The only way to reach the failing arm of [`Stores::read`] and
+    /// [`Stores::has`] without a real one, and therefore the only way to test
+    /// that `sync status` says so rather than reporting a short count.
+    unreadable: bool,
 }
 
 impl Fixture {
@@ -147,6 +152,22 @@ impl Fixture {
     /// that has none.
     pub fn set_safe_key(&mut self, key: Option<safe_storage::Key>) {
         self.safe_key = key;
+    }
+
+    /// Make every read and existence check on this "machine" fail, as a locked
+    /// login Keychain does.
+    pub fn set_unreadable(&mut self, unreadable: bool) {
+        self.unreadable = unreadable;
+    }
+
+    /// The injected failure, in the shape the real one arrives in.
+    fn fail(&self) -> Result<()> {
+        if self.unreadable {
+            return Err(crate::error::AppError::Credentials(
+                "this fixture's credential store is unreadable".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -213,11 +234,40 @@ impl Stores {
     /// module was written to end, so it must not be reachable by a shrug.
     pub fn read(&self, store: Store) -> Result<Option<Zeroizing<String>>> {
         match self {
-            Stores::Fixture(_) => Ok(self
-                .edit()
-                .get(store)
-                .map(|v| Zeroizing::new(v.to_string()))),
+            Stores::Fixture(_) => {
+                let fixture = self.edit();
+                fixture.fail()?;
+                Ok(fixture.get(store).map(|v| Zeroizing::new(v.to_string())))
+            }
             Stores::Machine => machine_read(store),
+        }
+    }
+
+    /// Does `store` hold a credential — established **without reading it**?
+    ///
+    /// The question `sync status` asks. `status` walks the filesystem, and a
+    /// store is not a file, so before this existed it reported one credential
+    /// fewer than `push --dry-run` planned — and the missing one was the Claude
+    /// Code login, the most sensitive item in the bundle (the whole reason to
+    /// look at what sync carries).
+    ///
+    /// Existence, not value, and the distinction is what makes it payable on
+    /// that path: [`crate::anthropic::keychain::has_raw`] never asks the
+    /// Keychain for the secret, so it cannot raise the ACL prompt a
+    /// [`Stores::read`] can — and the macOS menu bar runs `sync status --json`
+    /// on every menu open. Nothing here needs a password or a network.
+    ///
+    /// `Err` is "this machine could not say", never a shrug: `sync status`
+    /// turns it into [`WARN_KEYSTORE_UNAVAILABLE`](crate::sync::report::WARN_KEYSTORE_UNAVAILABLE)
+    /// rather than a quietly short count.
+    pub fn has(&self, store: Store) -> Result<bool> {
+        match self {
+            Stores::Fixture(_) => {
+                let fixture = self.edit();
+                fixture.fail()?;
+                Ok(fixture.get(store).is_some_and(|v| !v.is_empty()))
+            }
+            Stores::Machine => machine_has(store),
         }
     }
 
@@ -271,6 +321,13 @@ fn machine_read(store: Store) -> Result<Option<Zeroizing<String>>> {
 }
 
 #[cfg(target_os = "macos")]
+fn machine_has(store: Store) -> Result<bool> {
+    match store {
+        Store::ClaudeCodeOauth => crate::anthropic::keychain::has_raw(),
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn machine_write(store: Store, value: &str) -> Result<()> {
     match store {
         Store::ClaudeCodeOauth => crate::anthropic::keychain::write_raw(value),
@@ -287,6 +344,11 @@ fn machine_safe_key() -> Option<safe_storage::Key> {
 #[cfg(not(target_os = "macos"))]
 fn machine_read(_store: Store) -> Result<Option<Zeroizing<String>>> {
     Ok(None)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn machine_has(_store: Store) -> Result<bool> {
+    Ok(false)
 }
 
 #[cfg(not(target_os = "macos"))]

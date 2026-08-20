@@ -1,9 +1,20 @@
 //! `ai-usagebar sync setup` — pair this machine with the private repository
 //! named in `[sync] repo`, in the five steps UX-03 asks for.
 //!
-//! **Uploads nothing** (D-05). The flow is: the categories, then the repository
-//! and the gate, then the passphrase, then the size, then everything that
-//! persists.
+//! **Uploads no bundle data** (D-05). The flow is: the categories, then the
+//! repository and the gate, then the passphrase, then the size, then everything
+//! that persists.
+//!
+//! It can write exactly one thing, and only when asked: a `README.md` into a
+//! repository that has **no commits at all**, which is what
+//! `gh repo create --private` leaves behind and which GitHub will not let a
+//! release be tagged against. That offer sits inside step 2, *after* the gate,
+//! because it is the first thing that would put a byte in the repository and
+//! the private-repo refusal has to have run against it first. A decline leaves
+//! the repository untouched and prints the `gh api …` line instead. Nothing
+//! here creates a repository: the token holds no `Administration: write`, so
+//! REPO-03's "cannot bring a public repository into existence" is structural
+//! and a `Contents` write does not touch it.
 //!
 //! **The ordering is the substance**, and it changed for a security reason.
 //! The categories come *first* because the credentials category is an input to
@@ -48,6 +59,7 @@ use crate::sync::{SyncRoots, plan};
 use super::gate;
 use super::pairing;
 use super::token::{self, TokenSource};
+use super::write;
 use super::{Client, Endpoints, RepoRef};
 
 /// Everything the guided flow needs from outside itself.
@@ -242,6 +254,10 @@ pub struct SetupOutcome {
     pub files: usize,
     pub raw_bytes: u64,
     pub would_send: u64,
+    /// True when the user accepted the empty-repository offer and this run put
+    /// a README in the repository. The only thing this flow can upload, and the
+    /// reason the closing line cannot say "nothing was uploaded" unconditionally.
+    pub initialised: bool,
 }
 
 /// `N/5  …` — the step markers were always there and simply did not stand out.
@@ -351,10 +367,13 @@ pub async fn run(
     let record = pairing::read_from(&pairing_file)?;
     // check_drift first, then assert_pushable — that order, always.
     let drift = pairing::check_drift(record.as_ref(), &facts, credentials_in_bundle, now)?;
-    // The clearance is dropped here, deliberately: `sync setup` uploads nothing
-    // (D-05), so the only thing keeping it could do is age. A push mints and
-    // spends its own — see `gate`'s Phase 4 contract.
-    let (_clearance, gate_warnings) =
+    // Kept only as far as the empty-repository offer a few lines below, which is
+    // the one write this flow can make and is inside the same handful of round
+    // trips as the check that authorised it. If the repository is not empty the
+    // clearance is dropped unspent, which uploads nothing. A push mints and
+    // spends its own — see `gate`'s Phase 4 contract; nothing here is carried
+    // into one (F-3).
+    let (clearance, gate_warnings) =
         gate::assert_pushable(&facts, &repo, credentials_in_bundle, now)?;
 
     let mut warnings = drift.warnings.clone();
@@ -407,6 +426,20 @@ pub async fn run(
              issuing a second one.",
         ));
     }
+
+    // Still step 2, and deliberately **after** the gate: this is the first
+    // thing that would put a byte in the repository, so the private-repo
+    // refusal has to have already run against it. `gh repo create --private`
+    // leaves an empty repository behind, so this is the ordinary first-run
+    // state — and an empty one cannot be tagged, so a push would be answered
+    // with GitHub's bare 422 several minutes in.
+    let initialised = if client.repo_has_no_commits(&repo).await {
+        offer_first_commit(prompt, style, &client, &repo, clearance, now).await?
+    } else {
+        // Dropped unspent. `#[must_use]` is about a clearance nothing acted on;
+        // here the thing it would have authorised turned out not to be needed.
+        false
+    };
 
     // ---- Step 3: the passphrase, and the keyfile -------------------------
     //
@@ -475,12 +508,16 @@ pub async fn run(
         style,
     ));
     if !prompt.confirm("     Pair this machine with that scope?", true)? {
-        return Err(AppError::Other(
-            "setup stopped at the size confirmation. Nothing was uploaded — this command \
-             never uploads — the repository was not touched, and nothing was written here: \
-             no keyfile, no config change, no stored token. Re-run when you are ready."
-                .into(),
-        ));
+        return Err(AppError::Other(format!(
+            "setup stopped at the size confirmation. No bundle data was uploaded — this \
+             command never uploads any — {}, and nothing was written here: no keyfile, no \
+             config change, no stored token. Re-run when you are ready.",
+            if initialised {
+                "the README you approved is the only thing in the repository"
+            } else {
+                "the repository was not touched"
+            }
+        )));
     }
 
     // ---- Step 5: everything that persists --------------------------------
@@ -523,7 +560,61 @@ pub async fn run(
         files,
         raw_bytes,
         would_send,
+        initialised,
     })
+}
+
+/// The empty-repository offer, and the one write this flow can make.
+///
+/// **Asked, never assumed.** It is the user's repository and this is the first
+/// thing the tool would ever put in it, so the answer comes from
+/// [`SetupPrompt::confirm`] — a decline leaves the repository exactly as it was
+/// and prints what to run instead. Setup then carries on: the pairing, the
+/// password and the scope are all still valid, and the push that eventually
+/// needs the commit says so again in the same words.
+///
+/// **This adds a commit; it does not create a repository.** The token holds no
+/// `Administration: write`, which is what makes bringing a *public* repository
+/// into existence structurally impossible rather than merely disallowed
+/// (REPO-03), and a `Contents` write does not touch that. A repository that is
+/// not there never reaches this function — [`gate::fetch_facts`] has already
+/// refused with the `gh repo create --private` line.
+///
+/// The clearance is taken **by value** and spent here, which is the whole
+/// reason it survived step 2: this is the byte the private-repo check was run
+/// for, a few round trips after it.
+async fn offer_first_commit(
+    prompt: &mut dyn SetupPrompt,
+    style: Style,
+    client: &Client,
+    repo: &RepoRef,
+    clearance: gate::PushClearance,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    prompt.say(&under(
+        style,
+        &format!(
+            "{repo} has no commits yet — which is what `gh repo create --private` leaves \
+             behind. GitHub will not tag an empty repository, so a push would be refused \
+             by it.",
+        ),
+    ));
+    if !prompt.confirm(
+        "     Add a README.md to it now, so a push has something to hang off?",
+        true,
+    )? {
+        prompt.say(&under(
+            style,
+            "left untouched. Give it a commit yourself before the first push:",
+        ));
+        prompt.say(&write::first_commit_command(repo));
+        return Ok(false);
+    }
+    client
+        .init_first_commit(repo, &clearance.spend(now)?, now)
+        .await?;
+    prompt.say(&under(style, "README.md written."));
+    Ok(true)
 }
 
 /// Passphrase attempts a joining machine gets before setup gives up.
@@ -826,6 +917,12 @@ pub(crate) struct Script {
     /// `None` keeps whatever the config already had.
     pub categories: Option<Vec<SyncCategory>>,
     pub confirm: bool,
+    /// Answer `false` to any question containing this, whatever `confirm` says.
+    ///
+    /// The flow has two yes/no questions that a test needs to answer
+    /// *differently* — the empty-repository offer and the size confirmation —
+    /// and one `bool` cannot say "no to the README, yes to the pairing".
+    pub decline_matching: Option<String>,
     /// Token-file paths the flow asked to store / clear. Recorded rather than
     /// acted on — no test may reach a real Keychain. `cleared` carries the
     /// `TokenSource` too: *which* store a 401 reaches is the whole question
@@ -858,6 +955,11 @@ impl SetupPrompt for Double {
     fn confirm(&mut self, question: &str, _default_yes: bool) -> Result<bool> {
         let mut s = self.0.borrow_mut();
         s.reached.push(format!("confirm:{question}"));
+        if let Some(needle) = &s.decline_matching
+            && question.contains(needle.as_str())
+        {
+            return Ok(false);
+        }
         Ok(s.confirm)
     }
     fn passphrase(&mut self, _generated: &str) -> Result<Zeroizing<String>> {
@@ -980,6 +1082,7 @@ mod tests {
             .create_async()
             .await;
         let _p = no_pointer(&mut server).await;
+        let _c = has_commits(&mut server).await;
         run(
             cfg,
             &roots_at(dir),
@@ -989,6 +1092,29 @@ mod tests {
             now(),
         )
         .await
+    }
+
+    /// "This repository already has a commit" — the ordinary case, and the one
+    /// every test but the empty-repository ones wants. Only the status is read.
+    async fn has_commits(server: &mut mockito::ServerGuard) -> mockito::Mock {
+        server
+            .mock("GET", "/repos/o/n/commits")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body("[]")
+            .create_async()
+            .await
+    }
+
+    /// GitHub's own answer for a repository with no commits at all, verbatim.
+    async fn no_commits(server: &mut mockito::ServerGuard) -> mockito::Mock {
+        server
+            .mock("GET", "/repos/o/n/commits")
+            .match_query(mockito::Matcher::Any)
+            .with_status(409)
+            .with_body(r#"{"message":"Git Repository is empty."}"#)
+            .create_async()
+            .await
     }
 
     /// "Nothing has ever been pushed here."
@@ -1085,6 +1211,7 @@ mod tests {
             .create_async()
             .await;
         publish(&mut server, asset_name, asset).await;
+        let _c = has_commits(&mut server).await;
         run(
             &cfg_for(Some("o/n")),
             &roots_at(dir),
@@ -1783,7 +1910,14 @@ mod tests {
         let err = drive(&cfg_for(Some("o/n")), &dir, PRIVATE, 200, &script)
             .await
             .expect_err("the user declined");
-        assert!(err.to_string().contains("Nothing was uploaded"), "{err}");
+        assert!(
+            err.to_string().contains("No bundle data was uploaded"),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("the repository was not touched"),
+            "this repository already had commits, so nothing was written to it: {err}"
+        );
         assert!(!pairing::default_path(&roots_at(&dir)).exists());
 
         // F-10: the keyfile used to be written before this confirmation, and
@@ -1948,5 +2082,187 @@ mod tests {
                 .any(|r| r == "existing_passphrase"),
             "there is no existing passphrase to ask for"
         );
+    }
+
+    // ---- 6-11: the repository that has no commits yet --------------------
+
+    /// A private repository with **no commits at all** — what
+    /// `gh repo create --private` leaves behind — plus the one write the offer
+    /// can make.
+    ///
+    /// Every mock is returned because dropping one un-registers it; `readme` is
+    /// handed back separately so a test can ask whether it was hit.
+    async fn empty_repo(server: &mut mockito::ServerGuard) -> (Vec<mockito::Mock>, mockito::Mock) {
+        let repo = server
+            .mock("GET", "/repos/o/n")
+            .with_status(200)
+            .with_body(PRIVATE)
+            .create_async()
+            .await;
+        let commits = no_commits(server).await;
+        let pointer = no_pointer(server).await;
+        let readme = server
+            .mock("PUT", "/repos/o/n/contents/README.md")
+            .with_status(201)
+            .with_body(r#"{"content":{"sha":"a-blob-sha"}}"#)
+            .create_async()
+            .await;
+        (vec![repo, commits, pointer], readme)
+    }
+
+    /// The fix. Before it, setup paired a machine against a repository GitHub
+    /// would refuse to tag, and the refusal arrived several minutes into the
+    /// first push as a bare 422 with a command to paste.
+    #[tokio::test]
+    async fn an_empty_repository_is_offered_a_first_commit_and_a_yes_writes_one() {
+        let dir = TempDir::new().unwrap();
+        let mut server = mockito::Server::new_async().await;
+        let (_keep, readme) = empty_repo(&mut server).await;
+
+        let script = Script::new();
+        let out = run(
+            &cfg_for(Some("o/n")),
+            &roots_at(&dir),
+            &endpoints_at(&server.url()),
+            &chain(),
+            &mut Double(Rc::clone(&script)),
+            now(),
+        )
+        .await
+        .unwrap();
+
+        readme.assert_async().await;
+        assert!(out.initialised, "the outcome must report the one write");
+
+        // Asked, never assumed — it is the user's repository.
+        let reached = script.borrow().reached.clone();
+        assert!(
+            reached.iter().any(|r| r.contains("Add a README.md")),
+            "{reached:?}"
+        );
+        let said = script.borrow().said.join("\n");
+        assert!(said.contains("has no commits yet"), "{said}");
+        assert!(said.contains("README.md written"), "{said}");
+    }
+
+    /// **The ordering the whole offer hangs on.** Step 2 is the private-repo
+    /// gate and stays the first thing that touches the repository: a public one
+    /// is refused before anything asks about a commit, let alone writes one.
+    #[tokio::test]
+    async fn a_public_repository_is_refused_before_the_offer_is_ever_reached() {
+        let dir = TempDir::new().unwrap();
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/repos/o/n")
+            .with_status(200)
+            .with_body(PUBLIC)
+            .create_async()
+            .await;
+        let commits = no_commits(&mut server).await;
+        let readme = server
+            .mock("PUT", "/repos/o/n/contents/README.md")
+            .with_status(201)
+            .with_body(r#"{"content":{"sha":"a-blob-sha"}}"#)
+            .create_async()
+            .await;
+
+        let script = Script::new();
+        run(
+            &cfg_for(Some("o/n")),
+            &roots_at(&dir),
+            &endpoints_at(&server.url()),
+            &chain(),
+            &mut Double(Rc::clone(&script)),
+            now(),
+        )
+        .await
+        .expect_err("a public repository is refused");
+
+        assert!(
+            !commits.matched_async().await,
+            "emptiness was probed before the gate refused"
+        );
+        assert!(
+            !readme.matched_async().await,
+            "a byte was written to a repository the gate had not cleared"
+        );
+        assert!(
+            !script.borrow().reached.iter().any(|r| r.contains("README")),
+            "the offer was made about a repository that was about to be refused"
+        );
+    }
+
+    /// A decline leaves the repository exactly as it was and hands back the
+    /// command — the same one the push path prints, from the same function.
+    /// Setup then carries on: the pairing, the password and the scope are all
+    /// still valid without the commit.
+    #[tokio::test]
+    async fn declining_the_offer_leaves_the_repository_untouched_and_names_the_command() {
+        let dir = TempDir::new().unwrap();
+        let mut server = mockito::Server::new_async().await;
+        let (_keep, readme) = empty_repo(&mut server).await;
+
+        let script = Script::new();
+        script.borrow_mut().decline_matching = Some("README".into());
+
+        let out = run(
+            &cfg_for(Some("o/n")),
+            &roots_at(&dir),
+            &endpoints_at(&server.url()),
+            &chain(),
+            &mut Double(Rc::clone(&script)),
+            now(),
+        )
+        .await
+        .expect("a declined offer is not a failed setup");
+
+        assert!(!readme.matched_async().await, "the decline wrote something");
+        assert!(!out.initialised);
+
+        let said = script.borrow().said.join("\n");
+        assert!(said.contains("left untouched"), "{said}");
+        assert!(
+            said.contains(&write::first_commit_command(&out.repo)),
+            "the decline must print the command the push path prints: {said}"
+        );
+    }
+
+    /// The size confirmation still reports the truth about the remote, and the
+    /// truth changed: an approved README is in the repository, and saying
+    /// "the repository was not touched" over it would be a lie.
+    #[tokio::test]
+    async fn declining_the_size_after_approving_the_readme_says_what_is_there() {
+        let dir = TempDir::new().unwrap();
+        let mut server = mockito::Server::new_async().await;
+        let (_keep, readme) = empty_repo(&mut server).await;
+
+        let script = Script::new();
+        script.borrow_mut().decline_matching = Some("Pair this machine".into());
+
+        let err = run(
+            &cfg_for(Some("o/n")),
+            &roots_at(&dir),
+            &endpoints_at(&server.url()),
+            &chain(),
+            &mut Double(Rc::clone(&script)),
+            now(),
+        )
+        .await
+        .expect_err("the user declined the scope");
+
+        readme.assert_async().await;
+        let text = err.to_string();
+        assert!(text.contains("No bundle data was uploaded"), "{text}");
+        assert!(
+            text.contains("the README you approved is the only thing in the repository"),
+            "{text}"
+        );
+        assert!(!text.contains("the repository was not touched"), "{text}");
+
+        // F-10 is untouched: a README does not strand a re-run the way a
+        // keyfile did, and nothing local was written.
+        assert!(!crate::sync::cli::keyfile_path(&roots_at(&dir)).exists());
+        assert!(!pairing::default_path(&roots_at(&dir)).exists());
+        assert!(script.borrow().stored.is_empty());
     }
 }

@@ -195,6 +195,11 @@ fn open_index(roots: &SyncRoots) -> Option<Index> {
 /// menu open. A plan would want the sync password on a stdin a subprocess has
 /// no way to answer (D-02) and would open file bodies to get it; a repository
 /// section would put a network round-trip behind a UI gesture (T-6-04).
+///
+/// It does ask the machine-bound credential store **whether it holds an
+/// entry** — see [`report::build_status`]. That is none of the three things
+/// above: no password, no socket, no file body, and not even the store's value,
+/// so it cannot raise a Keychain prompt on a menu open either.
 fn status(
     config: &Config,
     roots: &SyncRoots,
@@ -463,11 +468,20 @@ fn render_setup(outcome: &github::setup::SetupOutcome) -> String {
     if outcome.reused_pairing {
         out.push_str("pairing:    reused — this machine was already paired.\n");
     }
-    out.push_str(
-        "\nThis machine is paired and ready to push.\n\
-         Nothing was uploaded — `sync setup` never uploads. Run `ai-usagebar sync push` when \
-         you are ready.\n",
-    );
+    // The one thing setup can put in the repository, and only ever with an
+    // explicit yes — so the closing line reports it rather than repeating a
+    // "nothing was uploaded" that would no longer be true.
+    if outcome.initialised {
+        out.push_str("repo:       initialised — a README was added to the empty repository.\n");
+    }
+    out.push_str("\nThis machine is paired and ready to push.\n");
+    out.push_str(if outcome.initialised {
+        "The README you approved is the only thing there — `sync setup` uploads no bundle \
+         data. Run `ai-usagebar sync push` when you are ready.\n"
+    } else {
+        "Nothing was uploaded — `sync setup` never uploads. Run `ai-usagebar sync push` when \
+         you are ready.\n"
+    });
     out
 }
 
@@ -1369,6 +1383,13 @@ mod tests {
             .with_status(404)
             .with_body(r#"{"message":"Not Found"}"#)
             .create();
+        // …and it already has a commit, so setup makes no offer to add one.
+        let _c = server
+            .mock("GET", "/repos/o/n/commits")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body("[]")
+            .create();
 
         let script = Script::new();
         script
@@ -1409,6 +1430,26 @@ mod tests {
             "{rendered}"
         );
         assert!(!rendered.contains("a-suppli"), "{rendered}");
+        assert!(!outcome.initialised, "this repository already had a commit");
+
+        // 6-11: and when setup *did* put the approved README in an empty
+        // repository, the closing line reports it instead of claiming over it.
+        let initialised = render_setup(&github::setup::SetupOutcome {
+            initialised: true,
+            ..outcome
+        });
+        assert!(
+            initialised.contains("a README was added to the empty repository"),
+            "{initialised}"
+        );
+        assert!(
+            !initialised.contains("Nothing was uploaded"),
+            "a README was: {initialised}"
+        );
+        assert!(
+            initialised.contains("uploads no bundle data"),
+            "D-05 still holds for everything else: {initialised}"
+        );
     }
 
     // ---- 3-07: `sync status` learns about the repository -----------------
