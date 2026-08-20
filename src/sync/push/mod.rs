@@ -46,7 +46,6 @@ use crate::config::{SyncCategory, SyncConfig};
 use crate::error::{AppError, Result};
 use crate::sync::SyncRoots;
 use crate::sync::crypto::{ChunkId, KdfParams, Keys};
-use crate::sync::github::write::Asset;
 use crate::sync::github::{Client, RepoRef, gate, pairing};
 use crate::sync::index::Index;
 
@@ -84,7 +83,7 @@ pub const MAX_SUPPORTED_POINTER: u32 = 1;
 /// snapshot pointing at deleted data — D2's single worst outcome — reached with
 /// neither machine doing anything wrong.
 ///
-/// The age floor is what closes it, and it is why [`Asset`] carries
+/// The age floor is what closes it, and it is why `write::Asset` carries
 /// `created_at`. The cost is that genuine garbage lingers a day; the alternative
 /// is an unrestorable backup.
 pub const PRUNE_GRACE: TimeDelta = TimeDelta::hours(24);
@@ -475,16 +474,6 @@ async fn went_public_mid_push(
          copy of the old keyfile can still open it with the old password.\n\
          The gate said: {why}"
     ))
-}
-
-/// Assets on this release whose names this format does not recognise.
-///
-/// Used by [`prune`] and by nothing else, and it lives here because it is a
-/// statement about the *layout* rather than about retention: a collector that
-/// deletes what it does not recognise turns every future format addition into a
-/// data-loss bug.
-pub fn is_pack_asset(asset: &Asset) -> bool {
-    asset.name.starts_with("pack-") && asset.name.ends_with(".bin")
 }
 
 #[cfg(test)]

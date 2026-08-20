@@ -139,12 +139,15 @@ impl fmt::Display for RepoRef {
     }
 }
 
-/// An authenticated, **read-only** GitHub client.
+/// An authenticated GitHub client.
 ///
-/// There is no `post`, `put`, `patch`, or multipart method here and no call site
-/// that hands this type a request body. That absence *is* D-05 — the type itself
-/// cannot upload — and it is enforced by a test in this file rather than by
-/// review, so a write verb added here fails the suite instead of shipping.
+/// Its **read** verb is [`get_json`](Client::get_json), here. Its six **write**
+/// verbs live in [`write`], in an inherent `impl` block that module opens, and
+/// each one takes a [`gate::Pushing`] by reference — a capability minted only by
+/// spending a fresh [`PushClearance`](gate::PushClearance), so a write cannot be
+/// reached without a visibility check that was fresh at the call. The guard test
+/// at the bottom of this file is what keeps those verbs from growing anywhere
+/// else in this directory.
 ///
 /// `Clone` because plan 4-03 uploads four packs concurrently and each task takes
 /// an owned client; the inner `reqwest::Client` is an `Arc` handle, so a clone

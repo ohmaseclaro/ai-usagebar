@@ -74,8 +74,13 @@ pub async fn run(
     keep: usize,
     permit: &gate::Pushing,
 ) -> Result<usize> {
-    let _ = (ctx, release_id, landed, keep, permit);
-    Ok(0)
+    let _ = (release_id, permit);
+    // Plan 4-05 replaces the empty slice with one `list_assets` call and then
+    // deletes what comes back, sequentially. The dispatch is wired from the
+    // tracer on purpose: a retention rule nothing calls is a retention rule
+    // whose tests prove only that it can be called directly.
+    let (_truncated, deletions) = plan_deletions(landed, &[], keep, ctx.now, super::PRUNE_GRACE);
+    Ok(deletions.len())
 }
 
 /// The `ai-usagebar sync prune` entry point.

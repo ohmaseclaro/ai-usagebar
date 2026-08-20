@@ -180,16 +180,36 @@ pub enum SyncAction {
 
     /// Send the encrypted bundle to the private remote.
     ///
-    /// This build has no transport, so only `--dry-run` does anything: it
-    /// measures a push — per category, file count, raw bytes, and the bytes
-    /// that would really upload — without performing one. Without the flag the
-    /// command refuses; it never half-executes.
+    /// Re-checks that the repository is private before the first byte and again
+    /// before publishing, uploads the packs, verifies each one is retrievable,
+    /// and only then flips the snapshot pointer. An interruption before that
+    /// flip leaves the previous snapshot exactly as it was.
+    ///
+    /// With `--dry-run` it measures a push — per category, file count, raw
+    /// bytes, and the bytes that would really upload — and contacts no network.
     Push {
         /// Measure only. Prints what a push would send, uploads nothing, and
         /// contacts no network.
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Delete remote data no kept snapshot still references.
+    ///
+    /// A push prunes automatically; this runs the same pass on demand. Only
+    /// packs that no surviving snapshot names and that are more than a day old
+    /// are removed — the age floor is what keeps this from deleting a pack
+    /// another machine has uploaded but not yet published.
+    Prune,
+
+    /// Change the sync password.
+    ///
+    /// Rewraps the master key and republishes the keyfile; not one pack byte
+    /// moves. **This is not revocation.** The data keys do not change, so
+    /// anyone who already holds a copy of the old keyfile can still open it
+    /// with the old password, forever. It stops future readers of the
+    /// repository, not past ones.
+    Rekey,
 }
 
 #[derive(clap::Subcommand, Debug, Clone)]
@@ -442,7 +462,7 @@ fn is_stdout_tty() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::{Parser, error::ErrorKind};
+    use clap::{CommandFactory, Parser, error::ErrorKind};
 
     #[test]
     fn version_flags_report_the_crate_version() {
@@ -488,8 +508,7 @@ mod tests {
             })
         ));
 
-        // Bare `push` parses and is refused at runtime, rather than being a
-        // parse error: the refusal gets to say why and point at `--dry-run`.
+        // Bare `push` now performs a push; `--dry-run` measures one.
         let bare = Cli::parse_from(["ai-usagebar", "sync", "push"]);
         assert!(matches!(
             bare.command,
@@ -497,6 +516,36 @@ mod tests {
                 action: SyncAction::Push { dry_run: false }
             })
         ));
+
+        let prune = Cli::parse_from(["ai-usagebar", "sync", "prune"]);
+        assert!(matches!(
+            prune.command,
+            Some(Command::Sync {
+                action: SyncAction::Prune
+            })
+        ));
+
+        let rekey = Cli::parse_from(["ai-usagebar", "sync", "rekey"]);
+        assert!(matches!(
+            rekey.command,
+            Some(Command::Sync {
+                action: SyncAction::Rekey
+            })
+        ));
+    }
+
+    /// The password-change help must say what it is not, because "changed the
+    /// password" reads as revocation and is not.
+    #[test]
+    fn the_rekey_help_states_that_a_password_change_is_not_revocation() {
+        let help = Cli::command()
+            .find_subcommand("sync")
+            .and_then(|sync| sync.clone().find_subcommand("rekey").cloned())
+            .expect("`sync rekey` must exist")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("not revocation"), "{help}");
+        assert!(help.contains("old password"), "{help}");
     }
 
     #[test]
