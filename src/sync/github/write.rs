@@ -205,16 +205,27 @@ impl Client {
         let resp = req.send().await.map_err(|e| http::from_transport(&e))?;
         let status = resp.status();
         let headers = resp.headers().clone();
-        // An oversized body is *not* retryable: re-issuing the request produces
-        // the same oversized body. `Unexpected` carries the real status so the
-        // message says what actually answered.
-        let body =
-            read_body_capped(resp, cap as usize)
-                .await
-                .map_err(|e| GithubError::Unexpected {
+        // Two different failures live here and must not share an answer.
+        //
+        // An oversized body is **not** retryable: re-issuing the request
+        // produces the same oversized body, so `Unexpected` carries the real
+        // status and the message says what actually answered.
+        //
+        // A connection that drops **while the body is being read** is a
+        // transport failure and *is* retryable — and it is the ordinary one on
+        // a large push. Collapsing both into `Unexpected` aborted a real
+        // 880 MiB upload at asset 15 of 20 with "HTTP 200: … check
+        // githubstatus", telling the user to wait out an outage that was not
+        // happening, when one retry would have carried it.
+        let body = read_body_capped(resp, cap as usize)
+            .await
+            .map_err(|e| match e {
+                AppError::Transport(message) => GithubError::Transport { message },
+                other => GithubError::Unexpected {
                     status: status.as_u16(),
-                    message: e.to_string(),
-                })?;
+                    message: other.to_string(),
+                },
+            })?;
         Ok((status, headers, body))
     }
 
@@ -920,6 +931,37 @@ mod tests {
         );
         // One attempt: retrying cannot make commits appear.
         post.assert_async().await;
+    }
+
+    /// A connection that drops mid-body is retried; an oversized body is not.
+    ///
+    /// Both used to arrive as `Unexpected`, which `is_retryable` never retries.
+    /// A real 880 MiB push died at asset 15 of 20 on a dropped response body
+    /// and told the user to check GitHub's status page — the one failure here
+    /// that a single retry fixes.
+    #[test]
+    fn a_dropped_body_is_transport_and_an_oversized_one_is_not() {
+        // The mapping `send_capped` applies, exercised at the seam that decides
+        // it: the classification, not the socket.
+        let dropped = AppError::Transport("error decoding response body".into());
+        let oversized = AppError::Schema("response body exceeds the 1024-byte limit".into());
+
+        let as_github = |e: AppError| match e {
+            AppError::Transport(message) => GithubError::Transport { message },
+            other => GithubError::Unexpected {
+                status: 200,
+                message: other.to_string(),
+            },
+        };
+
+        assert!(
+            http::is_retryable(&as_github(dropped)),
+            "a dropped connection is the one failure a retry fixes"
+        );
+        assert!(
+            !http::is_retryable(&as_github(oversized)),
+            "re-issuing the request produces the same oversized body"
+        );
     }
 
     // ---- list_assets ------------------------------------------------------
