@@ -30,6 +30,28 @@ pub fn sanitize_untrusted_field(value: &str) -> String {
         .collect()
 }
 
+/// One line of untrusted text on its way to a terminal or a log.
+///
+/// [`sanitize_untrusted_field`] keeps newlines, which is right for a multi-line
+/// diagnostic in a UI cell and wrong for anything that shares a line-oriented
+/// stream with a report the user is reading: one embedded newline forges a
+/// report line. Collapsing them is what `sync::restore::report` has always
+/// done; this is that rule, shared rather than restated.
+pub fn sanitize_untrusted_line(value: &str) -> String {
+    sanitize_untrusted_field(value).replace('\n', " ")
+}
+
+/// A filesystem path on its way to the same place.
+///
+/// Every component of a restore destination comes from a manifest a hostile
+/// remote wrote, and [`std::path::Display`](std::path::Display) escapes
+/// nothing. This is what [`crate::error::AppError::Io`] renders its path
+/// through, so an attacker-chosen path cannot carry a terminal escape out of
+/// *any* error site rather than only the ones that remembered.
+pub fn sanitize_untrusted_path(path: &std::path::Path) -> String {
+    sanitize_untrusted_line(&path.to_string_lossy())
+}
+
 fn is_bidi_control(ch: char) -> bool {
     matches!(
         ch,
