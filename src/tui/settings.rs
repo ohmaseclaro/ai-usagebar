@@ -528,6 +528,8 @@ pub fn save_to_path(state: &SettingsState, path: &Path) -> Result<()> {
         update_key(&mut doc, kv.section, input)?;
     }
 
+    update_sync_categories(&mut doc, state)?;
+
     let bytes = doc.to_string();
     crate::cache::atomic_write(path, bytes.as_bytes())?;
 
@@ -559,6 +561,42 @@ fn update_key(doc: &mut DocumentMut, section: &str, input: &KeyInput) -> Result<
     }
     set_string(doc, section, "api_key", &input.buf)?;
     set_bool(doc, section, "enabled", true)
+}
+
+/// Write `[sync] categories` from the overlay's rows.
+///
+/// Untouched rows write nothing: opening Settings to paste one API key must
+/// not also commit the user to a sync selection they never made, and a missing
+/// key means "the default" while an empty array means "nothing" — two
+/// different statements (T-6-22). An empty selection is therefore written
+/// explicitly and never elided.
+///
+/// The labels come from [`SyncCategory::label`], the same spelling the config
+/// parser reads, so there is one place the token is spelled.
+fn update_sync_categories(doc: &mut DocumentMut, state: &SettingsState) -> Result<()> {
+    if !state.sync_dirty {
+        return Ok(());
+    }
+    let mut array = toml_edit::Array::new();
+    for (cat, _) in state.sync_categories.iter().filter(|(_, on)| *on) {
+        array.push(cat.label());
+    }
+
+    let table = doc
+        .entry("sync")
+        .or_insert_with(toml_edit::table)
+        .as_table_mut()
+        .ok_or_else(|| AppError::Other("config.toml: [sync] is not a table".into()))?;
+
+    if let Some(item) = table.get_mut("categories")
+        && let Some(v) = item.as_value_mut()
+    {
+        *v = toml_edit::Value::Array(array);
+        v.decor_mut().set_prefix(" ");
+        return Ok(());
+    }
+    table.insert("categories", value(array));
+    Ok(())
 }
 
 /// Set or update a string field in a TOML section, preserving comments and
