@@ -35,7 +35,7 @@ use crate::sync::github::gate;
 use crate::sync::github::write::{ASSET_STATE_UPLOADED, Asset};
 
 use super::progress::Progress;
-use super::{BuiltPack, PushCtx, pack_asset_name};
+use super::{BuiltPack, PushCtx, keyfile_asset_name, pack_asset_name};
 
 /// One outstanding upload: the pack's position in the pending list — which is
 /// what progress reports — and the future doing the work.
@@ -725,6 +725,114 @@ mod tests {
             .await
             .expect_err("altered bytes must fail the run, so the caller never flips");
         assert!(err.to_string().contains("does not read back"), "{err}");
+    }
+
+    // ---- the keyfile asset, without which no second machine can bootstrap --
+
+    impl Local {
+        /// Write a cheap keyfile where `cli::keyfile_path` looks for it, and
+        /// return its canonical bytes and the asset name they address.
+        fn seed_keyfile(&self) -> (Vec<u8>, String) {
+            let (keyfile, _) =
+                Keyfile::create_with_floor(b"a-test-passphrase", CHEAP, CHEAP.m_kib).unwrap();
+            let path = crate::sync::cli::keyfile_path(&self.roots);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            // Pretty-printed, exactly as `setup::write_keyfile` writes it — the
+            // asset name addresses the *canonical* form, and a function that
+            // hashed the file as it sits would publish a name for bytes it did
+            // not upload.
+            std::fs::write(&path, serde_json::to_vec_pretty(&keyfile).unwrap()).unwrap();
+            let canonical = serde_json::to_vec(&keyfile).unwrap();
+            let name = keyfile_asset_name(&content_address(&canonical));
+            (canonical, name)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_first_push_uploads_the_keyfile_the_pointer_will_name() {
+        let mut server = mockito::Server::new_async().await;
+        let _list = mock_listing(&mut server, "[]".into()).await;
+        let local = Local::at(&server.url());
+        let (canonical, name) = local.seed_keyfile();
+
+        let upload = server
+            .mock("POST", "/repos/o/n/releases/9/assets")
+            .match_query(Matcher::UrlEncoded("name".into(), name.clone()))
+            // The bytes are the keyfile's own, unaltered: nothing here
+            // re-wraps, re-derives or re-encrypts.
+            .match_body(Matcher::from(canonical.clone()))
+            .with_status(201)
+            .with_body(asset_json(60, &name, canonical.len(), ASSET_STATE_UPLOADED))
+            .expect(1)
+            .create_async()
+            .await;
+
+        ensure_keyfile(&local.ctx(), RELEASE, &permit())
+            .await
+            .unwrap();
+        upload.assert_async().await;
+    }
+
+    /// Idempotent by content address, which is what makes it safe to call on
+    /// every push rather than only the first.
+    #[tokio::test]
+    async fn a_keyfile_already_present_and_uploaded_is_not_uploaded_again() {
+        let mut server = mockito::Server::new_async().await;
+        let local = Local::at(&server.url());
+        let (canonical, name) = local.seed_keyfile();
+        let _list = mock_listing(
+            &mut server,
+            format!(
+                "[{}]",
+                asset_json(60, &name, canonical.len(), ASSET_STATE_UPLOADED)
+            ),
+        )
+        .await;
+        let upload = server
+            .mock("POST", "/repos/o/n/releases/9/assets")
+            .expect(0)
+            .create_async()
+            .await;
+
+        ensure_keyfile(&local.ctx(), RELEASE, &permit())
+            .await
+            .unwrap();
+        upload.assert_async().await;
+    }
+
+    /// The same zombie the pack scan deletes: GitHub creates the asset record
+    /// before the body finishes, and a torn keyfile would otherwise hold the
+    /// name forever — leaving the pointer naming an unreadable asset.
+    #[tokio::test]
+    async fn a_torn_keyfile_asset_is_deleted_before_it_is_uploaded_again() {
+        let mut server = mockito::Server::new_async().await;
+        let local = Local::at(&server.url());
+        let (canonical, name) = local.seed_keyfile();
+        let _list = mock_listing(
+            &mut server,
+            format!("[{}]", asset_json(60, &name, canonical.len(), "starter")),
+        )
+        .await;
+        let delete = server
+            .mock("DELETE", "/repos/o/n/releases/assets/60")
+            .with_status(204)
+            .expect(1)
+            .create_async()
+            .await;
+        let upload = server
+            .mock("POST", "/repos/o/n/releases/9/assets")
+            .match_query(Matcher::UrlEncoded("name".into(), name.clone()))
+            .with_status(201)
+            .with_body(asset_json(61, &name, canonical.len(), ASSET_STATE_UPLOADED))
+            .expect(1)
+            .create_async()
+            .await;
+
+        ensure_keyfile(&local.ctx(), RELEASE, &permit())
+            .await
+            .unwrap();
+        delete.assert_async().await;
+        upload.assert_async().await;
     }
 
     /// D7: a 401 retried is a slower failure. `with_retry`'s own arms are
