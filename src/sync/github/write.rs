@@ -602,6 +602,10 @@ impl Client {
     /// every malformed request as a conflict.
     ///
     /// Returns the new blob `sha`, which the caller keeps for its next flip.
+    // Eight, and every one of them is load-bearing: three name the object, one
+    // is the precondition the whole design turns on, one is the capability, one
+    // is the clock. A struct wrapper here would be a struct with one call site.
+    #[allow(clippy::too_many_arguments)]
     pub async fn put_contents(
         &self,
         repo: &RepoRef,

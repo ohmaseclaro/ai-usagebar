@@ -476,6 +476,7 @@ mod tests {
             transcript_days: 30,
             transcript_max_bytes: 0,
             repo: None,
+            ..SyncConfig::default()
         }
     }
 

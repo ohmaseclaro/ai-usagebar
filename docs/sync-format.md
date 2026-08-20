@@ -331,15 +331,24 @@ that are already public ciphertext: it means a pack substituted on the remote
 cannot keep the name it is served under. Two-level fanout keeps any single
 listing far below GitHub's 3,000-entry directory width.
 
-**Sizes**: a writer aims for `PACK_TARGET` = 32 MiB and is sealed before a blob
-would carry it past `PACK_MAX` = 48 MiB. The 32 MiB is CAL-1's *unmeasured*
-fallback — see §7. A restore fetches a whole pack either way, so this bounds
-wasted bytes, not correctness.
+**Sizes**: `pack::should_seal` compares against **`PACK_MAX` = 48 MiB** and
+never reads `PACK_TARGET`. So packs fill to 48 MiB, and **`PACK_TARGET` = 32 MiB
+is advisory** — it names the size CAL-1's *unmeasured* fallback aims at (see §7)
+and governs nothing in the sealing decision. A restore fetches a whole pack
+either way, so this bounds wasted bytes, not correctness.
+
+The distinction is not pedantry. Somebody will one day raise a pack size
+constant, and the ceiling below is a function of **`PACK_MAX`**, not of the
+target; a document naming the wrong one sends them to the wrong guard.
 
 A pack header is itself a single sealed chunk, so it is bounded at 256 KiB of
-JSON, some thousands of entries. A 32 MiB pack of 256 KiB chunks holds about
-128, so this is slack rather than a limit; unlike the manifest and the index, it
-has never been near its ceiling.
+JSON, some thousands of entries. A 48 MiB pack of 256 KiB chunks holds about
+192, so this is slack rather than a limit; unlike the manifest and the index, it
+has never been near its ceiling. **Raising `PACK_MAX` raises the entry count with
+it and this ceiling must be re-checked at the same time** — it is the one place
+the gap-closure that made manifests and index objects multi-chunk deliberately
+did not reach. The upgrade path, if it is ever needed, is a format-2 multi-chunk
+header through the same `chunk::seal_all` / `reassemble` pair the manifest uses.
 
 **Packs are immutable once sealed.** A chunk already inside a pack is never
 re-packed; only an explicit prune-repack rewrites one. That immutability is what
@@ -791,3 +800,203 @@ Three consequences a caller must respect:
   Advancing on a *claim* rather than on a verified snapshot means a forged high
   counter locks the user out of their own real bundle — a denial of service
   built out of the very mechanism meant to protect them.
+
+---
+
+## 10. Remote layout
+
+Everything above describes objects. This describes where they live on a GitHub
+remote, and it is written so that someone holding only this page can implement a
+reader.
+
+### One release, one fixed tag
+
+Every bulk object is a **release asset** on a single release, tagged
+`ai-usagebar-sync-v1`, created on first push and never recreated. It is a
+*published* release, not a draft: a draft has no git tag until it is published,
+so `GET /repos/{owner}/{repo}/releases/tags/ai-usagebar-sync-v1` cannot find it,
+and a resume scan could not locate its own crashed predecessor. Atomicity does
+not come from draft state — it comes from the pointer flip below.
+
+Release assets rather than git objects, because deleting an asset actually
+removes the bytes. A git object survives in history, which would make "change
+the sync password" a comforting lie rather than a real control.
+
+### Two asset-name shapes, both content addresses
+
+```
+pack-<64 hex>.bin        content_address(pack bytes)      — a pack file, §4
+keyfile-<64 hex>.json    content_address(keyfile JSON)    — the wrapped master key, §2
+```
+
+Both names are the **unkeyed** BLAKE3 hash of the object's own bytes, rendered as
+64 lowercase hex characters. That is the same address §4 gives a pack on a
+filesystem store; only the shape differs, because a release asset name cannot
+contain a path separator, so the two-level `packs/ab/<hex>.pack` fanout collapses
+to a flat prefix. Both address the same bytes.
+
+Content addressing is what makes two questions exact rather than heuristic:
+
+- *Is this pack already uploaded?* Its name **is** its content, so a changed pack
+  gets a different name. No local record of a previous run is needed, which is
+  what makes a resumed push cheap.
+- *Can a rewrapped keyfile coexist with the one it replaces?* Yes, for the
+  instant between the upload and the delete, because the new bytes have a new
+  name. A fixed name would mean overwriting the only copy of the wrapped master
+  key.
+
+An asset whose name matches neither shape is **never** touched by this format. It
+may be a future version's object or something a user attached by hand.
+
+### The pointer, and the one compare-and-swap
+
+```
+sync/pointer.json        via the Contents API, not as a release asset
+```
+
+The pointer is an ordinary file in the repository, written through
+`PUT /repos/{owner}/{repo}/contents/sync/pointer.json` with the `sha` of the blob
+the writer expects to replace. **That `sha` precondition is the format's single
+linearization point.** A first push omits the `sha` field entirely — which means
+"create, and fail if it exists" — rather than sending it as null; those are
+different requests. GitHub answers a stale `sha` with `409`, and a `PUT` that
+omitted `sha` against a path that already exists with `422`; a reader-writer must
+treat both as the same conflict and re-read before retrying.
+
+Publishing a snapshot is therefore exactly one operation. Packs are immutable and
+referenced by nothing until the pointer names them, so an interrupted push leaves
+the previous snapshot exactly as it was — every uploaded pack is inert garbage,
+collected later.
+
+### The pointer's JSON
+
+```json
+{
+  "format": 1,
+  "repo_id": "github:123456789",
+  "keyfile": "keyfile-<64 hex>.json",
+  "snapshots": [
+    {
+      "root": "<base64 of the sealed snapshot root, §5>",
+      "index_chunks": [
+        {
+          "id":       "<64 hex>",
+          "pack":     "<64 hex>",
+          "offset":   0,
+          "clen":     4112,
+          "true_len": 4096
+        }
+      ],
+      "packs": ["<64 hex>", "…"]
+    }
+  ]
+}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `format` | `u32` | Pointer version. Readers accept at-or-below their ceiling and refuse only what is greater, exactly as §6 requires of every other object. **Probe this field before deserializing the rest** — a newer pointer may carry required fields an older build has never heard of, and a full deserialize would complain about a missing field instead of about the version. |
+| `repo_id` | string | `github:` followed by the repository's **numeric** id. A reader compares it against the identifier it holds locally and refuses a mismatch. It is a numeric id and not `owner/name` because names are transferable and re-registrable; the number is not. |
+| `keyfile` | string | The asset name of the keyfile a reader must fetch to derive any key at all. |
+| `snapshots` | array | **Oldest first, newest last**, at most `[sync] keep_snapshots` long (10 by default). A push appends its record at the end and truncates from the front. |
+| `snapshots[].root` | base64 | The sealed snapshot root of §5, framed exactly as `Root::seal` produces it. Opening it requires `root_key` **and** the reader's own `repo_id` as associated data. |
+| `snapshots[].index_chunks` | array | Where the **index object's own chunks** live — the bootstrap. See below. |
+| `snapshots[].packs` | array of 64-hex | **Every** pack this snapshot needs, reused ones included. |
+
+`packs` listing reused packs, not just new ones, is what makes garbage collection
+computable from the pointer alone: the live set is the union of `packs` over the
+surviving records, with no download and no key.
+
+### The bootstrap chain a reader walks
+
+```
+sync/pointer.json
+  → keyfile asset (pointer.keyfile)      → unwrap the master key with the password (§1, §2)
+  → newest sealed root (snapshots[*].root, selected by the counter *inside* each root)
+  → index_chunks                          → the index object's own chunks, by pack and offset
+  → the index object                      → every other chunk's (pack, offset, clen, true_len)
+  → root.manifest_chunks                  → the manifest, through the index object
+  → manifest.files[*].chunks              → the data chunks, through the index object
+```
+
+The one link that could not be inferred is `index_chunks`. The index object maps
+a chunk id to the pack and offset it lives at — but nothing describes itself, so
+the index object's *own* chunks are not in it. Without those five fields in the
+clear, a reader holding the pointer can locate nothing at all.
+
+Select the newest snapshot by the `counter` **inside** each opened root, never by
+position in the array. Position is attacker-controlled; the counter is inside the
+authenticated plaintext.
+
+Manifest paths are stored as a **root-prefixed relative** encoding — the name of
+the collection root (`config`, `desktop-data`, `desktop-profiles`,
+`claude-home`), then the path beneath it. Never an absolute path: an absolute
+path is unresolvable on a second machine, leaks the pushing user's username to
+anyone who obtains the repository, and is precisely what a restore's traversal
+defence must reject.
+
+### Why the container is plaintext, and what an attacker can do with it
+
+The pointer is **not** encrypted, and that is a deliberate choice with a
+specific, bounded consequence.
+
+The reason it is safe: it introduces **no new kind of object sealed under
+`chunk_key`**. Every element of value inside it is already sealed — the root under
+`root_key`, with the reader's own `repo_id` bound as associated data — so the
+container is a list of ciphertexts and content addresses, all of which anyone
+holding the repository can already see.
+
+What an attacker who can edit it *can* do:
+
+- **Drop entries.** That is a rollback, and it is caught by the local monotonic
+  anchor (§9), which refuses a counter below the high-water mark this machine has
+  already seen.
+- **Reorder the list.** Inert. A reader selects by the `counter` inside each
+  sealed root, not by array position.
+- **Truncate it to nothing.** A denial of service, not a disclosure, and
+  indistinguishable from deleting the file — which anyone with write access could
+  do anyway.
+
+What he *cannot* do:
+
+- **Add a fabricated snapshot.** The `root` is sealed; a forged one fails its
+  Poly1305 tag.
+- **Substitute another bundle's snapshot.** The root binds `repo_id` as
+  associated data, so a root from a different bundle fails the tag before
+  anything is parsed.
+- **Learn anything new.** `counter` and `created_at` are deliberately *not*
+  carried in the clear here even though they exist inside each root: they would
+  be redundant leakage. A reader opens at most `keep_snapshots` small roots to
+  find the newest, and garbage collection needs neither.
+
+Accepting this is also what keeps §6's deferred AAD object-type separator
+untriggered. **If a later version wants to seal this container, that is the
+trigger for the separator**, and it has to be raised deliberately rather than
+done quietly.
+
+### Garbage collection
+
+After a successful flip — and only after — a pusher may delete pack assets that
+no surviving snapshot references. Two rules, and **neither is sufficient alone**:
+
+1. The deletion set is computed against the pointer that **landed**, which is
+   whatever the remote returned from the compare-and-swap, never the one the
+   pusher built. If another machine won the race, the landed pointer is *its*
+   pointer and its packs are consequently live.
+2. **No asset younger than 24 hours is deleted, whatever the pointer says.** Rule
+   1 says nothing about a machine that has uploaded a pack and has not flipped
+   yet: that pack is referenced by no snapshot, the naive rule deletes it, and the
+   other machine then publishes a snapshot naming data that is gone. The age floor
+   is the only thing standing between garbage collection and another machine's
+   in-flight push. The cost is that genuine garbage lingers a day; the alternative
+   is an unrestorable backup.
+
+The snapshot **record** is always removed before any pack: the record disappears
+in the flip itself, which is strictly before the first `DELETE` is issued. The
+reverse order can leave a live snapshot pointing at a deleted pack, and there is
+no undo — the bytes are gone from a release asset, which is exactly the property
+release assets were chosen for.
+
+The keyfile asset named by `pointer.keyfile` is referenced by no snapshot's
+`packs` and is never a deletion candidate. Deleting it makes the entire bundle
+permanently unreadable.
