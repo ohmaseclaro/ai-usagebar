@@ -24,7 +24,7 @@
 //! to signed storage — was scheduled in Phase 1 and again in Phase 3 plan 3-06,
 //! and was **not run**. So `PACK_TARGET` stands at 32 MiB and a restore fetches
 //! each pack it needs in full. `download_asset` caps at 64 MiB, comfortably
-//! above [`PACK_MAX`], so no streaming verb and no `reqwest` `stream` feature is
+//! above [`PACK_ASSET_MAX`], so no streaming verb and no `reqwest` `stream` feature is
 //! needed either.
 //!
 //! Naming the optimisation so a future measurement has somewhere to land: if
@@ -49,7 +49,7 @@ use crate::sync::crypto::{ChunkId, Keyfile};
 use crate::sync::github::write::{ASSET_STATE_UPLOADED, MAX_ASSET_BYTES};
 use crate::sync::github::{Client, RepoRef};
 use crate::sync::model::{IndexObject, Manifest, Root};
-use crate::sync::pack::PACK_MAX;
+use crate::sync::pack::PACK_ASSET_MAX;
 use crate::sync::push::{self, RELEASE_TAG, SnapshotRecord};
 
 use super::{PackSource, Resolved, RestoreCtx};
@@ -109,10 +109,10 @@ const MAX_PACKS_PER_RESTORE: usize = 512;
 /// Bytes one restore will download — a bound on **transfer**.
 ///
 /// [`MAX_PACKS_PER_RESTORE`] does not give this one either: 512 packs at
-/// [`PACK_MAX`] would be 24 GiB. Derived as 256 full packs, which is where the
+/// [`PACK_ASSET_MAX`] would be 24 GiB. Derived as 256 full packs, which is where the
 /// two ceilings cross; whichever binds first, binds, and each refusal names the
 /// number a user who legitimately outgrows it has to raise.
-const MAX_RESTORE_BYTES: u64 = 256 * PACK_MAX as u64;
+const MAX_RESTORE_BYTES: u64 = 256 * PACK_ASSET_MAX as u64;
 
 /// A sealed root is one chunk plus framing; base64 inflates by 4/3. Bounded
 /// before the decode allocates.
@@ -469,10 +469,10 @@ async fn fetch_packs(
         }
         let name = push::pack_asset_name(id);
         let size = assets.get(&name).map_or(0, |asset| asset.size);
-        if size > PACK_MAX as u64 {
+        if size > PACK_ASSET_MAX as u64 {
             return Err(AppError::Other(format!(
                 "the pack asset {name:?} is declared as {size} bytes, larger than the \
-                 {PACK_MAX} a pack can be — refusing it"
+                 {PACK_ASSET_MAX} a pack can be — refusing it"
             )));
         }
         round_bytes = round_bytes.saturating_add(size);

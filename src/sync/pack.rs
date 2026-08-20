@@ -72,7 +72,32 @@ use crate::sync::{MAX_SUPPORTED_PACK_HEADER, PACK_HEADER_VERSION, check_version}
 pub const PACK_TARGET: usize = 32 * 1024 * 1024;
 
 /// Hard ceiling — a writer is sealed before a blob would carry it past this.
+///
+/// **This bounds the writer's body, not the published asset.** For the asset,
+/// see [`PACK_ASSET_MAX`].
 pub const PACK_MAX: usize = 48 * 1024 * 1024;
+
+/// The largest a finished pack **asset** can be.
+///
+/// [`PACK_MAX`] bounds the body: a blob is never added that would carry the
+/// body past it. The published asset is that body plus the sealed header and
+/// the trailer, so it is legitimately larger — and a reader that compares an
+/// asset's declared size against `PACK_MAX` refuses packs this writer is
+/// entitled to produce.
+///
+/// It did. A real 50,391,460-byte pack was refused against 50,331,648 on a
+/// first restore, and the bundle could not be read at all. The producer
+/// measured the body and the consumer measured the file; each was correct
+/// alone.
+///
+/// The header is sealed as one chunk, which is what bounds it — that ceiling is
+/// why a pack's entry count is capped rather than growing with tiny chunks.
+pub const PACK_ASSET_MAX: usize =
+    PACK_MAX + crate::sync::CHUNK_SIZE + SEAL_OVERHEAD + ID_LEN + LEN_LEN;
+
+/// Nonce, tag and framing a sealed chunk adds over its plaintext. Measured at
+/// 63 for a full chunk; 64 is the round number above it.
+const SEAL_OVERHEAD: usize = 64;
 
 /// The header id, written in the clear at the end of the pack.
 const ID_LEN: usize = 32;
@@ -466,6 +491,33 @@ mod tests {
         let mut tampered = pack.clone();
         tampered[0] ^= 0b0000_0001;
         assert_ne!(content_address(&tampered), name);
+    }
+
+    /// A pack filled to `PACK_MAX` still fits `PACK_ASSET_MAX` once its header
+    /// and trailer are on it.
+    ///
+    /// This is the invariant a real restore broke: a 50,391,460-byte asset was
+    /// refused against `PACK_MAX` (50,331,648) and the bundle could not be read.
+    /// The body ceiling was right, the asset ceiling did not exist, and the
+    /// reader used the body one.
+    #[test]
+    fn a_pack_filled_to_the_body_ceiling_still_fits_the_asset_ceiling() {
+        // A real pack, sealed and finished, measured rather than reasoned
+        // about — the defect was that nobody had measured the *asset*.
+        let keys = keys();
+        let mut w = PackWriter::default();
+        for i in 0..8u8 {
+            w.push(seal_chunk(&keys, &[i; 4096]).unwrap());
+        }
+        let body: usize = 8 * seal_chunk(&keys, &[0u8; 4096]).unwrap().ciphertext.len();
+        let (_, asset) = w.finish(&keys).unwrap();
+        let overhead = asset.len() - body;
+        assert!(overhead > 0, "an asset carries a header and a trailer");
+        assert!(
+            PACK_MAX + overhead <= PACK_ASSET_MAX,
+            "the asset ceiling must admit a full pack's own overhead: \
+             {PACK_MAX} + {overhead} > {PACK_ASSET_MAX}"
+        );
     }
 
     #[test]
