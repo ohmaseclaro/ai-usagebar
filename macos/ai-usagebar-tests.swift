@@ -766,6 +766,127 @@ func testSyncStatus() {
                 "unknown is surfaced, not silently rendered as up-to-date")
 }
 
+
+// ─── 6-02: the two sync actions, and what they may not become ─────────────
+//
+// The dangerous property here is negative — that a menu click cannot reach an
+// irreversible write more easily than the CLI does — so most of these are
+// assertions that something is *absent*. The forbidden spellings are built from
+// fragments so an assertion can never be satisfied by its own source text, and
+// the last two read the app file itself, because "no call site does X" is not a
+// thing a harness that cannot click a menu can otherwise check.
+func testSyncActions() {
+    print("sync actions")
+    let bin = "/opt/homebrew/bin/ai-usagebar"
+
+    assertEqual(syncCommand(.push), ["sync", "push"], "push names the push subcommand")
+    assertEqual(syncCommand(.pull), ["sync", "pull"], "pull names the pull subcommand")
+    assertEqual(syncCommandLine(binary: bin, .push), "'\(bin)' sync push",
+                "the command line is the binary and the subcommand, nothing else")
+
+    // A path with a quote in it cannot break out of the generated script.
+    assertEqual(syncCommandLine(binary: "/tmp/it's here/ai-usagebar", .pull),
+                "'/tmp/it'\\''s here/ai-usagebar' sync pull",
+                "a quote in the path is escaped, not passed through")
+
+    // The script really does run the command — without this the absence
+    // assertions below would pass against an empty string.
+    let pushScript = syncTerminalScript(binary: bin, .push)
+    assertEqual(pushScript.contains("'\(bin)' sync push"), true, "the script runs the command")
+    assertEqual(pushScript.hasPrefix("#!/usr/bin/env bash\n"), true, "…as a bash script")
+    assertEqual(pushScript.contains("fechar"), true, "…and holds the window open to be read")
+
+    // ── the four spellings that turn a report into a write, and the ones
+    //    that would carry a secret. None may appear in anything a click makes.
+    let d = "-"
+    let forbidden = [d + d + "apply", d + d + "yes", d + d + "force",
+                     d + d + "force" + d + "credentials", " " + d + "y",
+                     d + d + "password", d + d + "password" + d + "file",
+                     d + d + "passphrase", d + d + "non" + d + "interactive"]
+    for action in SyncAction.allCases {
+        let produced = syncCommandLine(binary: bin, action)
+            + "\n" + syncTerminalScript(binary: bin, action)
+            + "\n" + syncCommand(action).joined(separator: " ")
+        for needle in forbidden {
+            assertEqual(produced.contains(needle), false,
+                        "no menu-produced command carries \(needle)")
+        }
+    }
+
+    // ── what the confirmations say ───────────────────────────────────────
+    let push = syncPrompt(.push)
+    assertEqual(push.body.contains("não se desfaz"), true,
+                "push states that a publication is irreversible")
+    assertEqual(push.body.contains("senha do sync"), true,
+                "…and that the password is asked for in the terminal, not here")
+    let pull = syncPrompt(.pull)
+    assertEqual(pull.body.contains("nada é escrito"), true,
+                "pull states that the bare command writes nothing")
+    assertEqual(pull.body.contains("--apply"), true,
+                "…and names the flag that would, so it is the user who types it")
+    for prompt in [push, pull] {
+        assertEqual(prompt.title.isEmpty, false, "every prompt has a title")
+        assertEqual(prompt.go.isEmpty, false, "…and a labelled confirm button")
+    }
+
+    // ── the category rows: 6-01 parsed these and rendered none of them ───
+    assertEqual(syncCategoryRows(nil), [], "no status, no rows")
+
+    var status = SyncStatus()
+    status.categories = [
+        SyncCategoryLine(category: "config", enabled: true, files: 2, bytes: 4096),
+        SyncCategoryLine(category: "credentials", enabled: true, files: 1, bytes: 700),
+        SyncCategoryLine(category: "routines", enabled: true, files: 0, bytes: 0),
+        SyncCategoryLine(category: "transcripts", enabled: false, files: 0, bytes: 0),
+        SyncCategoryLine(category: "<b>novidade</b>", enabled: true, files: 3, bytes: 0),
+    ]
+    let rows = syncCategoryRows(status)
+    assertEqual(rows.count, 5, "one row per category the binary sent")
+    assertEqual(rows[0].hasPrefix("Configuração: 2 arquivos ("), true, "count and size")
+    assertEqual(rows[1].hasPrefix("Credenciais: 1 arquivo ("), true, "one file is singular")
+    assertEqual(rows[2], "Rotinas: vazio", "an enabled but empty category says so")
+    assertEqual(rows[3], "Transcrições: desativado",
+                "a category that is off is shown as off, never omitted")
+    // The label crossed a process boundary, so it is stripped like every other
+    // binary-supplied string that reaches an NSMenuItem.
+    assertEqual(rows[4].contains("<b>"), false, "an unknown label is stripped, not rendered")
+    assertEqual(rows[4].hasPrefix("novidade: 3 arquivos"), true, "…and still shown")
+
+    // ── the structural guard ─────────────────────────────────────────────
+    //
+    // `syncCommand` produces an argument vector, and the one thing that must
+    // never happen to it is reaching a `Process`. A menu bar that runs `sync
+    // push` in the background has no terminal for the password and no way to
+    // answer `sync pull`'s two gates, so it could only get through by adding
+    // the flags asserted absent above. Checked at the source level because a UI
+    // closure is not reachable from this harness.
+    let appSource = (try? String(contentsOfFile: menubarSourcePath(), encoding: .utf8)) ?? ""
+    assertEqual(appSource.contains("func syncCommand("), true,
+                "the app source was found and read")
+
+    let lines = appSource.split(separator: "\n", omittingEmptySubsequences: false)
+    let argLines = lines.filter { $0.contains("p.arguments =") }
+    assertEqual(argLines.count >= 3, true, "…and its Process call sites were located")
+    let syncArgLines = argLines.filter { $0.contains("\"sync\"") }
+    // Exactly one, so this is an assertion rather than an empty loop.
+    assertEqual(syncArgLines.count, 1, "the app builds exactly one sync argument vector")
+    assertEqual(syncArgLines.first?.contains("\"status\""), true,
+                "…and it is the read-only one")
+    let piped = lines.filter {
+        $0.contains("syncCommand(") && ($0.contains("arguments") || $0.contains("Process"))
+    }
+    assertEqual(piped.count, 0, "syncCommand never reaches a Process argument vector")
+    let handed = lines.filter { $0.contains("syncTerminalScript(") && !$0.contains("///") }
+    assertEqual(handed.contains { $0.contains("runInTerminal(") }, true,
+                "the script is handed to Terminal.app, which is the whole point")
+}
+
+/// The app file beside this one. `#filePath` is absolute because run-tests.sh
+/// compiles both by absolute path, so the harness finds it from any cwd.
+private func menubarSourcePath(_ here: String = #filePath) -> String {
+    (here as NSString).deletingLastPathComponent + "/ai-usagebar-menubar.swift"
+}
+
 @main
 struct TestRunner {
     static func main() {
@@ -782,6 +903,7 @@ struct TestRunner {
         testOverviewProviderToggle()
         testAccountStatus()
         testSyncStatus()
+        testSyncActions()
         testSystemIntegrations()
         if failures > 0 {
             print("\n\(failures) test(s) FAILED")
