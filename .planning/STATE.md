@@ -2,18 +2,18 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-current_phase: 1
-current_phase_name: encrypted-bundle-core
+current_phase: 4
+current_phase_name: push
 status: executing
 stopped_at: Milestone artifacts written (PROJECT, REQUIREMENTS, ROADMAP, STATE, research×3 +
 last_updated: "2026-08-19T16:50:50.537Z"
 last_activity: 2026-08-19
-last_activity_desc: Phase 1 execution started
+last_activity_desc: Phase 4 wave 2 executing (4-02/4-03/4-04/4-06)
 progress:
   total_phases: 6
-  completed_phases: 0
-  total_plans: 15
-  completed_plans: 0
+  completed_phases: 3
+  total_plans: 44
+  completed_plans: 27
 ---
 
 # Project State
@@ -29,13 +29,13 @@ usage as another's.
 
 ## Current Position
 
-Phase: 1 (encrypted-bundle-core) — CODE COMPLETE, gate green; formal completion awaits 2 live UATs
-Plan: 11 of 11 (9 planned + 2 security remediations)
-Status: Phase 1 done pending user UAT; Phase 2 starting
+Phase: 4 (push) — 4-01 merged; wave 2 in flight
+Plan: 1 of 7 merged in phase 4
+Status: phases 1-3 code-complete + audited; phase 4 executing
 Last activity: 2026-08-19 — Phase 1 execution started
 and reconciled, REQUIREMENTS.md (37 v1) and ROADMAP.md (6 phases) written
 
-Progress: [█░░░░░░░░░] ~17% (1 of 6 phases)
+Progress: [██████░░░░] ~58% (3 of 6 phases, phase 4 in flight)
 
 ## Performance Metrics
 
@@ -173,3 +173,29 @@ wave *describe* behaviour that another plan in the same wave *decides*? Docs, er
 This is the sixth instance in the milestone of a statement outrunning its implementation, and the
 first caused by concurrency rather than by sequence. Phases 4–6 run docs plans alongside
 behaviour plans (`4-07`, `6-05`), so the same shape can recur there.
+
+## Phase 4 — the keyfile gap, found by the tracer and not by planning
+
+`4-01` grepped all seven Phase 4 plans and found that **none of them uploads the keyfile asset
+on a first push**. `Pointer.keyfile` is set from the local keyfile's content address, but only
+`rekey` ever called `upload_asset` for one — so a first push published a pointer naming an asset
+that does not exist, and Phase 5 could not bootstrap on a second machine. That is the milestone's
+stated purpose, and it would have failed at the last step.
+
+Assigned to `4-03` as `upload::ensure_keyfile`, idempotent by content address, called by both the
+first-push path and `4-06`'s rekey. One function, two callers — rather than the rekey-only path
+the plans described.
+
+**The class, again:** seven plans each correct in isolation, with the defect in the gap between
+them. This is the seventh instance in the milestone of a statement outrunning its implementation.
+No file-overlap check finds it; only reading the plans against the goal does.
+
+## Phase 4 — a guard that passed on a real violation
+
+`4-01`'s first REPO-03 guard split each file at `#[cfg(test)]` to scan only production code. That
+marker also appears **inside a doc comment** in `pairing.rs`, truncating that file's scanned region
+to its first 76 lines — an injected `.post(` below it passed cleanly. The rewrite assembles needles
+at runtime (`format!(".{verb}(")`), which removes the reason to skip any region at all.
+
+A guard that cannot fail its own negative control is decoration. Both halves now have hand-run
+negative controls.
