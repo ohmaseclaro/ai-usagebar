@@ -144,6 +144,22 @@ pub enum Disposition {
     /// them the session. macOS only: [`crate::safe_storage`]'s key store is the
     /// macOS login Keychain and no other platform has the question to ask.
     ForeignSafeStorage,
+    /// A [`crate::sync::keystore`] store this machine already holds a
+    /// **different** live credential in.
+    ///
+    /// Silently replacing the Claude login this tool exists to report on is the
+    /// worst outcome this whole feature has, so it is never the default. The one
+    /// consent that promotes it is `--force-credentials`; `--force` alone does
+    /// not, exactly as for a locally-newer `.credentials.json`.
+    ///
+    /// It carries no timestamps and cannot: a Keychain item has no mtime this
+    /// side can compare, so "is the local one newer?" has no answer here and is
+    /// not pretended to. The question asked instead is the one that can be
+    /// answered — *is it the same credential?* — by hashing what the store holds
+    /// with the same [`Keys::chunk_id`] the push side used. Identical is
+    /// [`Disposition::SkipIdentical`] and needs no consent at all, so a repeated
+    /// pull onto the machine that pushed is silent.
+    ReplacesLiveCredential,
 }
 
 impl Disposition {
@@ -532,19 +548,36 @@ mod tests {
     }
 
     fn push_one_file(pusher: &SyncRoots, rel: &str, body: &[u8]) -> Bundle {
-        let (keyfile, keys) =
-            Keyfile::create_with_floor(PASSWORD.as_bytes(), CHEAP, CHEAP.m_kib).unwrap();
-        let keyfile_bytes = serde_json::to_vec(&keyfile).unwrap();
-        let keyfile_name = keyfile_asset_name(&content_address(&keyfile_bytes));
+        push_bundle(pusher, |keys| {
+            let path = pusher.config_dir.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, body).unwrap();
+            file_plan_for(keys, path, body)
+        })
+    }
 
-        let path = pusher.config_dir.join(rel);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, body).unwrap();
+    /// The same push, but of Claude Code's login in the **machine-bound store**
+    /// rather than of a file — which on macOS is where the credential actually
+    /// is. See [`crate::sync::keystore`].
+    fn push_login(pusher: &SyncRoots, value: &str) -> Bundle {
+        push_bundle(pusher, |keys| {
+            pusher
+                .stores
+                .edit()
+                .set(crate::sync::keystore::Store::ClaudeCodeOauth, value);
+            file_plan_for(
+                keys,
+                PathBuf::from(crate::sync::keystore::Store::ClaudeCodeOauth.manifest_path()),
+                value.as_bytes(),
+            )
+        })
+    }
 
+    fn file_plan_for(keys: &Keys, path: PathBuf, body: &[u8]) -> FilePlan {
         let chunk_ids: Vec<[u8; 32]> = chunk::split(body)
             .map(|block| *keys.chunk_id(block).as_bytes())
             .collect();
-        let file_plan = FilePlan {
+        FilePlan {
             path,
             sealed_chunks: chunk::sealed_chunk_count(body.len() as u64),
             new_chunk_ids: chunk_ids.clone(),
@@ -552,13 +585,26 @@ mod tests {
             new_bytes: body.len() as u64,
             new_stored_bytes: body.len() as u64,
             reused: false,
-        };
+        }
+    }
+
+    /// One real push of one planned item, through the push side's own packer —
+    /// so the pair is exercised rather than a hand-rolled remote that could
+    /// agree with a broken reader.
+    fn push_bundle(pusher: &SyncRoots, plan_one: impl FnOnce(&Keys) -> FilePlan) -> Bundle {
+        let (keyfile, keys) =
+            Keyfile::create_with_floor(PASSWORD.as_bytes(), CHEAP, CHEAP.m_kib).unwrap();
+        let keyfile_bytes = serde_json::to_vec(&keyfile).unwrap();
+        let keyfile_name = keyfile_asset_name(&content_address(&keyfile_bytes));
+
+        let file_plan = plan_one(&keys);
+        let body_len = file_plan.new_bytes;
         let plan = SyncPlan {
             categories: Vec::new(),
             new_chunk_ids: file_plan.new_chunk_ids.clone(),
-            total_raw_bytes: body.len() as u64,
-            total_new_bytes: body.len() as u64,
-            total_new_stored_bytes: body.len() as u64,
+            total_raw_bytes: body_len,
+            total_new_bytes: body_len,
+            total_new_stored_bytes: body_len,
             files_opened: 1,
             append_check_miss_bytes: 0,
             index_rebuilt: false,
@@ -760,6 +806,80 @@ mod tests {
             !restorer.anchor_path.exists(),
             "a dry run advanced the anchor"
         );
+    }
+
+    /// **Two Macs, and the credential that was missing from the bundle entirely.**
+    ///
+    /// Claude Code on macOS keeps its OAuth credential in the login Keychain,
+    /// not in `~/.claude/.credentials.json`, so the collectors found no file and
+    /// the `credentials` category restored to nothing usable. Here the whole
+    /// chain runs — alice's store is read into a real push, served, and restored
+    /// onto bob's — and the login arrives byte for byte.
+    ///
+    /// Both machines' stores are injected fixtures; no real login Keychain is
+    /// within reach of this test. See [`crate::sync::keystore`].
+    #[tokio::test]
+    async fn a_keychain_login_pushed_on_one_mac_arrives_byte_for_byte_on_the_other() {
+        use crate::sync::keystore::Store;
+
+        let push_dir = TempDir::new().unwrap();
+        let login = r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-fixture","refreshToken":"sk-ant-ort01-fixture"}}"#;
+        let bundle = push_login(&roots_at(push_dir.path(), "alice"), login);
+
+        let mut server = mockito::Server::new_async().await;
+        serve(&mut server, &bundle).await;
+
+        let client = client_at(&server.url());
+        let restorer = Restorer::new(TempDir::new().unwrap());
+        assert!(
+            restorer
+                .roots
+                .stores
+                .read(Store::ClaudeCodeOauth)
+                .unwrap()
+                .is_none(),
+            "the second Mac starts with no Claude login, which is the premise"
+        );
+
+        let outcome = run(restorer.ctx(
+            &client,
+            RestoreOptions {
+                apply: true,
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("the chain resolves");
+
+        assert_eq!(outcome.written, 1);
+        assert!(outcome.failed_at.is_none());
+        assert_eq!(
+            outcome.plan.items[0].manifest_path,
+            "keystore/claude-code-oauth"
+        );
+        assert_eq!(
+            restorer
+                .roots
+                .stores
+                .read(Store::ClaudeCodeOauth)
+                .unwrap()
+                .map(|v| v.to_string())
+                .as_deref(),
+            Some(login),
+            "the login did not survive the round trip"
+        );
+
+        // **And not a byte of it landed on the disk.** A synthetic manifest
+        // entry that resolved to a file would be a live OAuth token written in
+        // plaintext under the user's home directory.
+        for path in files_under(restorer.roots.config_dir.parent().unwrap()) {
+            let body = fs::read(&path).unwrap_or_default();
+            assert!(
+                !String::from_utf8_lossy(&body).contains("sk-ant-oat01-fixture"),
+                "the credential was written to {}",
+                path.display()
+            );
+        }
     }
 
     /// The tracer, second half: the same bundle, applied.

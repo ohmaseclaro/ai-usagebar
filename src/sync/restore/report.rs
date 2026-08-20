@@ -645,6 +645,12 @@ fn facing(disposition: &Disposition) -> Facing {
             flag: None,
             replaces_existing: false,
         },
+        Disposition::ReplacesLiveCredential => Facing {
+            kind: Kind::Attention,
+            verb: "NEEDS YOUR CONFIRMATION — this machine already has a different login here,                    and it is not archived by the pre-restore backup",
+            flag: Some("--force-credentials"),
+            replaces_existing: false,
+        },
         Disposition::ForeignSafeStorage => Facing {
             kind: Kind::Refusal,
             verb: "REFUSED — this Claude Desktop session is locked to the Mac that saved it \
@@ -676,7 +682,10 @@ fn mtimes(disposition: &Disposition) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
         | Disposition::SkipIdentical
         | Disposition::ExcludedByPolicy
         | Disposition::RejectedPath(_)
-        | Disposition::ForeignSafeStorage => None,
+        | Disposition::ForeignSafeStorage
+        // A store has no mtime on either side; `decide_store` compares digests
+        // instead of pretending otherwise.
+        | Disposition::ReplacesLiveCredential => None,
     }
 }
 
