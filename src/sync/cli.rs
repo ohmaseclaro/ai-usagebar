@@ -76,12 +76,26 @@ pub fn run_with(
     match action {
         SyncAction::Status => status(cfg, roots, endpoints, chain, now),
         SyncAction::Setup => setup(cfg, roots, endpoints, chain, now),
-        SyncAction::Push { dry_run: true, .. } => dry_run(cfg, roots, now),
+        SyncAction::Push {
+            dry_run: true,
+            rebuild_index,
+            force_rehash,
+            ..
+        } => dry_run(cfg, roots, now, recovery(*rebuild_index, *force_rehash)),
         SyncAction::Push {
             dry_run: false,
             allow_rollback,
-            ..
-        } => push(cfg, roots, endpoints, chain, *allow_rollback, now),
+            rebuild_index,
+            force_rehash,
+        } => push(
+            cfg,
+            roots,
+            endpoints,
+            chain,
+            *allow_rollback,
+            recovery(*rebuild_index, *force_rehash),
+            now,
+        ),
         SyncAction::Prune => prune(cfg, roots, endpoints, chain, now),
         SyncAction::Rekey => rekey(cfg, roots, endpoints, chain, now),
         SyncAction::Pull {
@@ -274,8 +288,11 @@ async fn repo_section(
     section
 }
 
-fn dry_run(config: &Config, roots: &SyncRoots, now: DateTime<Utc>) -> i32 {
-    let index = open_index(roots);
+fn dry_run(config: &Config, roots: &SyncRoots, now: DateTime<Utc>, recovery: Recovery) -> i32 {
+    if let Err(why) = maybe_reset_index(roots, recovery.rebuild) {
+        return refuse(&why);
+    }
+    let index = open_index(roots).map(|index| rehashing(index, recovery.rehash));
     let (plan, no_key) = try_plan(roots, config, index.as_ref(), now);
     let report = DryRunReport {
         status: report::build_status(roots, &config.sync, index.as_ref(), now, plan, None),
@@ -569,14 +586,20 @@ fn push(
     endpoints: &Endpoints,
     chain: &TokenChain,
     allow_rollback: bool,
+    recovery: Recovery,
     now: DateTime<Utc>,
 ) -> i32 {
-    let parts = match resolve(cfg, roots, endpoints, chain) {
+    if let Err(why) = maybe_reset_index(roots, recovery.rebuild) {
+        return refuse(&why);
+    }
+    let mut parts = match resolve(cfg, roots, endpoints, chain) {
         Ok(parts) => parts,
         Err(why) => return refuse(&why),
     };
+    parts.index = rehashing(parts.index, recovery.rehash);
+    let parts = &parts;
     match local_keyfile(&keyfile_path(roots)) {
-        Ok(keyfile) => push_with_parts(cfg, roots, &parts, &keyfile, allow_rollback, now),
+        Ok(keyfile) => push_with_parts(cfg, roots, parts, &keyfile, allow_rollback, now),
         Err(why) => refuse(&why),
     }
 }
@@ -722,9 +745,80 @@ fn rekey(
 // ---- the inbound command ---------------------------------------------------
 
 /// Where a pull talks, and whether it may ask.
+///
+/// **`gate` is `Some` only when stdin is a terminal**, and that is this
+/// command's deliberate answer to a real collision. A pull reads the sync
+/// password off stdin, and both of plan 5-06's confirmations read from stdin
+/// too. Over a *pipe* there is one stream and no way to tell the two apart, so
+/// whichever reads second eats the other's line. The password wins that
+/// stream — it is the one input that cannot be supplied any other way, since
+/// Phase 1's rule keeps it out of argv and out of the environment — and a piped
+/// run therefore answers with `--apply`, `--yes` and `--force-credentials`
+/// rather than with typed words. Over a *terminal* the two reads are
+/// sequential, nothing is consumed twice, and both confirmations are offered
+/// normally.
 struct PullIo<'a> {
     out: &'a mut dyn std::io::Write,
     gate: Option<&'a mut dyn std::io::BufRead>,
+}
+
+/// The sync password for a restore.
+///
+/// **The keyfile a pull opens comes off the remote, not off this disk.** A
+/// second machine has none — that is the whole point of a restore — so unlike
+/// [`local_keyfile`] there is no local file to read here, and [`keyfile_path`]
+/// is not consulted at all. Only the password that unwraps the *published*
+/// wrapper is needed, and it arrives the same way it always has: stdin only,
+/// never argv, never an environment variable (T-5-66).
+fn sync_password(interactive: bool) -> std::result::Result<zeroize::Zeroizing<String>, String> {
+    if interactive {
+        eprintln!(
+            "The sync password for this bundle. It is echoed — this build has no \
+             hidden-input dependency."
+        );
+    }
+    let pw = passphrase::read_line(std::io::stdin().lock()).map_err(|e| e.to_string())?;
+    // Without this an unattended run with stdin on /dev/null would spend a
+    // gibibyte and a second and a half hashing the empty string first.
+    if pw.is_empty() {
+        return Err("no sync password arrived on stdin".into());
+    }
+    Ok(pw)
+}
+
+/// `--rebuild-index` / `--force-rehash`, carried as one value because two
+/// commands offer them and two implementations would be two sets of semantics.
+///
+/// Both live on `sync push`, where they change what the planner does, and
+/// `--rebuild-index` is offered on `sync pull` as well: a user reaches for it
+/// after losing a machine, and after a machine loss the command they are
+/// running is `pull`. Neither can lose data — the worst either does is make one
+/// run slow.
+#[derive(Debug, Clone, Copy, Default)]
+struct Recovery {
+    rebuild: bool,
+    rehash: bool,
+}
+
+const fn recovery(rebuild: bool, rehash: bool) -> Recovery {
+    Recovery { rebuild, rehash }
+}
+
+/// `--rebuild-index`, applied before anything opens the database.
+fn maybe_reset_index(roots: &SyncRoots, rebuild: bool) -> std::result::Result<(), String> {
+    if !rebuild {
+        return Ok(());
+    }
+    index::reset_at(&roots.index_file)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// `--force-rehash`, applied where the handle is made — every planner that
+/// takes this index then re-reads every file, and none of them had to remember
+/// to thread a flag through.
+fn rehashing(index: Index, rehash: bool) -> Index {
+    if rehash { index.rehashing() } else { index }
 }
 
 /// `~/.claude-acc/backups` — the account switcher's own archive directory, so a
@@ -741,6 +835,11 @@ fn backups_dir(roots: &SyncRoots) -> PathBuf {
         .join("backups")
 }
 
+/// `ai-usagebar sync pull` — the command a second machine types.
+///
+/// **Every refusal that does not need a password comes first**, exactly as the
+/// push arm orders them: an unconfigured or unpaired machine is told so before
+/// it is asked for a password it would then discard.
 fn pull(
     cfg: &Config,
     roots: &SyncRoots,
@@ -749,20 +848,175 @@ fn pull(
     opts: RestoreOptions,
     now: DateTime<Utc>,
 ) -> i32 {
-    let _ = (cfg, roots, endpoints, chain, opts, now);
-    0
+    // Before `resolve` opens the index, never after.
+    if let Err(why) = maybe_reset_index(roots, opts.rebuild_index) {
+        return refuse(&why);
+    }
+    let parts = match resolve(cfg, roots, endpoints, chain) {
+        Ok(parts) => parts,
+        Err(why) => return refuse(&why),
+    };
+    // One read of the terminal, used for both the password and the gates, so
+    // the two can never disagree about which stream they are sharing.
+    let interactive = std::io::stdin().is_terminal();
+    let pw = match sync_password(interactive) {
+        Ok(pw) => pw,
+        Err(why) => return refuse(&why),
+    };
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    if interactive {
+        let stdin = std::io::stdin();
+        let mut gate = stdin.lock();
+        let mut io = PullIo {
+            out: &mut out,
+            gate: Some(&mut gate),
+        };
+        pull_with_parts(roots, &parts, &pw, opts, &mut io, now)
+    } else {
+        let mut io = PullIo {
+            out: &mut out,
+            gate: None,
+        };
+        pull_with_parts(roots, &parts, &pw, opts, &mut io, now)
+    }
 }
 
+/// The tested seam: no terminal, no password prompt, everything injected.
+///
+/// **The order below is the phase's safety property, not a style.**
+///
+/// 1. plan, always, with `apply` off — including under `--apply`, because the
+///    report is what both gates and the summary are built from, and a dry run
+///    fetches no file content at all (5-02).
+/// 2. the one apply gate (D6), which renders the plan itself.
+/// 3. the credential gate (D2), **before** `backup::take` and before the first
+///    byte, so a user who stops here has cost the machine nothing at all — no
+///    archive, no writes (T-5-60, T-5-61).
+/// 4. `restore::run` with `apply` set, which takes the backup and writes in the
+///    order `restore/mod.rs` froze.
+///
+/// Exit codes: 0 for a completed dry run, a declined apply gate, or a completed
+/// apply; 1 for every error, one message to stderr. A declined *apply* gate is
+/// a choice the tool honoured; a declined *credential* gate stopped a restore
+/// the user had already asked for, and is reported as the failure it is.
 fn pull_with_parts(
     roots: &SyncRoots,
     parts: &Resolved,
     passphrase: &zeroize::Zeroizing<String>,
-    opts: RestoreOptions,
+    mut opts: RestoreOptions,
     io: &mut PullIo<'_>,
     now: DateTime<Utc>,
 ) -> i32 {
-    let _ = (roots, parts, passphrase, opts, io, now);
-    0
+    let rt = match runtime() {
+        Ok(rt) => rt,
+        Err(why) => return refuse(&why),
+    };
+    // 4-08 wired the rollback anchor onto the push path and named the file.
+    // Restore reads and advances the **same** one, through the same helper —
+    // a second implementation is how a defence ends up with two copies that
+    // disagree, which is the finding that put the anchor on the path at all.
+    let anchor_path = push::anchor_path(roots, &parts.repo);
+    let backups_dir = backups_dir(roots);
+    let ctx = |opts| restore::RestoreCtx {
+        client: &parts.client,
+        repo: &parts.repo,
+        roots,
+        repo_id: &parts.repo_id,
+        passphrase,
+        anchor_path: &anchor_path,
+        backups_dir: &backups_dir,
+        opts,
+        now,
+    };
+
+    // 1.
+    let plan = match rt.block_on(restore::run(ctx(RestoreOptions {
+        apply: false,
+        ..opts
+    }))) {
+        Ok(outcome) => outcome.plan,
+        Err(e) => return refuse(&e.to_string()),
+    };
+
+    // 2. `confirm_apply` writes the whole report before it asks, so the plan is
+    //    rendered exactly once on every path through here — printing it and
+    //    then calling the gate would show it twice.
+    if !opts.apply {
+        let Some(gate) = io.gate.as_deref_mut() else {
+            // A dry run is a *success*: it did exactly what it was asked, and
+            // the footer names `--apply` (`report::APPLY_COMMAND`).
+            return match write!(io.out, "{}", restore::report::render_plan(&plan)) {
+                Ok(()) => 0,
+                Err(e) => refuse(&e.to_string()),
+            };
+        };
+        match restore::report::confirm_apply(&plan, &opts, io.out, gate) {
+            Ok(true) => {}
+            Ok(false) => return 0,
+            Err(e) => return refuse(&e.to_string()),
+        }
+    } else if let Err(e) = write!(io.out, "{}", restore::report::render_plan(&plan)) {
+        return refuse(&e.to_string());
+    }
+
+    // 3.
+    let credentials: Vec<&restore::ItemPlan> = plan
+        .items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.disposition,
+                restore::Disposition::NeedsCredentialConfirm { .. }
+            )
+        })
+        .collect();
+    if !credentials.is_empty() {
+        // Piped, stdin belongs to the password (see `PullIo`); an unattended
+        // run answers with `--force-credentials`, which the gate reads itself.
+        let mut unanswerable = std::io::empty();
+        let answered = match io.gate.as_deref_mut() {
+            Some(gate) => restore::report::confirm_credentials(&credentials, &opts, io.out, gate),
+            None => {
+                restore::report::confirm_credentials(&credentials, &opts, io.out, &mut unanswerable)
+            }
+        };
+        match answered {
+            // Set the option and re-plan below, rather than editing the
+            // dispositions in hand: a hand-set disposition and its recorded
+            // reason drift apart, and re-planning is one more pass over data
+            // that has already been downloaded.
+            Ok(true) => opts.force_credentials = true,
+            Ok(false) => {
+                let named: Vec<String> = credentials
+                    .iter()
+                    .map(|item| {
+                        crate::display::sanitize_untrusted_field(&item.manifest_path).to_string()
+                    })
+                    .collect();
+                return refuse(&format!(
+                    "the restore stopped at the credential confirmation. Nothing was written \
+                     and no backup was taken.\n\
+                     \x20           left alone: {}\n\
+                     \x20           Re-run with `--force --force-credentials` to replace them.",
+                    named.join(", ")
+                ));
+            }
+            Err(e) => return refuse(&e.to_string()),
+        }
+    }
+
+    // 4.
+    opts.apply = true;
+    let outcome = match rt.block_on(restore::run(ctx(opts))) {
+        Ok(outcome) => outcome,
+        Err(e) => return refuse(&e.to_string()),
+    };
+    if let Err(e) = write!(io.out, "{}", restore::report::render_outcome(&outcome)) {
+        return refuse(&e.to_string());
+    }
+    // A partial restore is reported, not rolled back — and it is not a success.
+    i32::from(outcome.failed_at.is_some())
 }
 
 /// One non-zero exit, one message, and nothing else: no token, no prefix of one,
@@ -1915,6 +2169,12 @@ mod tests {
     fn paired(dir: &Path) -> SyncRoots {
         let roots = roots_in(dir);
         fs::create_dir_all(&roots.config_dir).unwrap();
+        // A machine that has run `sync status` once already has one. In
+        // production it lives under `~/.cache`, outside every sync root;
+        // `SyncRoots::at` only lands it inside `config_dir` because the test
+        // seam derives it from there, so opening it here keeps the
+        // "wrote nothing" assertions about restored *data*.
+        Index::at(&roots.index_file).unwrap();
         pairing::write_to(
             &pairing::default_path(&roots),
             &pairing::Pairing {
@@ -2356,16 +2616,15 @@ mod tests {
         assert_eq!(code, 0, "…and accepted when the user says so");
     }
 
-    /// T-5-67: every failure is non-zero, with its own message, and none of
-    /// them puts a byte on disk.
+    /// T-5-67, one failure per test so each message is attributable: every one
+    /// is non-zero, distinct, and puts no byte on disk.
     #[test]
-    fn every_failure_exits_non_zero_with_its_own_message_and_writes_nothing() {
+    fn a_wrong_password_is_refused_and_writes_nothing() {
         let push_dir = TempDir::new().unwrap();
         let bundle = pushed(push_dir.path(), &[(CRED, b"{\"token\":\"fixture\"}")]);
-
-        // A wrong password.
         let mut server = mockito::Server::new();
         serve(&mut server, &bundle);
+
         let dir = TempDir::new().unwrap();
         let roots = paired(dir.path());
         let before = files_under(dir.path());
@@ -2381,47 +2640,65 @@ mod tests {
         );
         assert_ne!(code, 0);
         assert_eq!(files_under(dir.path()), before);
+    }
 
-        // No pointer at all — nothing has ever been pushed.
+    /// Nothing has ever been pushed: a refusal, not a crash and not a success.
+    #[test]
+    fn a_bundle_with_no_pointer_is_refused_and_writes_nothing() {
         let mut empty = mockito::Server::new();
         empty
             .mock("GET", "/repos/o/n/contents/sync/pointer.json")
             .with_status(404)
             .with_body(r#"{"message":"Not Found"}"#)
             .create();
+
         let dir = TempDir::new().unwrap();
         let roots = paired(dir.path());
+        let before = files_under(dir.path());
         let (code, _) = pull_at(&roots, &empty.url(), RestoreOptions::default(), None);
         assert_ne!(code, 0);
-        assert!(files_under(dir.path()).len() <= files_under(dir.path()).len());
+        assert_eq!(files_under(dir.path()), before);
+    }
 
-        // An unreachable remote.
+    /// A remote that refuses the read.
+    ///
+    /// **Not a dead port**, deliberately: a transport failure is retryable, so
+    /// `pointer::load` spends the production 60/120/240-second backoff before
+    /// giving up — seven minutes inside the AUR `check()`. That policy is
+    /// `github::write::with_retry`'s to test, and it has its own. A 403 is
+    /// returned immediately, which is what this arm is about.
+    #[test]
+    fn a_remote_that_refuses_the_read_is_refused_back_and_writes_nothing() {
+        let mut server = mockito::Server::new();
+        server
+            .mock("GET", "/repos/o/n/contents/sync/pointer.json")
+            .with_status(403)
+            .with_body(r#"{"message":"Forbidden"}"#)
+            .create();
+
         let dir = TempDir::new().unwrap();
         let roots = paired(dir.path());
         let before = files_under(dir.path());
-        let (code, _) = pull_at(
-            &roots,
-            "http://127.0.0.1:1",
-            RestoreOptions::default(),
-            None,
-        );
+        let (code, _) = pull_at(&roots, &server.url(), RestoreOptions::default(), None);
         assert_ne!(code, 0);
         assert_eq!(files_under(dir.path()), before);
+    }
 
-        // A tampered pack: one flipped byte in a bundle the push side really made.
-        let mut tampered = mockito::Server::new();
-        let mut broken = pushed(
-            &TempDir::new().unwrap().keep(),
-            &[(CRED, b"{\"token\":\"fixture\"}")],
-        );
+    /// One flipped byte in a bundle the push side really produced.
+    #[test]
+    fn a_tampered_pack_is_refused_and_writes_nothing() {
+        let push_dir = TempDir::new().unwrap();
+        let mut broken = pushed(push_dir.path(), &[(CRED, b"{\"token\":\"fixture\"}")]);
         broken.packs[0].1[64] ^= 0x01;
-        serve(&mut tampered, &broken);
+        let mut server = mockito::Server::new();
+        serve(&mut server, &broken);
+
         let dir = TempDir::new().unwrap();
         let roots = paired(dir.path());
         let before = files_under(dir.path());
         let (code, _) = pull_at(
             &roots,
-            &tampered.url(),
+            &server.url(),
             RestoreOptions {
                 apply: true,
                 ..RestoreOptions::default()
@@ -2535,5 +2812,124 @@ mod tests {
             roots.desktop_profiles_dir.parent(),
             "the same directory `claude_desktop::Paths` puts its rollbacks in"
         );
+    }
+
+    /// **The piped case, decided deliberately.** A pull reads the sync password
+    /// off stdin and both gates read from stdin too; over one pipe whichever
+    /// reads second eats the other's line. The password wins the stream, so a
+    /// piped run is never asked anything — it prints the plan, names `--apply`,
+    /// and stops. Nothing here consumes a second line that was never there.
+    #[test]
+    fn a_piped_run_is_never_asked_anything_so_the_password_keeps_the_pipe() {
+        let push_dir = TempDir::new().unwrap();
+        let bundle = pushed(push_dir.path(), &[(CRED, b"{\"token\":\"fixture\"}")]);
+        let mut server = mockito::Server::new();
+        serve(&mut server, &bundle);
+
+        let dir = TempDir::new().unwrap();
+        let roots = paired(dir.path());
+        let (code, out) = pull_at(&roots, &server.url(), RestoreOptions::default(), None);
+
+        assert_eq!(code, 0);
+        assert!(!out.contains("[y/N]"), "a piped run must not ask: {out}");
+        assert!(
+            !out.contains("Type the word"),
+            "nor reach the credential gate's reader: {out}"
+        );
+        assert!(out.contains(restore::report::APPLY_COMMAND), "{out}");
+        // …and the same run on a terminal is asked, so the assertion above is
+        // about the pipe rather than about the plan being empty.
+        let (_, asked) = pull_at(
+            &roots,
+            &server.url(),
+            RestoreOptions::default(),
+            Some("n\n"),
+        );
+        assert!(asked.contains("[y/N]"), "{asked}");
+    }
+
+    /// The plan is rendered **once**. `confirm_apply` writes the whole report
+    /// before it asks, so a caller that also printed it would show it twice.
+    #[test]
+    fn the_plan_is_printed_exactly_once_on_the_path_that_asks() {
+        let push_dir = TempDir::new().unwrap();
+        let bundle = pushed(push_dir.path(), &[(CRED, b"{\"token\":\"fixture\"}")]);
+        let mut server = mockito::Server::new();
+        serve(&mut server, &bundle);
+
+        let dir = TempDir::new().unwrap();
+        let roots = paired(dir.path());
+        let (_, out) = pull_at(
+            &roots,
+            &server.url(),
+            RestoreOptions::default(),
+            Some("n\n"),
+        );
+        assert_eq!(out.matches("DRY RUN").count(), 1, "{out}");
+    }
+
+    /// The two push-side recovery flags reach the arm and do what they say:
+    /// the index is discarded and the run re-reads every file. A flag nothing
+    /// reads is this milestone's most repeated defect, so this is the call-site
+    /// guard for both of them.
+    #[test]
+    fn the_index_recovery_flags_reach_the_push_arm_and_empty_the_index() {
+        let dir = TempDir::new().unwrap();
+        let (roots, keyfile) = seeded(&dir);
+        let cfg = cfg_with_repo(Some("o/n"));
+
+        // Warm it: a row and a last-sync line, both of which a reset drops.
+        let index = Index::at(&roots.index_file).unwrap();
+        plan::build_with_keys(&roots, &cfg.sync, &index, NOW, &keyfile.keys).unwrap();
+        index.set_last_sync(NOW).unwrap();
+        assert!(Index::at(&roots.index_file).unwrap().last_sync().is_some());
+        drop(index);
+
+        assert_eq!(
+            dry_run(&cfg, &roots, NOW, recovery(true, true)),
+            0,
+            "`sync push --dry-run --rebuild-index --force-rehash`"
+        );
+        let after = Index::at(&roots.index_file).unwrap();
+        assert!(after.last_sync().is_none(), "--rebuild-index discarded it");
+        assert_eq!(
+            plan::build_with_keys(&roots, &cfg.sync, &after.rehashing(), NOW, &keyfile.keys)
+                .unwrap()
+                .files_opened,
+            plan::build_with_keys(
+                &roots,
+                &cfg.sync,
+                &Index::at(&dir.path().join("cold.sqlite3")).unwrap(),
+                NOW,
+                &keyfile.keys,
+            )
+            .unwrap()
+            .files_opened,
+            "--force-rehash reads what a cold index reads"
+        );
+    }
+
+    /// And the clap surface exists for both, on the command where they change
+    /// what the planner does.
+    #[test]
+    fn push_accepts_both_recovery_flags_together() {
+        use clap::Parser;
+        let cli = crate::widget::cli::Cli::parse_from([
+            "ai-usagebar",
+            "sync",
+            "push",
+            "--rebuild-index",
+            "--force-rehash",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Some(crate::widget::cli::Command::Sync {
+                action: SyncAction::Push {
+                    rebuild_index: true,
+                    force_rehash: true,
+                    ..
+                }
+            })
+        ));
     }
 }
