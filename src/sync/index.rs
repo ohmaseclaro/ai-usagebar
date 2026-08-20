@@ -7,12 +7,14 @@
 //! a false hit would silently omit a changed file from the snapshot, which is
 //! the one failure this module exists to prevent.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, params, params_from_iter};
 
 use crate::error::{AppError, Result};
+use crate::sync::crypto::ChunkId;
 use crate::sync::scope::FileEntry;
 
 /// Schema version this build writes and is the only one it reads. Unlike the
@@ -27,6 +29,13 @@ pub const SCHEMA_VERSION: i64 = 1;
 /// before its container authenticates needs its own bound. 32 MiB is a million
 /// ids, roughly a 256 GiB file: unreachable legitimately.
 const MAX_CHUNK_IDS_BYTES: i64 = 32 * 1024 * 1024;
+
+/// How many ids one `IN (…)` list carries.
+///
+/// SQLite's `SQLITE_MAX_VARIABLE_NUMBER` was 999 before 3.32 and is 32766 after,
+/// and this crate does not choose which SQLite a packager links. 900 is under
+/// both, so the query never depends on that.
+const SQL_BATCH: usize = 900;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS file (
@@ -58,6 +67,23 @@ pub struct FileRecord {
     pub sealed_chunks: u64,
     /// The file's chunk ids, in file order.
     pub chunk_ids: Vec<[u8; 32]>,
+}
+
+/// Where the local index believes one already-packed chunk lives.
+///
+/// The same five numbers a [`PackEntry`](crate::sync::pack::PackEntry) carries,
+/// which is the point: a chunk the last push packed can be named in the next
+/// snapshot's index object without re-reading, re-sealing or re-uploading it.
+///
+/// It is a **hint**, exactly as the rest of this module is. Every field arrives
+/// from an unauthenticated local database, so a caller must treat absence as the
+/// safe answer — and [`Index::chunk_locations`] guarantees that direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkLocation {
+    pub pack: ChunkId,
+    pub offset: u64,
+    pub clen: u32,
+    pub plen: u32,
 }
 
 /// `~/.cache/ai-usagebar/sync/index.sqlite3`, via the same resolver the vendor
@@ -295,6 +321,128 @@ impl Index {
         Ok(removed)
     }
 
+    // ---- the chunk table ----------------------------------------------
+    //
+    // The table has existed since plan 2-03 and had no writer until 4-02, which
+    // is why "already uploaded" could only ever be inferred from the `file`
+    // table: a chunk shared with a file that failed its append check was
+    // re-sealed and re-uploaded even though the bytes were already on the
+    // remote. These four accessors close that.
+
+    /// Record where a batch of chunks landed: `(chunk id, pack id, offset,
+    /// ciphertext length, plaintext length)`.
+    ///
+    /// One transaction for the whole batch, and the generation stamped inside
+    /// the same statement — a first push records thousands of rows, and a
+    /// transaction per row is the difference between a second and a minute.
+    ///
+    /// **Call it after the pack is finished**, never before: a pack's content
+    /// address does not exist until its header is sealed, so a row written
+    /// earlier names nothing.
+    pub fn record_chunks(&self, rows: &[(ChunkId, ChunkId, u64, u32, u32)]) -> Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let seen_gen = clamp_i64(self.generation());
+        let tx = self.conn.unchecked_transaction().map_err(|e| self.err(e))?;
+        let mut written = 0usize;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT OR REPLACE INTO chunk \
+                     (id, pack, \"offset\", clen, plen, seen_gen) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )
+                .map_err(|e| self.err(e))?;
+            for (id, pack, offset, clen, plen) in rows {
+                written += stmt
+                    .execute(params![
+                        id.as_bytes().as_slice(),
+                        pack.as_bytes().as_slice(),
+                        clamp_i64(*offset),
+                        *clen,
+                        *plen,
+                        seen_gen,
+                    ])
+                    .map_err(|e| self.err(e))?;
+            }
+        }
+        tx.commit().map_err(|e| self.err(e))?;
+        Ok(written)
+    }
+
+    /// Where the index believes each of `ids` lives, for the subset it knows.
+    ///
+    /// One query per [`SQL_BATCH`] ids rather than one per id, and it **fails
+    /// towards not-known**: a SQL error, a missing table, a blob that is not 32
+    /// bytes, a negative offset or length — every one of them yields absence.
+    /// The cost of absence is re-uploading bytes that are already there; the
+    /// cost of a wrong hit is a snapshot naming a pack that holds nothing, so
+    /// there is only one safe direction and this is it.
+    pub fn chunk_locations(&self, ids: &[ChunkId]) -> HashMap<ChunkId, ChunkLocation> {
+        let mut found = HashMap::new();
+        for batch in ids.chunks(SQL_BATCH) {
+            let sql = format!(
+                "SELECT id, pack, \"offset\", clen, plen FROM chunk WHERE id IN ({})",
+                vec!["?"; batch.len()].join(",")
+            );
+            let Ok(mut stmt) = self.conn.prepare(&sql) else {
+                return HashMap::new();
+            };
+            let rows = stmt.query_map(
+                params_from_iter(batch.iter().map(|id| id.as_bytes().as_slice())),
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            );
+            let Ok(rows) = rows else {
+                return HashMap::new();
+            };
+            for row in rows.flatten() {
+                if let Some((id, at)) = located(row) {
+                    found.insert(id, at);
+                }
+            }
+        }
+        found
+    }
+
+    /// The subset of `ids` this index has a location for — the membership-only
+    /// view of [`Index::chunk_locations`], for a caller that only needs to know
+    /// whether a chunk has to be sealed again.
+    pub fn known_chunks(&self, ids: &[ChunkId]) -> HashSet<ChunkId> {
+        self.chunk_locations(ids).into_keys().collect()
+    }
+
+    /// Drop every row naming one of `packs`, after those packs are actually gone
+    /// from the remote, so the index never claims a chunk lives somewhere it
+    /// does not.
+    ///
+    /// Deleting rows is safe by construction: the worst outcome is a re-upload.
+    pub fn forget_chunks(&self, packs: &[ChunkId]) -> Result<usize> {
+        let mut removed = 0usize;
+        for batch in packs.chunks(SQL_BATCH) {
+            let sql = format!(
+                "DELETE FROM chunk WHERE pack IN ({})",
+                vec!["?"; batch.len()].join(",")
+            );
+            removed += self
+                .conn
+                .execute(
+                    &sql,
+                    params_from_iter(batch.iter().map(|id| id.as_bytes().as_slice())),
+                )
+                .map_err(|e| self.err(e))?;
+        }
+        Ok(removed)
+    }
+
     fn meta<T: rusqlite::types::FromSql>(&self, key: &str) -> Option<T> {
         self.conn
             .query_row("SELECT v FROM meta WHERE k = ?1", [key], |row| row.get(0))
@@ -330,6 +478,26 @@ fn key_of(entry: &FileEntry) -> Option<(i64, i64, i64)> {
         i64::try_from(entry.size).ok()?,
         i64::try_from(entry.mtime_ns).ok()?,
         i64::try_from(entry.inode).ok()?,
+    ))
+}
+
+/// Decode one `chunk` row, or `None`.
+///
+/// Rejects rather than casts: a negative `offset`, `clen` or `plen` is a row no
+/// writer of ours produced, and `as u64` would turn it into an enormous
+/// plausible-looking number pointing into the middle of somebody's pack.
+fn located(row: (Vec<u8>, Vec<u8>, i64, i64, i64)) -> Option<(ChunkId, ChunkLocation)> {
+    let (id, pack, offset, clen, plen) = row;
+    let id: [u8; 32] = id.try_into().ok()?;
+    let pack: [u8; 32] = pack.try_into().ok()?;
+    Some((
+        ChunkId::from_bytes(id),
+        ChunkLocation {
+            pack: ChunkId::from_bytes(pack),
+            offset: u64::try_from(offset).ok()?,
+            clen: u32::try_from(clen).ok()?,
+            plen: u32::try_from(plen).ok()?,
+        },
     ))
 }
 
@@ -377,6 +545,12 @@ fn open_checked(path: &Path) -> Result<Connection> {
         "SELECT path, size, mtime_ns, inode, sealed_chunks, chunk_ids, seen_gen FROM file",
     )
     .map_err(|e| sql_err(path, e))?;
+    // The same probe for the chunk table. Its *reads* degrade to "nothing
+    // known" on their own, but `record_chunks` is a write in the middle of a
+    // push, where the answer can no longer be "discard the index" — so the
+    // shape is checked here, where it still can be.
+    conn.prepare("SELECT id, pack, \"offset\", clen, plen, seen_gen FROM chunk")
+        .map_err(|e| sql_err(path, e))?;
     conn.execute(
         "INSERT OR REPLACE INTO meta (k, v) VALUES ('schema_version', ?1)",
         [SCHEMA_VERSION],
@@ -719,7 +893,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let index = open(&dir);
         assert_eq!(
-            index.record_chunks(&[(cid(1), cid(9), 0, 4112, 4096)]).unwrap(),
+            index
+                .record_chunks(&[(cid(1), cid(9), 0, 4112, 4096)])
+                .unwrap(),
             1
         );
 
@@ -790,7 +966,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(index.forget_chunks(&[cid(9)]).unwrap(), 2);
-        assert_eq!(index.known_chunks(&[cid(1), cid(2), cid(3)]), [cid(3)].into());
+        assert_eq!(
+            index.known_chunks(&[cid(1), cid(2), cid(3)]),
+            [cid(3)].into()
+        );
     }
 
     /// The module's rule, applied to the new table: every malformed shape is
