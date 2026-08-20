@@ -523,6 +523,8 @@ mod tests {
             index_path: PathBuf::from("/nowhere/index.sqlite3"),
             plan,
             repo: None,
+            pending: None,
+            warnings: Vec::new(),
         }
     }
 
@@ -839,5 +841,240 @@ mod tests {
         assert_eq!(human_bytes(1024), "1.0 KiB");
         assert_eq!(human_bytes(4 * 1024 * 1024), "4.0 MiB");
         assert_eq!(human_bytes(2 * 1024 * 1024 * 1024), "2.0 GiB");
+    }
+
+    // ---- 6-01: the machine-readable rendering ----------------------------
+
+    /// Never the wall clock. `now` is only the transcripts bounds' reference
+    /// point, and a test that reads the clock is a test that can fail on a date
+    /// nobody chose.
+    fn fixed_now() -> DateTime<Utc> {
+        DateTime::from_timestamp(1_760_000_000, 0).unwrap()
+    }
+
+    /// Microseconds, not a gibibyte: the AUR `check()` runs this.
+    fn cheap_keys() -> crate::sync::crypto::Keys {
+        use crate::sync::crypto::{KdfParams, Keyfile};
+        let cheap = KdfParams {
+            m_kib: 8,
+            t: 1,
+            p: 1,
+        };
+        Keyfile::create_with_floor(b"a-test-passphrase", cheap, cheap.m_kib)
+            .unwrap()
+            .1
+    }
+
+    fn walk_strings(v: &serde_json::Value, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::String(s) => out.push(s.clone()),
+            serde_json::Value::Array(a) => a.iter().for_each(|x| walk_strings(x, out)),
+            serde_json::Value::Object(o) => o.values().for_each(|x| walk_strings(x, out)),
+            _ => {}
+        }
+    }
+
+    /// The key set 6-02 parses. Named once, here, because renaming one of these
+    /// after a menu bar has shipped against it is a compatibility break.
+    #[test]
+    fn status_json_carries_the_last_sync_the_pending_summary_and_one_line_per_category() {
+        let mut report = report_of(vec![a_line(SyncCategory::Config, 3, 2048)], None);
+        report.pending = Some(PendingSummary {
+            files: 3,
+            bytes: 4096,
+        });
+
+        let v = status_json(&report);
+        assert_eq!(v["last_sync"], "2026-08-19T12:00:00+00:00");
+        assert_eq!(v["index"], "/nowhere/index.sqlite3");
+        assert_eq!(v["total_files"], 3);
+        assert_eq!(v["total_bytes"], 2048);
+        assert_eq!(v["pending"], true);
+        assert_eq!(v["pending_files"], 3);
+        assert_eq!(v["pending_bytes"], 4096);
+        assert_eq!(v["warnings"], serde_json::json!([]));
+
+        let cats = v["categories"].as_array().unwrap();
+        assert_eq!(cats.len(), 1);
+        assert_eq!(cats[0]["category"], "config");
+        assert_eq!(cats[0]["enabled"], true);
+        assert_eq!(cats[0]["files"], 3);
+        assert_eq!(cats[0]["bytes"], 2048);
+        assert_eq!(cats[0]["capped"], false);
+    }
+
+    /// Every key on every run, so a consumer never has to tell "absent" from
+    /// "null" — and `last_sync` is JSON `null`, never the string "never": the
+    /// wording belongs to whoever draws the row.
+    #[test]
+    fn every_key_is_present_even_when_its_value_is_null() {
+        let mut report = report_of(Vec::new(), None);
+        report.last_sync = None;
+        report.index_path = PathBuf::new();
+
+        let v = status_json(&report);
+        for key in [
+            "last_sync",
+            "pending",
+            "pending_files",
+            "pending_bytes",
+            "categories",
+            "total_files",
+            "total_bytes",
+            "index",
+            "warnings",
+        ] {
+            assert!(v.get(key).is_some(), "missing {key}: {v}");
+        }
+        assert_eq!(v["last_sync"], serde_json::Value::Null);
+        assert_eq!(v["index"], serde_json::Value::Null);
+    }
+
+    /// An index that would not open is a warning the JSON consumer must see:
+    /// without it a machine that syncs hourly renders as "never synced".
+    #[test]
+    fn an_unavailable_index_yields_a_null_index_and_says_so_in_warnings() {
+        let dir = TempDir::new().unwrap();
+        let report = build_status(
+            &roots_at(&dir),
+            &SyncConfig::default(),
+            None,
+            fixed_now(),
+            None,
+            None,
+        );
+
+        let v = status_json(&report);
+        assert_eq!(v["index"], serde_json::Value::Null);
+        assert_eq!(v["last_sync"], serde_json::Value::Null);
+        assert_eq!(v["pending"], serde_json::Value::Null);
+        assert_eq!(v["warnings"], serde_json::json!([WARN_INDEX_UNAVAILABLE]));
+    }
+
+    #[test]
+    fn status_json_is_a_pure_function_of_the_report() {
+        let report = report_of(vec![a_line(SyncCategory::Config, 1, 10)], None);
+        assert_eq!(status_json(&report), status_json(&report));
+    }
+
+    /// D-04's three states. "Unknown" is not "nothing pending": a backup nobody
+    /// can tell is stale is exactly what surfacing this exists to prevent.
+    #[test]
+    fn pending_is_true_false_or_unknown_and_never_flattens_the_third() {
+        let mut report = report_of(vec![a_line(SyncCategory::Config, 3, 4096)], None);
+
+        report.pending = Some(PendingSummary {
+            files: 3,
+            bytes: 4096,
+        });
+        assert_eq!(status_json(&report)["pending"], true);
+
+        report.pending = Some(PendingSummary::default());
+        let v = status_json(&report);
+        assert_eq!(v["pending"], false);
+        assert_eq!(v["pending_files"], 0);
+        assert_eq!(v["pending_bytes"], 0);
+
+        report.pending = None;
+        let v = status_json(&report);
+        assert_eq!(v["pending"], serde_json::Value::Null);
+        assert_eq!(v["pending_files"], serde_json::Value::Null);
+        assert_eq!(v["pending_bytes"], serde_json::Value::Null);
+    }
+
+    /// T-6-01. This document promises counts, byte totals, category labels, an
+    /// index path and a fixed warning vocabulary — nothing else. Walk it and
+    /// fail on any other string, so a future field that carries a file's
+    /// contents has to break this test before it can ship.
+    #[test]
+    fn every_string_in_the_document_is_a_label_a_path_a_timestamp_or_a_known_warning() {
+        let dir = TempDir::new().unwrap();
+        seed(dir.path(), "config.toml", "a-secret-that-must-not-travel");
+        seed(dir.path(), "accounts/work/.credentials.json", "{}");
+        let index = Index::at(&dir.path().join("index.sqlite3")).unwrap();
+        let report = build_status(
+            &roots_at(&dir),
+            &SyncConfig::default(),
+            Some(&index),
+            fixed_now(),
+            None,
+            None,
+        );
+
+        let document = status_json(&report);
+        let rendered = document.to_string();
+        assert!(
+            !rendered.contains("a-secret-that-must-not-travel"),
+            "{rendered}"
+        );
+
+        let mut leaves = Vec::new();
+        walk_strings(&document, &mut leaves);
+        assert!(!leaves.is_empty(), "nothing was walked: {document}");
+        for leaf in leaves {
+            let known = SyncCategory::ALL.iter().any(|c| c.label() == leaf)
+                || WARNINGS.contains(&leaf.as_str())
+                || DateTime::parse_from_rfc3339(&leaf).is_ok()
+                || Path::new(&leaf).is_absolute();
+            assert!(known, "unexpected string in the JSON: {leaf:?}");
+        }
+    }
+
+    /// Where the first two pending states come from: the index either vouches
+    /// for a file or it does not.
+    #[test]
+    fn pending_counts_the_files_the_index_does_not_vouch_for() {
+        let dir = TempDir::new().unwrap();
+        seed(dir.path(), "config.toml", "[sync]\n");
+        seed(dir.path(), "accounts/work/.credentials.json", "{}");
+        let roots = roots_at(&dir);
+        let cfg = SyncConfig::default();
+        let index = Index::at(&dir.path().join("index.sqlite3")).unwrap();
+
+        let before = build_status(&roots, &cfg, Some(&index), fixed_now(), None, None);
+        let p = before
+            .pending
+            .expect("an opened index is never the unknown state");
+        assert_eq!((p.files, p.bytes), (2, 9));
+
+        // Record them exactly as the planner does; then nothing is pending —
+        // via the scan, and via a plan whose files were all short-circuited.
+        let keys = cheap_keys();
+        plan::build_with_keys(&roots, &cfg, &index, fixed_now(), &keys).unwrap();
+        let after = build_status(&roots, &cfg, Some(&index), fixed_now(), None, None);
+        assert_eq!(after.pending, Some(PendingSummary::default()));
+
+        let reused = plan::build_with_keys(&roots, &cfg, &index, fixed_now(), &keys).unwrap();
+        assert_eq!(reused.files_opened, 0);
+        let with_plan = build_status(&roots, &cfg, Some(&index), fixed_now(), Some(reused), None);
+        assert_eq!(with_plan.pending, Some(PendingSummary::default()));
+    }
+
+    /// `sync status` is advertised as costing a stat sweep. A file whose body
+    /// cannot be read at all is still counted, because nothing on this path
+    /// opens one — a status call that hashed a 50 MB transcript to draw a menu
+    /// row would break that promise silently.
+    #[cfg(unix)]
+    #[test]
+    fn the_pending_count_never_opens_a_file_body() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        seed(dir.path(), "config.toml", "[sync]\n");
+        let unreadable = dir.path().join("config.toml");
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let index = Index::at(&dir.path().join("index.sqlite3")).unwrap();
+        let report = build_status(
+            &roots_at(&dir),
+            &SyncConfig::default(),
+            Some(&index),
+            fixed_now(),
+            None,
+            None,
+        );
+        assert_eq!(report.pending.map(|p| p.files), Some(1));
+
+        // …and give it back a mode the TempDir can clean up.
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o600)).unwrap();
     }
 }

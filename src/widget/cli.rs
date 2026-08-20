@@ -572,7 +572,16 @@ mod tests {
         assert!(matches!(
             status.command,
             Some(Command::Sync {
-                action: SyncAction::Status
+                action: SyncAction::Status { json: false }
+            })
+        ));
+
+        // 6-01: opt-in, and only on this variant — the macOS menu bar's read.
+        let machine = Cli::parse_from(["ai-usagebar", "sync", "status", "--json"]);
+        assert!(matches!(
+            machine.command,
+            Some(Command::Sync {
+                action: SyncAction::Status { json: true }
             })
         ));
 
