@@ -101,6 +101,7 @@ pub struct Index {
     conn: Connection,
     path: PathBuf,
     rebuilt: bool,
+    rehash: bool,
 }
 
 impl Index {
@@ -126,6 +127,7 @@ impl Index {
                 conn,
                 path: path.to_path_buf(),
                 rebuilt: false,
+                rehash: false,
             }),
             Err(why) => {
                 // Path and reason only — the rows themselves are account UUIDs.
@@ -140,6 +142,7 @@ impl Index {
                     conn,
                     path: path.to_path_buf(),
                     rebuilt: true,
+                    rehash: false,
                 })
             }
         }
@@ -156,6 +159,26 @@ impl Index {
     /// guessing.
     pub fn was_rebuilt(&self) -> bool {
         self.rebuilt
+    }
+
+    /// `--force-rehash`: make every cached-record read miss for the life of this
+    /// handle, so the planner opens and hashes every file.
+    ///
+    /// **It suppresses reads and clears nothing.** Every row survives, and the
+    /// run rewrites them with what it actually found — a flag that also
+    /// destroyed the cache would be more destructive than its name (T-5-65).
+    /// The escape that *does* discard is [`reset_at`], which is a different
+    /// question with a different flag.
+    ///
+    /// It sits on the handle rather than on [`crate::sync::plan::build`]'s
+    /// argument list because `lookup` and `cached` are the only two reads there
+    /// are: putting the switch on them covers every planner — `sync push`,
+    /// `push --dry-run` and `status` — instead of only the ones a caller
+    /// remembered to thread a bool through.
+    #[must_use]
+    pub fn rehashing(mut self) -> Self {
+        self.rehash = true;
+        self
     }
 
     /// When the last successful sync completed, if the index knows. `None` is
@@ -196,6 +219,9 @@ impl Index {
     /// is not a whole number of 32-byte ids, a SQL error) is a miss, never a
     /// partial answer.
     pub fn lookup(&self, entry: &FileEntry) -> Option<FileRecord> {
+        if self.rehash {
+            return None;
+        }
         let path = entry.path.to_str()?;
         let (size, mtime_ns, inode) = key_of(entry)?;
         self.read_row(
@@ -215,6 +241,9 @@ impl Index {
     /// before reusing any id, because a rewrite that happens to grow a file is
     /// indistinguishable from an append by `(size, mtime_ns, inode)` alone.
     pub fn cached(&self, path: &Path) -> Option<FileRecord> {
+        if self.rehash {
+            return None;
+        }
         let path = path.to_str()?;
         self.read_row(
             "SELECT sealed_chunks, chunk_ids FROM file \
@@ -555,6 +584,32 @@ fn open_checked(path: &Path) -> Result<Connection> {
 /// Remove a damaged index, sidecars included: SQLite would happily replay a
 /// stale `-journal` or `-wal` over the fresh database and reinstate exactly the
 /// corruption we just removed.
+/// `--rebuild-index`: throw the index away and start it empty at the same path.
+///
+/// The **explicit** version of what [`Index::at`] already does on its own when
+/// it meets a file it cannot trust — same discard, same fresh mode-0600
+/// database, same "one slow sync" cost. This one is user-invoked, for the case
+/// where the automatic check passes and the user has some other reason to
+/// distrust the cache.
+///
+/// It **removes the file** rather than issuing `DROP TABLE` against it: an index
+/// corrupt enough to need this escape is one SQLite may refuse to open at all,
+/// and a recovery path must not depend on the thing it is recovering from
+/// (T-5-64). Absent is not an error — it is the same outcome by a shorter road.
+/// A directory at `path` is refused by name rather than removed, because
+/// nothing here should ever recurse over a user's tree.
+pub fn reset_at(path: &Path) -> Result<Index> {
+    if path.is_dir() {
+        return Err(AppError::Other(format!(
+            "the local sync index path {} is a directory, not a database — \
+             refusing to remove it",
+            path.display()
+        )));
+    }
+    discard(path)?;
+    Index::at(path)
+}
+
 fn discard(path: &Path) -> Result<()> {
     for suffix in ["", "-journal", "-wal", "-shm"] {
         let mut name = path.as_os_str().to_os_string();
@@ -1017,6 +1072,97 @@ mod tests {
         index.record_chunks(&[(cid(1), cid(9), 0, 10, 8)]).unwrap();
         index.conn.execute("DROP TABLE chunk", []).unwrap();
         assert!(index.chunk_locations(&[cid(1)]).is_empty());
+    }
+
+    // ---- 5-07: the two index-recovery escapes -------------------------
+
+    /// `--rebuild-index` on a warm index: the rows are gone, the file is back,
+    /// and it is private again. A recovery that left the database group- or
+    /// world-readable would be a leak created by the repair.
+    #[test]
+    fn reset_at_replaces_a_populated_index_with_an_empty_private_one() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("index.sqlite3");
+        let index = Index::at(&path).unwrap();
+        let file = sample(&dir);
+        index.record(&file, 1, &ids(2)).unwrap();
+        index
+            .set_last_sync(
+                DateTime::parse_from_rfc3339("2026-08-19T12:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            )
+            .unwrap();
+        assert!(index.lookup(&file).is_some(), "the fixture is warm");
+        drop(index);
+
+        let fresh = reset_at(&path).unwrap();
+        assert!(
+            fresh.lookup(&file).is_none(),
+            "every row went with the file"
+        );
+        assert!(fresh.last_sync().is_none());
+        assert_eq!(fresh.generation(), 0);
+        assert_eq!(fresh.meta::<i64>("schema_version"), Some(SCHEMA_VERSION));
+        #[cfg(unix)]
+        assert_private(&path);
+    }
+
+    /// Absent is not an error — a user who deleted the file by hand and then
+    /// passed the flag has asked for the state they are already in.
+    #[test]
+    fn reset_at_on_a_path_that_does_not_exist_is_the_same_outcome() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("never").join("index.sqlite3");
+        let fresh = reset_at(&path).unwrap();
+        assert!(path.exists());
+        assert!(fresh.last_sync().is_none());
+    }
+
+    /// T-5-64's sibling: the escape removes a *file*. A directory is named and
+    /// refused, never walked — this function must not be a route to `rm -r`.
+    #[test]
+    fn reset_at_refuses_a_directory_and_removes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let victim = dir.path().join("index.sqlite3");
+        std::fs::create_dir_all(victim.join("something-precious")).unwrap();
+
+        let Err(err) = reset_at(&victim) else {
+            panic!("a directory is not a database");
+        };
+        assert!(err.to_string().contains("is a directory"), "{err}");
+        assert!(
+            victim.join("something-precious").is_dir(),
+            "the tree survived the refusal"
+        );
+    }
+
+    /// `--force-rehash`: every cached read misses, and **nothing is cleared**.
+    /// A flag that also destroyed the cache would be more destructive than its
+    /// name says (T-5-65), so the rows are asserted to survive by reopening.
+    #[test]
+    fn a_rehashing_index_misses_every_cached_read_and_keeps_every_row() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("index.sqlite3");
+        let index = Index::at(&path).unwrap();
+        let file = sample(&dir);
+        index.record(&file, 1, &ids(2)).unwrap();
+        assert!(index.lookup(&file).is_some());
+        assert!(index.cached(&file.path).is_some());
+
+        let rehashing = index.rehashing();
+        assert!(rehashing.lookup(&file).is_none(), "the D5 tuple misses");
+        assert!(
+            rehashing.cached(&file.path).is_none(),
+            "the append hint too"
+        );
+        drop(rehashing);
+
+        let reopened = Index::at(&path).unwrap();
+        assert!(
+            reopened.lookup(&file).is_some(),
+            "--force-rehash suppressed reads; it must not have deleted rows"
+        );
     }
 
     /// Stamped with the run's generation in the same statement, exactly as
