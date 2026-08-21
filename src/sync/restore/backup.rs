@@ -32,6 +32,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::display::{sanitize_untrusted_line, sanitize_untrusted_path};
 use crate::error::{AppError, Result};
 use crate::sync::SyncRoots;
 
@@ -139,11 +140,18 @@ pub(crate) fn take_with(
 
     if !output.status.success() {
         // The caller must not proceed to write (T-5-45).
+        //
+        // `tar` names the member it failed on, and a restore's members are
+        // paths a hostile manifest chose. Its stderr is therefore untrusted
+        // text on its way to a terminal, exactly like a vendor diagnostic:
+        // `sanitize_untrusted_line` drops the control bytes, collapses the
+        // newlines that would otherwise forge report lines, and caps the
+        // length so a flooded stderr cannot bury the message that matters.
         return Err(AppError::Other(format!(
             "could not write the pre-restore backup {} (tar exited {}): {}",
-            archive.display(),
+            sanitize_untrusted_path(&archive),
             output.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&output.stderr).trim()
+            sanitize_untrusted_line(&String::from_utf8_lossy(&output.stderr)).trim()
         )));
     }
 
@@ -482,6 +490,47 @@ mod tests {
         assert!(
             text.contains("tar exited 2"),
             "the exit code was dropped: {text}"
+        );
+    }
+
+    /// `tar` names the member it failed on, and a restore's members come from a
+    /// manifest a hostile remote wrote. The stderr it prints is therefore
+    /// untrusted text on its way to the user's terminal.
+    ///
+    /// `#[cfg(unix)]` because `recorder` writes a `#!/bin/sh` script, which
+    /// Windows cannot execute — the same reason five sibling tests here fail on
+    /// `windows-latest`. Gating this one keeps that count from growing; it does
+    /// not fix it.
+    #[cfg(unix)]
+    #[test]
+    fn hostile_tar_stderr_reaches_the_user_stripped_of_terminal_control() {
+        let fixture = Fixture::new();
+        let log = fixture.dir.path().join("argv");
+        // An escape that repaints the line, and a newline that would forge a
+        // second one in a line-oriented report.
+        let tar = recorder(
+            fixture.dir.path(),
+            &log,
+            2,
+            "tar: \033[2K\rall good, nothing to see\nRESTORED: 0 files",
+        );
+
+        let targets = vec![fixture.seed(".claude/a.jsonl", b"a", 0o600)];
+        let text = take_with(&fixture.ctx(), &targets, &tar)
+            .expect_err("a failed backup must abort the restore")
+            .to_string();
+
+        assert!(
+            !text.contains('\u{1b}') && !text.contains('\r'),
+            "a terminal control byte survived: {text:?}"
+        );
+        assert!(
+            !text.contains('\n'),
+            "an embedded newline can forge a report line: {text:?}"
+        );
+        assert!(
+            text.contains("all good, nothing to see"),
+            "the readable part of the diagnostic was dropped: {text}"
         );
     }
 
