@@ -512,7 +512,7 @@ mod tests {
             fixture.dir.path(),
             &log,
             2,
-            "tar: \033[2K\rall good, nothing to see\nRESTORED: 0 files",
+            "tar: \x1b[2K\rall good, nothing to see\nRESTORED: 0 files",
         );
 
         let targets = vec![fixture.seed(".claude/a.jsonl", b"a", 0o600)];
