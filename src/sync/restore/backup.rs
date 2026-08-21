@@ -40,7 +40,23 @@ use super::{BackupRecord, RestoreCtx};
 /// A fixed path, never resolved off `PATH` (T-5-42) — the same reasoning
 /// [`claude_desktop::app`](crate::claude_desktop::app) applies to `tar` and
 /// [`anthropic::keychain`](crate::anthropic::keychain) to `security(1)`.
+///
+/// The rule matters more on Windows, not less: `CreateProcessW` searches the
+/// application and current directories before `PATH`, so a bare `tar` is a
+/// hijack waiting for a working directory an attacker can write to.
+#[cfg(not(windows))]
 const TAR: &str = "/usr/bin/tar";
+
+/// Windows has shipped bsdtar in System32 since Windows 10 1803, and it takes
+/// the same `-czf … -C … --` this module already passes.
+///
+/// Spelled absolutely for the reason above. `%SystemRoot%` would be more
+/// correct on a relocated install, but reading it means an env lookup inside
+/// `src/sync/`, which a structural guard forbids — and a fixed path that is
+/// wrong on an exotic install fails loudly at the backup, before any byte is
+/// restored, which is the safe direction.
+#[cfg(windows)]
+const TAR: &str = r"C:\Windows\System32\tar.exe";
 
 /// Preserve exactly the paths the restore is about to write.
 ///
