@@ -358,7 +358,21 @@ fn decide_store(ctx: &RestoreCtx<'_>, keys: &Keys, file: &FileEntry) -> Disposit
     // an empty one would make the next line call a live credential absent and
     // replace it without ever asking.
     let Ok(local) = ctx.roots.stores.read(&store) else {
-        return Disposition::ReplacesLiveCredential;
+        // The local store will not read — a cookie jar carrying another Mac's
+        // ciphertext is the ordinary case, since the jar travels as a file too
+        // and only its values are re-sealed. There is nothing here to compare
+        // against and nothing to lose, so `--force-credentials` resolves it
+        // like any other replacement.
+        //
+        // Returning `ReplacesLiveCredential` unconditionally put it beyond the
+        // one flag that answers it: the CLI resolved the flag, `merge` re-ran,
+        // and the item came back needing the same consent, so a real restore
+        // refused at the write path with the flag already passed.
+        return if ctx.opts.force_credentials {
+            Disposition::Update
+        } else {
+            Disposition::ReplacesLiveCredential
+        };
     };
     let Some(local) = local.filter(|v| !v.is_empty()) else {
         return Disposition::Create;
@@ -1762,6 +1776,43 @@ mod tests {
                     "{label} did not land"
                 );
             }
+        }
+
+        /// A store this machine cannot **read** is still resolvable by the one
+        /// flag that answers it.
+        ///
+        /// The cookie jar travels as a file as well as a store — only its
+        /// values are re-sealed — so after one restore the local jar holds the
+        /// *other* Mac's ciphertext and will not open here. That is the ordinary
+        /// second-machine state, not an exotic one.
+        ///
+        /// Returning `ReplacesLiveCredential` for an unreadable local store put
+        /// the item beyond `--force-credentials`: the CLI resolved the flag,
+        /// `merge` re-ran, the item came back needing the same consent, and a
+        /// real restore refused at the write path with the flag already passed.
+        /// Found by running it on a second Mac, not by any test.
+        #[test]
+        fn force_credentials_resolves_a_store_this_machine_cannot_read() {
+            let m = Machine::new();
+            m.roots.stores.edit().set_safe_key(Some([7u8; 16]));
+            m.roots.stores.edit().set_unreadable(true);
+
+            let gmail = desktop("gmail").manifest_path();
+            let resolved = snapshot_with_packs(&[(gmail.as_str(), b"theirs")]);
+
+            // Without the second consent it is still refused — the flag is what
+            // changed, not the rule.
+            assert_eq!(
+                disposition_of(&plan_of(&m, &resolved, opts(true, false)), gmail.as_str()),
+                &Disposition::ReplacesLiveCredential
+            );
+
+            let plan = plan_of(&m, &resolved, opts(true, true));
+            assert!(
+                disposition_of(&plan, gmail.as_str()).writes(),
+                "--force-credentials must be able to answer an unreadable store, \
+                 or nothing can"
+            );
         }
 
         /// D2 for the two new stores, which is the same rule as for the Claude
