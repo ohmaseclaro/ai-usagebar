@@ -670,12 +670,24 @@ mod tests {
         assert_eq!(credentials.raw_bytes, 37);
     }
 
-    /// D-04 and the opt-in, together: with `credentials` switched off the
-    /// store is never even read, so a bundle cannot carry it by accident.
+    /// D-04 and the opt-in, together: with `credentials` switched off **no**
+    /// store is even read, so a bundle cannot carry one by accident — the
+    /// Cursor sign-in and every Claude Desktop profile included.
     #[test]
     fn switching_credentials_off_carries_no_store_at_all() {
         let dir = TempDir::new().unwrap();
         let roots = with_login(dir.path(), "a-live-token");
+        roots
+            .stores
+            .edit()
+            .set(keystore::Store::CursorAuth, "a-live-cursor-jwt");
+        roots.stores.edit().set(
+            keystore::Store::DesktopTokenCache {
+                profile: "gmail".to_string(),
+                slot: keystore::TokenSlot::V2,
+            },
+            "a-live-desktop-token",
+        );
         let index = index_at(dir.path());
 
         // `cfg()` is config-only: credentials is off.
@@ -684,9 +696,59 @@ mod tests {
         assert!(
             plan.file_plans
                 .iter()
-                .all(|f| f.path != Path::new("keystore/claude-code-oauth")),
-            "a store reached a bundle whose owner switched credentials off"
+                .all(|f| !f.path.starts_with(keystore::PREFIX)),
+            "a store reached a bundle whose owner switched credentials off: {:?}",
+            plan.file_plans.iter().map(|f| &f.path).collect::<Vec<_>>()
         );
+    }
+
+    /// Four Claude Desktop accounts and a Cursor sign-in are five more
+    /// credentials that are not files, and all five reach the plan under their
+    /// own wire names without a single `File::open`.
+    #[test]
+    fn every_seeded_store_reaches_the_plan_under_its_own_wire_name() {
+        let dir = TempDir::new().unwrap();
+        let roots = with_login(dir.path(), "the-claude-code-login");
+        roots.stores.edit().set(
+            keystore::Store::CursorAuth,
+            r#"{"cursorAuth/accessToken":"j"}"#,
+        );
+        for label in ["gmail", "hotmail", "struct", "toptal"] {
+            roots.stores.edit().set(
+                keystore::Store::DesktopTokenCache {
+                    profile: label.to_string(),
+                    slot: keystore::TokenSlot::V2,
+                },
+                &format!("token for {label}"),
+            );
+        }
+        let index = index_at(dir.path());
+
+        let plan = build(&roots, &creds_cfg(), &index, now(), toy_id).unwrap();
+        let mut wires: Vec<String> = plan
+            .file_plans
+            .iter()
+            .map(|f| f.path.to_string_lossy().into_owned())
+            .collect();
+        wires.sort();
+        assert_eq!(
+            wires,
+            vec![
+                "keystore/claude-code-oauth",
+                "keystore/cursor-auth",
+                "keystore/desktop-token-cache/gmail/config-tokenCacheV2",
+                "keystore/desktop-token-cache/hotmail/config-tokenCacheV2",
+                "keystore/desktop-token-cache/struct/config-tokenCacheV2",
+                "keystore/desktop-token-cache/toptal/config-tokenCacheV2",
+            ]
+        );
+        assert_eq!(plan.files_opened, 0);
+        let credentials = plan
+            .categories
+            .iter()
+            .find(|c| c.category == SyncCategory::Credentials)
+            .unwrap();
+        assert_eq!(credentials.files, 6);
     }
 
     /// The failure that would make the whole path pointless: an OAuth token

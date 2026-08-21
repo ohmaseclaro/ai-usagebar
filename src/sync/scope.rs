@@ -1092,4 +1092,117 @@ mod tests {
         assert_eq!(scan.bytes, 0);
         assert_eq!(scan.category, SyncCategory::Config);
     }
+
+    // ---- cursor: three named shapes out of a 37 GB directory ---------------
+
+    /// **The allow-list, measured.** On this user's Mac the Cursor directory is
+    /// 37 GB and the part worth carrying is about 1.2 GB. Everything named here
+    /// that is *not* collected was measured on that machine, and a deny-list
+    /// that had missed any one of them would have multiplied the bundle.
+    #[test]
+    fn cursor_carries_the_three_conversation_shapes_and_nothing_else() {
+        let dir = TempDir::new().unwrap();
+        let user = "cursor-user";
+        seed(
+            dir.path(),
+            &format!("{user}/globalStorage/state.vscdb"),
+            "x",
+        );
+        seed(
+            dir.path(),
+            &format!("{user}/globalStorage/conversation-search.db"),
+            "x",
+        );
+        for ws in ["9f2c", "aa11", "bb22"] {
+            seed(
+                dir.path(),
+                &format!("{user}/workspaceStorage/{ws}/state.vscdb"),
+                "x",
+            );
+        }
+
+        // 33 GB of stale backup Cursor left behind — the single entry that
+        // makes this an allow-list rather than a deny-list.
+        seed(
+            dir.path(),
+            &format!("{user}/globalStorage/state.vscdb.bloated.bak"),
+            "x",
+        );
+        // 1.6 GB of derived worker data, and a 688 MB rebuildable edit history.
+        seed(
+            dir.path(),
+            &format!("{user}/globalStorage/anysphere.cursor-agent-worker/index.bin"),
+            "x",
+        );
+        seed(
+            dir.path(),
+            &format!("{user}/History/1a2b/entries.json"),
+            "x",
+        );
+        // ~6 GB of caches.
+        for junk in [
+            "CachedData/x.code",
+            "GPUCache/data_0",
+            "logs/main.log",
+            "snapshots/s1.bin",
+            "WebStorage/1/x.db",
+        ] {
+            seed(dir.path(), &format!("{user}/{junk}"), "x");
+        }
+        // Per-workspace clutter beside the one file that is wanted.
+        seed(
+            dir.path(),
+            &format!("{user}/workspaceStorage/9f2c/anysphere.cursor-retrieval/index"),
+            "x",
+        );
+
+        let cfg = SyncConfig {
+            categories: vec![SyncCategory::Transcripts],
+            ..SyncConfig::default()
+        };
+        let scan = collect(SyncCategory::Transcripts, &roots_at(&dir), &cfg, Utc::now());
+        let mut got: Vec<String> = scan
+            .files
+            .iter()
+            .map(|f| {
+                f.path
+                    .strip_prefix(dir.path().join(user))
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "globalStorage/conversation-search.db",
+                "globalStorage/state.vscdb",
+                "workspaceStorage/9f2c/state.vscdb",
+                "workspaceStorage/aa11/state.vscdb",
+                "workspaceStorage/bb22/state.vscdb",
+            ]
+        );
+        // No walk was involved, so no count of workspaces can silently truncate.
+        assert!(!scan.walk_capped);
+    }
+
+    /// Conversations are transcripts, and transcripts are opt-in. A user who
+    /// has not asked for them does not get 1.2 GB of Cursor state.
+    #[test]
+    fn cursor_conversations_do_not_travel_unless_transcripts_are_switched_on() {
+        let dir = TempDir::new().unwrap();
+        seed(dir.path(), "cursor-user/globalStorage/state.vscdb", "x");
+        assert!(
+            !SyncConfig::default().includes(SyncCategory::Transcripts),
+            "the default set is what makes this opt-in"
+        );
+        let scan = collect(
+            SyncCategory::Transcripts,
+            &roots_at(&dir),
+            &SyncConfig::default(),
+            Utc::now(),
+        );
+        assert!(scan.files.is_empty(), "{:?}", names(&scan));
+    }
 }

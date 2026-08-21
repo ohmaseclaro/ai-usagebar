@@ -1104,4 +1104,62 @@ mod tests {
             );
         }
     }
+
+    /// **Two writers, one path, and a fixed order.**
+    ///
+    /// `cursor-user/globalStorage/state.vscdb` is carried as a file — it holds
+    /// the conversations — and `keystore/cursor-auth` writes the `cursorAuth/*`
+    /// rows into that same database. The file must land first, or it replaces
+    /// the database and takes the freshly written credential with it.
+    ///
+    /// Manifest order here deliberately puts the **store first**, so a run that
+    /// merely followed the manifest would write it first. The file's write is
+    /// then made to fail, and the store having stayed empty is the proof that
+    /// the file ran ahead of it.
+    #[test]
+    fn every_file_is_written_before_any_store_whatever_the_manifest_order_says() {
+        let m = Machine::new();
+        const DB: &str = "cursor-user/globalStorage/state.vscdb";
+        const ROWS: &str = r#"{"cursorAuth/accessToken":"from-the-bundle"}"#;
+
+        // The database's own directory, planted as a regular file, so the file
+        // half of the run cannot succeed.
+        let dest = m.dest(DB);
+        std::fs::create_dir_all(dest.parent().unwrap().parent().unwrap()).unwrap();
+        std::fs::write(dest.parent().unwrap(), b"in the way").unwrap();
+
+        let (packs, ids) = packed(&[ROWS.as_bytes(), b"a whole database"]);
+        let store_item = ItemPlan {
+            dest: None,
+            manifest_path: "keystore/cursor-auth".into(),
+            category: SyncCategory::Credentials,
+            true_len: ROWS.len() as u64,
+            chunks: ids[0].clone(),
+            disposition: Disposition::Create,
+        };
+        let file_item = item(
+            &m,
+            DB,
+            b"a whole database",
+            ids[1].clone(),
+            Disposition::Create,
+        );
+        let plan = plan_of(vec![store_item, file_item]);
+
+        let applied = apply(&m.ctx(), &plan, &packs).unwrap();
+        assert_eq!(
+            applied.failed_at.as_deref(),
+            Some(DB),
+            "the file half must have run first"
+        );
+        assert_eq!(applied.written, 0);
+        assert!(
+            m.roots
+                .stores
+                .edit()
+                .get(&crate::sync::keystore::Store::CursorAuth)
+                .is_none(),
+            "the store was written before the file it writes into"
+        );
+    }
 }
