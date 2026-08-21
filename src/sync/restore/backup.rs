@@ -67,13 +67,26 @@ pub fn take(ctx: &RestoreCtx<'_>, targets: &[PathBuf]) -> Result<Option<BackupRe
     take_with(ctx, targets, Path::new(TAR))
 }
 
-/// Test seam. Production always passes [`TAR`]; the CLI has no way to reach
-/// this, which is what keeps T-5-42 closed.
-pub(crate) fn take_with(
-    ctx: &RestoreCtx<'_>,
-    targets: &[PathBuf],
-    tar: &Path,
-) -> Result<Option<BackupRecord>> {
+/// Everything a backup decides before a process exists: which targets are
+/// really on disk, the root they share, their names relative to it, and the
+/// archive's own path and argv.
+///
+/// **Split out of [`take_with`] so it can be tested without spawning
+/// anything.** The `tar` stand-in those tests used is a `#!/bin/sh` script,
+/// which is why five of them failed on `windows-latest` and nowhere else —
+/// they were asserting on argv, member order and the archive's name, none of
+/// which needs a child process at all. What genuinely does need one (the
+/// archive's mode, and the error a non-zero exit carries) stays behind
+/// `#[cfg(unix)]` and says so.
+struct Plan {
+    archive: PathBuf,
+    /// What the archive's member paths are relative to.
+    root: PathBuf,
+    members: usize,
+    argv: Vec<std::ffi::OsString>,
+}
+
+fn plan(ctx: &RestoreCtx<'_>, targets: &[PathBuf]) -> Result<Option<Plan>> {
     // Only what is already on disk: a `Create` has nothing to preserve, and an
     // empty tarball would be a misleading artifact suggesting otherwise.
     let mut present: Vec<&PathBuf> = targets.iter().filter(|p| p.exists()).collect();
@@ -115,14 +128,44 @@ pub(crate) fn take_with(
         ctx.now.format("%Y%m%d-%H%M%S")
     ));
 
+    Ok(Some(Plan {
+        members: members.len(),
+        argv: {
+            let mut argv: Vec<std::ffi::OsString> = vec![
+                "-czf".into(),
+                archive.clone().into_os_string(),
+                "-C".into(),
+                root.clone().into_os_string(),
+                // A member beginning with a dash is never read as a flag (T-5-41).
+                "--".into(),
+            ];
+            argv.extend(members.into_iter().map(PathBuf::into_os_string));
+            argv
+        },
+        archive,
+        root,
+    }))
+}
+
+/// Test seam. Production always passes [`TAR`]; the CLI has no way to reach
+/// this, which is what keeps T-5-42 closed.
+pub(crate) fn take_with(
+    ctx: &RestoreCtx<'_>,
+    targets: &[PathBuf],
+    tar: &Path,
+) -> Result<Option<BackupRecord>> {
+    let Some(plan) = plan(ctx, targets)? else {
+        return Ok(None);
+    };
+    let Plan {
+        archive,
+        root,
+        members,
+        argv,
+    } = plan;
+
     let output = Command::new(tar)
-        .arg("-czf")
-        .arg(&archive)
-        .arg("-C")
-        .arg(&root)
-        // A member beginning with a dash is never read as a flag (T-5-41).
-        .arg("--")
-        .args(&members)
+        .args(argv)
         .output()
         .map_err(|error| AppError::Other(format!("could not run `tar`: {error}")))?;
 
@@ -163,7 +206,7 @@ pub(crate) fn take_with(
     Ok(Some(BackupRecord {
         archive,
         root,
-        members: members.len(),
+        members,
         bytes,
     }))
 }
@@ -348,6 +391,7 @@ mod tests {
     /// A `tar` stand-in: records its argv one line per argument, creates the
     /// archive named by `$2` so the caller's stat succeeds, and exits `code`.
     /// Nothing here reaches the real binary.
+    #[cfg(unix)]
     fn recorder(dir: &Path, log: &Path, code: i32, stderr: &str) -> PathBuf {
         let program = dir.join(format!("tar-recorder-{code}.sh"));
         fs::write(
@@ -363,12 +407,23 @@ mod tests {
         program
     }
 
-    fn recorded(log: &Path) -> Vec<String> {
-        fs::read_to_string(log)
-            .unwrap()
-            .lines()
-            .map(str::to_owned)
+    /// A plan's argv as strings, for comparison against literals.
+    fn argv_of(p: &Plan) -> Vec<String> {
+        p.argv
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
             .collect()
+    }
+
+    /// One member path in this platform's own separator. The argv carries what
+    /// `strip_prefix` produced, which is `\` on Windows and `/` everywhere
+    /// else — a literal `".claude/a.jsonl"` would be asserting on the
+    /// separator rather than on the member.
+    fn rel(unix: &str) -> String {
+        unix.split('/')
+            .collect::<PathBuf>()
+            .to_string_lossy()
+            .into_owned()
     }
 
     /// Unix only: `PermissionsExt` does not exist on Windows, and the mode this
@@ -383,6 +438,7 @@ mod tests {
     /// The one thing this module must never do is return `None` for a tree it
     /// simply did not archive — so `None` is reachable only when no target is
     /// on disk, and then no `tar` runs at all.
+    #[cfg(unix)]
     #[test]
     fn nothing_on_disk_means_no_archive_and_no_tar() {
         let fixture = Fixture::new();
@@ -413,34 +469,31 @@ mod tests {
     #[test]
     fn the_archive_follows_the_switchers_naming_and_the_argv_is_flag_safe() {
         let fixture = Fixture::new();
-        let log = fixture.dir.path().join("argv");
-        let tar = recorder(fixture.dir.path(), &log, 0, "");
-
         let targets = vec![
             fixture.seed(".claude/projects/a.jsonl", b"a", 0o600),
             fixture.seed(".config/ai-usagebar/config.toml", b"c", 0o600),
         ];
-        let record = take_with(&fixture.ctx(), &targets, &tar)
+        let p = plan(&fixture.ctx(), &targets)
             .unwrap()
             .expect("an existing tree must be archived");
 
         let expected = fixture
             .backups_dir
             .join(format!("sync-restore-{STAMP}.tar.gz"));
-        assert_eq!(record.archive, expected);
-        assert_eq!(record.root, fixture.home(), "the -C root is not the home");
-        assert_eq!(record.members, 2);
+        assert_eq!(p.archive, expected);
+        assert_eq!(p.root, fixture.home(), "the -C root is not the home");
+        assert_eq!(p.members, 2);
 
         assert_eq!(
-            recorded(&log),
+            argv_of(&p),
             vec![
                 "-czf".to_string(),
                 expected.display().to_string(),
                 "-C".to_string(),
                 fixture.home().display().to_string(),
                 "--".to_string(),
-                ".claude/projects/a.jsonl".to_string(),
-                ".config/ai-usagebar/config.toml".to_string(),
+                rel(".claude/projects/a.jsonl"),
+                rel(".config/ai-usagebar/config.toml"),
             ],
             "`--` must precede the members and the members must be relative"
         );
@@ -449,9 +502,6 @@ mod tests {
     #[test]
     fn members_are_existing_only_deduplicated_and_sorted() {
         let fixture = Fixture::new();
-        let log = fixture.dir.path().join("argv");
-        let tar = recorder(fixture.dir.path(), &log, 0, "");
-
         let zed = fixture.seed(".claude/z.jsonl", b"z", 0o600);
         let amy = fixture.seed(".claude/a.jsonl", b"a", 0o600);
         let targets = vec![
@@ -463,16 +513,22 @@ mod tests {
             fixture.home().join(".claude/absent.jsonl"),
         ];
 
-        let record = take_with(&fixture.ctx(), &targets, &tar).unwrap().unwrap();
-        assert_eq!(record.members, 2);
+        let p = plan(&fixture.ctx(), &targets).unwrap().unwrap();
+        assert_eq!(p.members, 2);
         assert_eq!(
-            &recorded(&log)[5..],
-            &[".claude/a.jsonl".to_string(), ".claude/z.jsonl".to_string()]
+            &argv_of(&p)[5..],
+            &[rel(".claude/a.jsonl"), rel(".claude/z.jsonl")]
         );
     }
 
     /// T-5-45: a backup that cannot be taken is not advisory. `take` returns
     /// `Err`, so `run` never reaches `write::apply`.
+    ///
+    /// `#[cfg(unix)]` for [`recorder`]'s shebang, like every test here that
+    /// needs a real child process. The platform-independent half of this
+    /// module's behaviour — argv, member order, the archive's name and root —
+    /// is tested through [`plan`] instead, and runs everywhere.
+    #[cfg(unix)]
     #[test]
     fn a_tar_failure_is_an_error_carrying_its_stderr() {
         let fixture = Fixture::new();
@@ -554,6 +610,7 @@ mod tests {
     /// T-5-40. The directory is restricted *before* `tar` creates the file, so
     /// there is no window in which a credential archive is world-readable.
     #[test]
+    #[cfg(unix)]
     fn the_archive_is_0600_inside_a_0700_directory() {
         let fixture = Fixture::new();
         let log = fixture.dir.path().join("argv");
@@ -562,11 +619,8 @@ mod tests {
         let targets = vec![fixture.seed(".claude/a.jsonl", b"a", 0o600)];
         let record = take_with(&fixture.ctx(), &targets, &tar).unwrap().unwrap();
 
-        #[cfg(unix)]
-        {
-            assert_eq!(mode_of(&fixture.backups_dir), 0o700);
-            assert_eq!(mode_of(&record.archive), 0o600);
-        }
+        assert_eq!(mode_of(&fixture.backups_dir), 0o700);
+        assert_eq!(mode_of(&record.archive), 0o600);
     }
 
     /// A customised `CLAUDE_CONFIG_DIR` outside the home is supported, and the
@@ -575,25 +629,17 @@ mod tests {
     #[test]
     fn a_target_outside_the_home_widens_the_root_to_the_common_ancestor() {
         let fixture = Fixture::new();
-        let log = fixture.dir.path().join("argv");
-        let tar = recorder(fixture.dir.path(), &log, 0, "");
-
         let inside = fixture.seed(".claude/a.jsonl", b"a", 0o600);
         let outside = fixture.dir.path().join("elsewhere/config.toml");
         fs::create_dir_all(outside.parent().unwrap()).unwrap();
         fs::write(&outside, b"c").unwrap();
 
-        let record = take_with(&fixture.ctx(), &[inside, outside], &tar)
-            .unwrap()
-            .unwrap();
+        let p = plan(&fixture.ctx(), &[inside, outside]).unwrap().unwrap();
 
-        assert_eq!(record.root, fixture.dir.path());
+        assert_eq!(p.root, fixture.dir.path());
         assert_eq!(
-            &recorded(&log)[5..],
-            &[
-                "bob/.claude/a.jsonl".to_string(),
-                "elsewhere/config.toml".to_string()
-            ]
+            &argv_of(&p)[5..],
+            &[rel("bob/.claude/a.jsonl"), rel("elsewhere/config.toml")]
         );
     }
 
