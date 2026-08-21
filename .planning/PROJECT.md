@@ -54,6 +54,9 @@ throughout — it has found four defects no audit did.
 - ✓ A renamed routine's title converges to one value across accounts — v1.0.x
 - ✓ A CLI+Desktop label collision is sourced from Desktop only, ending the refresh-token
   rotation war and silent usage misattribution — v1.1.0
+- ✓ Encrypted GitHub sync: a second Mac pulls the bundle and opens Claude Desktop
+  already signed in on all four accounts, with Cursor live too — confirmed in the
+  field 2026-08-21 — v1.0 (fork only, not upstream)
 
 ### Active
 
