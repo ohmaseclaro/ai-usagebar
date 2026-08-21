@@ -618,6 +618,7 @@ mod tests {
     use crate::sync::github::{Client, Endpoints, RepoRef};
     use crate::sync::model::{IndexEntry, Manifest, Root};
     use crate::sync::pack::PackWriter;
+    use crate::sync::push::progress::Silent;
     use crate::sync::restore::PackSource;
     use crate::sync::{CHUNK_SIZE, SyncRoots};
     use std::fs;
@@ -1493,8 +1494,13 @@ mod tests {
 
         fn apply_to(m: &Machine, plan: &RestorePlan, resolved: &Resolved) -> Applied {
             let client = m.client();
-            write::apply(&m.ctx(&client, applying()), plan, &resolved.packs)
-                .expect("the write half returns Ok even for a partial run")
+            write::apply(
+                &m.ctx(&client, applying()),
+                plan,
+                &resolved.packs,
+                &mut Silent,
+            )
+            .expect("the write half returns Ok even for a partial run")
         }
 
         /// **The headline.** A machine with no Claude login gets one, byte for
@@ -1555,8 +1561,13 @@ mod tests {
             // the confirmation would have been answered — the same tripwire
             // `NeedsCredentialConfirm` has. Nothing is written either way.
             let client = m.client();
-            let err = write::apply(&m.ctx(&client, applying()), &plan, &resolved.packs)
-                .expect_err("an unanswered credential consent must not reach the write path");
+            let err = write::apply(
+                &m.ctx(&client, applying()),
+                &plan,
+                &resolved.packs,
+                &mut Silent,
+            )
+            .expect_err("an unanswered credential consent must not reach the write path");
             assert!(err.to_string().contains("credential confirmation"), "{err}");
             assert_eq!(held(&m).as_deref(), Some(LIVE));
         }
@@ -1764,7 +1775,13 @@ mod tests {
             assert_eq!(disposition_of(&plan, CACHE), &Disposition::Create);
 
             let client = m.client();
-            write::apply(&m.ctx(&client, applying()), &plan, &resolved.packs).unwrap();
+            write::apply(
+                &m.ctx(&client, applying()),
+                &plan,
+                &resolved.packs,
+                &mut Silent,
+            )
+            .unwrap();
             let dest = layout::from_manifest_path(&m.roots, CACHE).unwrap();
             assert_eq!(fs::read_to_string(&dest).unwrap(), mine);
         }
@@ -1803,7 +1820,13 @@ mod tests {
             );
 
             let client = m.client();
-            write::apply(&m.ctx(&client, applying()), &plan, &resolved.packs).unwrap();
+            write::apply(
+                &m.ctx(&client, applying()),
+                &plan,
+                &resolved.packs,
+                &mut Silent,
+            )
+            .unwrap();
             assert_eq!(
                 fs::read_to_string(&dest).unwrap(),
                 live,
@@ -1824,7 +1847,13 @@ mod tests {
             assert_eq!(plan.items[0].disposition, Disposition::ForeignSafeStorage);
 
             let client = m.client();
-            write::apply(&m.ctx(&client, applying()), &plan, &resolved.packs).unwrap();
+            write::apply(
+                &m.ctx(&client, applying()),
+                &plan,
+                &resolved.packs,
+                &mut Silent,
+            )
+            .unwrap();
             assert!(
                 !layout::from_manifest_path(&m.roots, CACHE)
                     .unwrap()
@@ -1852,7 +1881,13 @@ mod tests {
             assert_eq!(disposition_of(&plan, PORTABLE), &Disposition::Create);
 
             let client = m.client();
-            write::apply(&m.ctx(&client, applying()), &plan, &resolved.packs).unwrap();
+            write::apply(
+                &m.ctx(&client, applying()),
+                &plan,
+                &resolved.packs,
+                &mut Silent,
+            )
+            .unwrap();
             let dest = layout::from_manifest_path(&m.roots, PORTABLE).unwrap();
             assert_eq!(fs::read(&dest).unwrap(), portable);
         }
@@ -1870,7 +1905,13 @@ mod tests {
             assert_eq!(plan.items[0].disposition, Disposition::Create);
 
             let client = m.client();
-            write::apply(&m.ctx(&client, applying()), &plan, &resolved.packs).unwrap();
+            write::apply(
+                &m.ctx(&client, applying()),
+                &plan,
+                &resolved.packs,
+                &mut Silent,
+            )
+            .unwrap();
             assert_eq!(
                 fs::read(layout::from_manifest_path(&m.roots, CACHE).unwrap()).unwrap(),
                 plain

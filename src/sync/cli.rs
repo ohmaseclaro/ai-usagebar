@@ -874,6 +874,11 @@ fn rekey(
 struct PullIo<'a> {
     out: &'a mut dyn std::io::Write,
     gate: Option<&'a mut dyn std::io::BufRead>,
+    /// Where the three slow stretches narrate themselves — **stderr**, so a
+    /// redirected `sync pull` still has a clean standard output. Injected for
+    /// the same reason `gate` is: `pull_with_parts` is the tested seam and must
+    /// not reach for a terminal.
+    progress: &'a mut dyn progress::Progress,
 }
 
 /// Announced before an interactive read, because the password is echoed.
@@ -996,18 +1001,24 @@ fn pull(
     };
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
+    // The same reporter `sync push` builds, and read from **stderr**'s terminal
+    // rather than stdin's: a `sync pull > log` with a password on the keyboard
+    // should still get plain lines, and `sync pull | less` should not get a `\r`.
+    let mut progress = progress::reporter(std::io::stderr().is_terminal(), stderr_style());
     if interactive {
         let stdin = std::io::stdin();
         let mut gate = stdin.lock();
         let mut io = PullIo {
             out: &mut out,
             gate: Some(&mut gate),
+            progress: progress.as_mut(),
         };
         pull_with_parts(roots, &parts, &pw, opts, &mut io, now)
     } else {
         let mut io = PullIo {
             out: &mut out,
             gate: None,
+            progress: progress.as_mut(),
         };
         pull_with_parts(roots, &parts, &pw, opts, &mut io, now)
     }
@@ -1062,10 +1073,13 @@ fn pull_with_parts(
     };
 
     // 1.
-    let plan = match rt.block_on(restore::run(ctx(RestoreOptions {
-        apply: false,
-        ..opts
-    }))) {
+    let plan = match rt.block_on(restore::run(
+        ctx(RestoreOptions {
+            apply: false,
+            ..opts
+        }),
+        &mut *io.progress,
+    )) {
         Ok(outcome) => outcome.plan,
         Err(e) => return refuse(&e.to_string()),
     };
@@ -1144,7 +1158,7 @@ fn pull_with_parts(
 
     // 4.
     opts.apply = true;
-    let outcome = match rt.block_on(restore::run(ctx(opts))) {
+    let outcome = match rt.block_on(restore::run(ctx(opts), &mut *io.progress)) {
         Ok(outcome) => outcome,
         Err(e) => return refuse(&e.to_string()),
     };
@@ -2417,6 +2431,9 @@ mod tests {
         .expect("the fixture is configured and paired");
         let pw = zeroize::Zeroizing::new(password.to_owned());
         let mut out: Vec<u8> = Vec::new();
+        // The progress reporter is injected and silent here: this seam asserts
+        // what reaches **stdout**, and progress deliberately never does.
+        let mut progress = progress::Silent;
         let code = match answers {
             Some(typed) => {
                 let mut reader = std::io::Cursor::new(typed.as_bytes().to_vec());
@@ -2428,6 +2445,7 @@ mod tests {
                     &mut PullIo {
                         out: &mut out,
                         gate: Some(&mut reader),
+                        progress: &mut progress,
                     },
                     NOW,
                 )
@@ -2440,6 +2458,7 @@ mod tests {
                 &mut PullIo {
                     out: &mut out,
                     gate: None,
+                    progress: &mut progress,
                 },
                 NOW,
             ),
