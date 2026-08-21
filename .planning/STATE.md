@@ -1,17 +1,16 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.0
-milestone_name: milestone
-status: verifying
-stopped_at: Completed 6-05-PLAN.md — release prepared at 1.2.0, NOT tagged (fork/upstream divergence)
-last_updated: "2026-08-20T06:47:25.094Z"
-last_activity: 2026-08-20
+milestone: v1.1
+milestone_name: Staged upstream PRs
+status: planning
+last_updated: "2026-08-21T17:07:59.741Z"
+last_activity: 2026-08-21
 progress:
-  total_phases: 6
-  completed_phases: 6
-  total_plans: 43
-  completed_plans: 48
-  percent: 100
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # Project State
@@ -27,12 +26,10 @@ usage as another's.
 
 ## Current Position
 
-Phase: 6 (surfaces-and-ship) — complete
-Plan: all merged
-Status: code complete, gates green, awaiting the human tag and a real two-machine run
-Last activity: 2026-08-20
-
-Progress: [██████████] 100% code-complete — tag is the user's
+Phase: Not started (defining requirements)
+Plan: —
+Status: Defining requirements
+Last activity: 2026-08-21 — Milestone v1.1 started
 
 ## Performance Metrics
 
@@ -323,10 +320,13 @@ never hand-edited.
 
 - **The tag.** `6-05` is the milestone's only `autonomous: false` plan, for the reason it states:
   tags are immutable and a wrong one cannot be moved. Nothing was tagged or pushed.
+
 - **`omarchy plugin validate .`** — the `omarchy` CLI does not exist for macOS. Not run, and
   recorded as *not run* rather than passing. It must run on the Linux box before any tag.
+
 - **CAL-1 and CAL-5** — both need a real private repo and a token; both remain `#[ignore]`d and
   both doc comments state what a measurement would change.
+
 - **The real two-machine run.** Every one of the 60 integration assertions talks to mockito, so
   the round trip is genuine except that the GitHub on the other end is one this repo wrote. That
   is the one verification the codebase cannot perform on itself.
@@ -359,6 +359,7 @@ Two things worth carrying forward:
 - **`push::progress` is now the sync-wide reporter**, parametrised by a `Stage`
   (verb + noun + an `eta` flag). A fourth stage adds a const, not a module. Do
   not write a second progress vocabulary for a third surface.
+
 - **`plan.bytes_to_fetch` is not a progress total** and reads like one. It is
   computed in `restore::run` step 3, *after* step 2 has already downloaded
   everything, and it sums chunk `clen` rather than pack asset bytes. The bar

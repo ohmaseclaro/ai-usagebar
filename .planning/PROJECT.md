@@ -16,6 +16,28 @@ Answer "how much quota do I have left, and on which account?" instantly and corr
 without the user opening a browser, and without ever mis-reporting one account's usage as
 another's.
 
+## Current Milestone: v1.1 Staged upstream PRs
+
+**Goal:** Decompose the ~51,000-line encrypted-sync change into small, independently
+reviewable, independently mergeable PRs, and close the blocking findings from
+akitaonrails's review of PR #113 before the first one ships.
+
+**Target features:**
+- Bounded KDF: mandatory memory, time and parallelism ceilings enforced **before** any
+  Argon2id work, on every path that opens a keyfile (restore, join, open), with an
+  available-memory preflight and a Windows implementation
+- Portable archiving: `tar` resolved per-platform and its stderr sanitized through the
+  project's usual terminal-control and sensitive-diagnostic path
+- Three staged PRs in the maintainer's own order: format + bounded KDF/keyfile core,
+  then local archive/restore, then remote transport and lifecycle
+- An explicit ownership split: the core goes upstream; credential backup and remote
+  transport live in a companion repository, which is the boundary the maintainer named
+
+**Key context:** the work is complete and green on macOS and Linux (1866 tests) on
+`milestone/encrypted-sync`; upstream `main` has moved to v1.4.0, so every PR rebases onto
+it. `.planning/` must never reach an upstream PR. The fork stays the daily driver
+throughout — it has found four defects no audit did.
+
 ## Requirements
 
 ### Validated
@@ -104,3 +126,20 @@ another's.
 
 ---
 *Last updated: 2026-08-17 after starting the encrypted-GitHub-sync milestone*
+
+## Evolution
+
+This document evolves at phase transitions and milestone boundaries.
+
+**After each phase transition** (via `/gsd-transition`):
+1. Requirements invalidated? → Move to Out of Scope with reason
+2. Requirements validated? → Move to Validated with phase reference
+3. New requirements emerged? → Add to Active
+4. Decisions to log? → Add to Key Decisions
+5. "What This Is" still accurate? → Update if drifted
+
+**After each milestone** (via `/gsd-complete-milestone`):
+1. Full review of all sections
+2. Core Value check — still the right priority?
+3. Audit Out of Scope — reasons still valid?
+4. Update Context with current state
