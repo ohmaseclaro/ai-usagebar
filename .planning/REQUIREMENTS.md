@@ -153,6 +153,97 @@ Deferred. Tracked, not in this roadmap.
 - **REC-01**: Browse and restore an *older* snapshot, not just the latest
 - **REC-02**: Selective restore of a single category or account
 
+## v1.1 Requirements — Staged upstream PRs
+
+**Defined:** 2026-08-21, from akitaonrails's closing review of PR #113.
+
+Not new features. This milestone decomposes work that already exists and closes the
+findings that made it unmergeable. Two decisions taken up front shape every requirement
+below: the **core goes upstream and credential backup plus remote transport live in a
+companion repository**, and the **fork stays the daily driver** throughout — it is what
+found four defects no audit did.
+
+### Bounded KDF (his finding 2 and 3 — the blocker)
+
+- [ ] **KDF-01**: Every path that opens a keyfile — restore, join, and open — enforces a
+      ceiling on Argon2id memory, time **and** parallelism **before** any allocation or
+      work begins. Today only `m` is checked, at 4 GiB, and `t` and `p` have no ceiling at
+      all, so a hostile keyfile chooses the cost the victim pays before anything
+      authenticates it.
+
+- [ ] **KDF-02**: The ceilings are `m ≤ 2 GiB`, `t ≤ 16`, `p ≤ 16`, each justified in
+      writing against a published recommendation rather than chosen for looking large.
+      2 GiB is RFC 9106 §4's first recommended option and the most any standard asks for;
+      4 GiB was never a bound, since it is a guaranteed OOM on the 4 GB aarch64 class this
+      project ships for.
+
+- [ ] **KDF-03**: `p` is documented as a **tamper signal, not a cost bound** — the vendored
+      `argon2` 0.5.3 has no `parallel` feature, so parallelism multiplies neither memory nor
+      work. A ceiling that implies otherwise is the same defect being fixed.
+
+- [ ] **KDF-04**: Every ceiling has a test proving an oversized parameter is refused before
+      allocation, and the refusal names a remedy that exists.
+
+- [ ] **KDF-05**: `check_memory_budget` and `available_memory_kib` are **deleted, not
+      wired up**. The macOS arm reads `hw.memsize` — total installed memory, a constant —
+      so it structurally cannot fail; there is no Windows arm; and it names a flag that
+      does not exist. A preflight that cannot fire is worse than none, because the docs
+      claim it protects the user.
+
+- [ ] **KDF-06**: The imaginary `--kdf-memory` flag is resolved — either implemented or
+      struck from all six places that assume it, including the live refusal text
+      (`crypto.rs:788`) and the doc line asserting that refusal ships
+      (`docs/sync-format.md:591`). Found while verifying his finding; it is the same class.
+
+### Portability (his finding 1)
+
+- [x] **PORTAB-01**: `tar` is resolved per platform and spelled absolutely on both, so a
+      writable working directory cannot hijack it. *(a9f3ee4)*
+
+- [x] **PORTAB-02**: The archive module's platform-independent decisions — argv, member
+      order, the archive's name and root — are tested without spawning a child, so they
+      run on Windows. Only the two assertions that genuinely need a process are gated.
+      *(3b20ef7 — a9f3ee4 fixed production and left five tests failing.)*
+
+- [x] **PORTAB-03**: Structural guards read a CRLF checkout the same as an LF one.
+      *(bc1f8e2)*
+
+- [ ] **PORTAB-04**: All four CI jobs, Windows included, are green on the exact head of
+      every staged PR before it is opened. Nothing above counts as closed until observed.
+
+### Diagnostics (his finding 4)
+
+- [x] **DIAG-01**: `tar`'s stderr goes through the project's own untrusted-text path —
+      control bytes dropped, newlines collapsed, length capped — because a restore's
+      members are paths a hostile manifest chose. *(98fb0bb)*
+
+- [ ] **DIAG-02**: The same treatment is offered upstream for the three pre-existing sites
+      with the identical defect (`claude_desktop/app.rs:231`, `anthropic/keychain.rs:142`
+      and `:233`), as a separate small PR rather than folded into ours.
+
+### The split (his finding 5)
+
+- [ ] **SPLIT-01**: Three PRs in his order: format and bounded KDF/keyfile core, then local
+      archive/restore, then remote transport and lifecycle.
+
+- [ ] **SPLIT-02**: No PR exceeds what one reviewer can hold. Measured today the grouping
+      is 4.4k / 12.6k / 19.1k lines, so the third is split further before it is opened.
+
+- [ ] **SPLIT-03**: Every PR rebases onto upstream `main` at v1.4.0 or later, and
+      `.planning/` never appears in one.
+
+- [ ] **SPLIT-04**: Each PR states that its dependency additions were already in the tree —
+      the milestone held a zero-new-crate rule — rather than leaving a reviewer to verify
+      24 lines of `Cargo.toml` by hand.
+
+### Ownership (his closing note)
+
+- [ ] **OWN-01**: Credential backup and remote transport live in a companion repository.
+      The upstream core carries the format, the bounded KDF, and the local archive.
+
+- [ ] **OWN-02**: An independent crypto/security review is obtained before credential
+      backup is enabled anywhere it is offered to other users.
+
 ## Out of Scope
 
 | Feature | Reason |
