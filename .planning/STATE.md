@@ -59,6 +59,7 @@ Progress: [██████████] 100% code-complete — tag is the use
 |------|----------|-------|-------|
 | Phase 5 P08 | ~2h | 3 tasks | 4 files |
 | Phase 6 P05 | ~2h | 2 tasks | 10 files |
+| Phase 6 P12 | ~2h | 2 commits | 9 files |
 
 ## Accumulated Context
 
@@ -126,7 +127,7 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-08-20T06:47:16.129Z
+Last session: 2026-08-21
 Stopped at: Completed 6-05-PLAN.md — release prepared at 1.2.0, NOT tagged (fork/upstream divergence)
 SUMMARY). Nothing implemented yet.
 Resume file: None
@@ -344,3 +345,24 @@ a phase added. Every phase now ends with it.
 The strongest fix found was `sync::FixedName`: rather than correct two byte-exact filename
 comparisons on a case-folding filesystem, it made `name == CREDENTIAL_FILE` **fail to compile**.
 The next person to add a filename does not need to remember the rule.
+
+## Phase 6 P12 — the two silences a real restore found
+
+The 2.1 GiB restore onto a second Mac ran the whole way — Argon2id, ~880 MiB of
+packs, 431 writes — under a terminal with nothing on it, and the password read
+sat at column 0 of a blank line with nothing to say it wanted input. Both are
+fixed (6-12), and both were the same failure: the code knew a number and did
+not say it.
+
+Two things worth carrying forward:
+
+- **`push::progress` is now the sync-wide reporter**, parametrised by a `Stage`
+  (verb + noun + an `eta` flag). A fourth stage adds a const, not a module. Do
+  not write a second progress vocabulary for a third surface.
+- **`plan.bytes_to_fetch` is not a progress total** and reads like one. It is
+  computed in `restore::run` step 3, *after* step 2 has already downloaded
+  everything, and it sums chunk `clen` rather than pack asset bytes. The bar
+  uses `fetch_packs`'s own `round_bytes`, from the release listing, which is the
+  only figure that exists before the first request. This is instance 13 of the
+  milestone's defect class — a name that asserts more than the value knows —
+  caught in planning rather than in shipped text.
