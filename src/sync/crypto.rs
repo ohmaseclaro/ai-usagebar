@@ -114,11 +114,38 @@ pub const MIN_KDF_MEMORY_KIB: u32 = 8 * 1024;
 /// gets its chance to make the unwrap fail, and in flat violation of the
 /// project's hard invariant that the widget always exits 0.
 ///
-/// Four gibibytes is four times the shipped default and far past any parameter
-/// set a human would choose, so it costs a legitimate bundle nothing. This is a
-/// hard ceiling, not a fit-in-RAM check; [`check_memory_budget`] is the separate,
-/// actionable pre-flight a surface runs against the machine it is on.
-pub const MAX_KDF_MEMORY_KIB: u32 = 4 * 1024 * 1024;
+/// **Two gibibytes**, which is RFC 9106 §4's first recommended option and the
+/// most any published recommendation asks for. The previous four was not a
+/// bound: it is a guaranteed OOM on the 4 GB aarch64 class this project ships
+/// binaries for, so the only machines it "protected" were ones with enough
+/// memory not to care. Two is twice the shipped default, so it costs a
+/// legitimate bundle nothing while halving the worst case an attacker can pick.
+pub const MAX_KDF_MEMORY_KIB: u32 = 2 * 1024 * 1024;
+
+/// Ceiling on Argon2id's time parameter, from the same hostile keyfile.
+///
+/// **This is the sharper half of the finding.** `t` is a pure linear CPU
+/// multiplier (RFC 9106 §3.2) that allocates nothing, so no memory bound
+/// touches it — and until this constant existed it was bounded only by
+/// `argon2` 0.5.3's `MAX_T_COST = u32::MAX`, about 1.4 × 10⁹ times the shipped
+/// cost. A keyfile could simply ask that opening it take a century.
+///
+/// Sixteen sits strictly above every published recommendation: RFC 9106 gives 1
+/// and 3, OWASP 1–5, borg 3, Bitwarden 2–10.
+pub const MAX_KDF_TIME: u32 = 16;
+
+/// Ceiling on Argon2id's parallelism parameter.
+///
+/// **A tamper signal, not a cost bound, and the distinction is load-bearing.**
+/// The vendored `argon2` 0.5.3 has no `parallel` feature — lanes are filled
+/// sequentially — so `p` multiplies neither the memory allocated nor the work
+/// done. Documenting it as a cost bound would be the same defect this constant
+/// exists to fix: a claim the code does not keep. What it does do is refuse a
+/// keyfile whose parameters no writer in this project could have produced.
+///
+/// Sixteen, not one, because `p == 1` would refuse RFC 9106's own second
+/// recommended option, and matches Bitwarden's published maximum.
+pub const MAX_KDF_PAR: u32 = 16;
 
 /// Refuse writing a new keyfile below `min_m_kib` — normally
 /// [`MIN_KDF_MEMORY_KIB`].
@@ -138,24 +165,50 @@ fn check_kdf_floor(m_kib: u32, min_m_kib: u32) -> Result<()> {
     )))
 }
 
-/// Refuse an Argon2id memory parameter above [`MAX_KDF_MEMORY_KIB`], before
-/// anything allocates it.
+/// Refuse Argon2id parameters above the ceilings, before anything allocates or
+/// computes.
 ///
-/// Pure and clock-free, like everything else here. The parameters are public —
-/// they live in cleartext in the keyfile — so naming them is safe.
+/// **All three, not just memory.** Bounding `m` alone bounded the parameter a
+/// reader would think of first and left `t` — a linear CPU multiplier that
+/// allocates nothing — at `u32::MAX`. A keyfile is cleartext from a remote the
+/// format treats as hostile, and every one of these numbers is read and acted
+/// on *before* the AEAD gets its chance to say the keyfile was tampered with.
+/// That ordering is inherent: the parameters are what produce the key the tag
+/// is checked with. So the parameters must be bounded on their face.
+///
+/// Pure and clock-free, like everything else here. The values are public — they
+/// live in cleartext in the keyfile — so naming them in the refusal is safe and
+/// is the only actionable thing to say.
 ///
 /// Private, and it stays private because [`derive_kek`] applies it to every
 /// derivation: an outside caller has nothing left to enforce by hand.
-fn check_kdf_ceiling(m_kib: u32) -> Result<()> {
-    if m_kib <= MAX_KDF_MEMORY_KIB {
+fn check_kdf_ceiling(k: KdfParams) -> Result<()> {
+    let over = if k.m_kib > MAX_KDF_MEMORY_KIB {
+        format!(
+            "{} MiB of memory, above the {} MiB ceiling",
+            k.m_kib / 1024,
+            MAX_KDF_MEMORY_KIB / 1024
+        )
+    } else if k.t > MAX_KDF_TIME {
+        format!("{} passes, above the ceiling of {MAX_KDF_TIME}", k.t)
+    } else if k.p > MAX_KDF_PAR {
+        format!("{} lanes, above the ceiling of {MAX_KDF_PAR}", k.p)
+    } else {
         return Ok(());
-    }
+    };
+
+    // Names the offending value, the bound, what a real keyfile carries, and
+    // two actions that exist. The compatibility set is a single point — every
+    // keyfile this project has ever written carries the shipped default,
+    // because nothing has ever offered a way to choose otherwise — so quoting
+    // it is a fact rather than an example.
     Err(AppError::Other(format!(
-        "this keyfile asks for {} MiB of key-derivation memory, above the \
-         {} MiB ceiling this build will allocate — refusing before the \
-         allocation rather than aborting inside it",
-        m_kib / 1024,
-        MAX_KDF_MEMORY_KIB / 1024
+        "refusing this keyfile before deriving anything from it: it asks for \
+         {over}. A keyfile written by ai-usagebar carries m=1024 MiB, t=3, p=1, \
+         so these parameters were not produced by this project — the file is \
+         damaged or was tampered with in transit. Re-run `ai-usagebar sync \
+         pull` to fetch it again, or `ai-usagebar sync setup` to re-pair this \
+         machine against a keyfile you trust"
     )))
 }
 
@@ -173,7 +226,7 @@ fn check_kdf_ceiling(m_kib: u32) -> Result<()> {
 /// 0. A guard in the shared function is both the smaller diff and the only one
 /// a future caller cannot forget.
 pub fn derive_kek(pw: &[u8], salt: &[u8; 16], k: KdfParams) -> Result<Zeroizing<[u8; 32]>> {
-    check_kdf_ceiling(k.m_kib)?;
+    check_kdf_ceiling(k)?;
     let params = Params::new(k.m_kib, k.t, k.p, Some(32)).map_err(|_| {
         // The parameters are public (they live in cleartext in the keyfile), so
         // naming them is safe and is the only actionable thing to say.
@@ -394,8 +447,10 @@ impl Keyfile {
     /// Unwrap the master key with `pw` and derive the subkeys.
     ///
     /// Uses **the parameters stored in this keyfile**, never
-    /// [`KdfParams::default`]: a bundle initialised at a lower `--kdf-memory`
-    /// must stay openable, and a bundle initialised higher must stay strong.
+    /// [`KdfParams::default`]: a bundle initialised at a lower cost must stay
+    /// openable, and one initialised higher must stay strong — within
+    /// [`MAX_KDF_MEMORY_KIB`], [`MAX_KDF_TIME`] and [`MAX_KDF_PAR`], which
+    /// every derivation is held to whatever the keyfile asks for.
     pub fn open(&self, pw: &[u8]) -> Result<Keys> {
         Ok(subkeys(&*self.unwrap_master_key(pw)?))
     }
@@ -766,62 +821,6 @@ const ROOT_AAD: &[u8] = b"ai-usagebar.sync.v1 root";
 /// needs to import a hash crate.
 pub fn content_address(bytes: &[u8]) -> ChunkId {
     ChunkId(*blake3::hash(bytes).as_bytes())
-}
-
-/// Refuse an Argon2 working set that does not fit *this machine*, before
-/// allocating it.
-///
-/// Pure, and takes `available_kib` by argument: that is the seam, exactly as
-/// `Cache::at` exists so no test calls `Cache::for_vendor`. A 1 GB box must get
-/// an actionable refusal naming `--kdf-memory`, never an OOM abort.
-///
-/// This is the *pre-flight*, for a surface that knows how much memory it has and
-/// can print something a user can act on. It is not the safety net:
-/// `check_kdf_ceiling` is, it runs inside [`derive_kek`] with no dependency on a
-/// caller remembering anything, and it does not read the machine.
-pub fn check_memory_budget(m_kib: u32, available_kib: u64) -> Result<()> {
-    if u64::from(m_kib) <= available_kib {
-        return Ok(());
-    }
-    Err(AppError::Other(format!(
-        "key derivation needs {} MiB of memory but only {} MiB is available — \
-         re-run with a lower --kdf-memory, which weakens every future restore \
-         of this bundle",
-        m_kib / 1024,
-        available_kib / 1024
-    )))
-}
-
-/// Best-effort available physical memory. The non-test wrapper around
-/// [`check_memory_budget`]'s second argument; no test may call it.
-#[cfg(target_os = "linux")]
-pub fn available_memory_kib() -> Option<u64> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    meminfo.lines().find_map(|line| {
-        line.strip_prefix("MemAvailable:")?
-            .split_whitespace()
-            .next()?
-            .parse()
-            .ok()
-    })
-}
-
-/// See the Linux variant. macOS has no `MemAvailable`; `hw.memsize` (total
-/// physical) is the closest honest answer.
-#[cfg(target_os = "macos")]
-pub fn available_memory_kib() -> Option<u64> {
-    let out = std::process::Command::new("sysctl")
-        .args(["-n", "hw.memsize"])
-        .output()
-        .ok()?;
-    let bytes: u64 = String::from_utf8(out.stdout).ok()?.trim().parse().ok()?;
-    Some(bytes / 1024)
-}
-
-/// See the Linux variant. Elsewhere the budget check is simply skipped.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub fn available_memory_kib() -> Option<u64> {
-    None
 }
 
 /// The OS CSPRNG. No `rand`, no `ThreadRng`, no reseeding.
@@ -1219,18 +1218,161 @@ mod tests {
             .open(b"a hostile remote")
             .expect_err("u32::MAX KiB is 4 TiB and must never be attempted")
             .to_string();
-        assert!(err.contains("ceiling this build will allocate"), "{err}");
-        assert!(err.contains("4096 MiB"), "{err}");
+        assert!(err.contains("refusing this keyfile"), "{err}");
+        assert!(err.contains("2048 MiB ceiling"), "{err}");
 
         // Exactly at the ceiling is allowed through; one KiB past it is not.
         // Asserted on the gate itself, because letting `open` actually reach
-        // `derive_kek` at 4 GiB is precisely what a unit test must not do.
-        assert!(check_kdf_ceiling(MAX_KDF_MEMORY_KIB).is_ok());
-        assert!(check_kdf_ceiling(MAX_KDF_MEMORY_KIB + 1).is_err());
+        // `derive_kek` at 2 GiB is precisely what a unit test must not do.
+        let at = |m, t, p| KdfParams { m_kib: m, t, p };
+        assert!(check_kdf_ceiling(at(MAX_KDF_MEMORY_KIB, 3, 1)).is_ok());
+        assert!(check_kdf_ceiling(at(MAX_KDF_MEMORY_KIB + 1, 3, 1)).is_err());
 
         // Untouched, it still opens, so the refusal above is the gate rather
         // than a keyfile that never worked.
         assert!(keyfile.open(b"a hostile remote").is_ok());
+    }
+
+    /// KDF-01/02/04: every parameter, at its boundary and one past it, on the
+    /// gate every derivation routes through.
+    ///
+    /// Asserted on `check_kdf_ceiling` and not by opening a keyfile, because
+    /// the whole point is that the boundary values must never be *derived* — a
+    /// test that allocated 2 GiB to prove 2 GiB is allowed would be the bug.
+    #[test]
+    fn each_ceiling_admits_its_boundary_and_refuses_one_past_it() {
+        let at = |m, t, p| KdfParams { m_kib: m, t, p };
+
+        assert!(check_kdf_ceiling(at(MAX_KDF_MEMORY_KIB, 1, 1)).is_ok());
+        assert!(check_kdf_ceiling(at(MAX_KDF_MEMORY_KIB + 1, 1, 1)).is_err());
+
+        assert!(check_kdf_ceiling(at(CHEAP.m_kib, MAX_KDF_TIME, 1)).is_ok());
+        assert!(check_kdf_ceiling(at(CHEAP.m_kib, MAX_KDF_TIME + 1, 1)).is_err());
+
+        assert!(check_kdf_ceiling(at(CHEAP.m_kib, 1, MAX_KDF_PAR)).is_ok());
+        assert!(check_kdf_ceiling(at(CHEAP.m_kib, 1, MAX_KDF_PAR + 1)).is_err());
+
+        // The shipped default is not near any of them.
+        assert!(check_kdf_ceiling(KdfParams::default()).is_ok());
+    }
+
+    /// **`t` is the one no memory bound touches.**
+    ///
+    /// It is a linear CPU multiplier that allocates nothing, so a keyfile with
+    /// a modest `m_kib` and `t = u32::MAX` passed every check this module had
+    /// and then ran for centuries — and did it *before* the AEAD could say the
+    /// keyfile was forged, because the parameters are what produce the key the
+    /// tag is checked with.
+    #[test]
+    fn a_keyfile_demanding_unbounded_cpu_is_refused_though_its_memory_is_modest() {
+        let (keyfile, _) =
+            Keyfile::create_with_floor(b"a hostile remote", CHEAP, CHEAP.m_kib).unwrap();
+
+        let mut absurd = keyfile.clone();
+        absurd.kdf.t = u32::MAX;
+        let err = absurd
+            .open(b"a hostile remote")
+            .expect_err("u32::MAX passes must never be attempted")
+            .to_string();
+        assert!(err.contains("passes"), "{err}");
+        assert!(err.contains(&MAX_KDF_TIME.to_string()), "{err}");
+
+        let mut absurd = keyfile.clone();
+        absurd.kdf.p = MAX_KDF_PAR + 1;
+        let err = absurd
+            .open(b"a hostile remote")
+            .expect_err("more lanes than any writer here produces must be refused")
+            .to_string();
+        assert!(err.contains("lanes"), "{err}");
+
+        // Untouched, it still opens: the refusals above are the gate.
+        assert!(keyfile.open(b"a hostile remote").is_ok());
+    }
+
+    /// KDF-01: the ceilings cover **restore, join and open** — proven by
+    /// showing those three paths have no separate derivation to cover.
+    ///
+    /// Deliberately one structural guard rather than nine tests (three
+    /// parameters × three paths). The three paths are
+    /// `restore::fetch`, `github::setup`'s join, and `cli`'s open, and all
+    /// three reach the same `Keyfile::open`; three copies of
+    /// [`each_ceiling_admits_its_boundary_and_refuses_one_past_it`] would
+    /// re-test one function while proving nothing about a fourth caller added
+    /// later. What actually needs guarding is that no such caller can appear
+    /// with its own `Argon2` — which is the shape the module note already
+    /// argues for, and which the previous version of this bound got wrong by
+    /// living in `wrap` and `unwrap_master_key` instead of in `derive_kek`.
+    #[test]
+    fn every_argon2_in_the_crate_is_the_one_inside_the_guarded_derivation() {
+        let mut sites = Vec::new();
+        for path in crate::sync::guard::rs_files_in("src") {
+            let source = std::fs::read_to_string(&path).expect("readable module");
+            for (n, line) in crate::sync::guard::production_code(&source)
+                .lines()
+                .enumerate()
+            {
+                if line.contains("Argon2::new") {
+                    sites.push(format!("{}:{}", path.display(), n + 1));
+                }
+            }
+        }
+        assert_eq!(
+            sites.len(),
+            1,
+            "exactly one Argon2 may be constructed in this crate — the one in \
+             `derive_kek`, behind `check_kdf_ceiling`. Found: {sites:#?}"
+        );
+
+        // And the guard runs before it, in that function, rather than in any
+        // caller: the ordering is the whole property.
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sync/crypto.rs"),
+        )
+        .expect("readable module");
+        let body = crate::sync::guard::production_code(&source);
+        let derive = body
+            .split_once("pub fn derive_kek")
+            .expect("derive_kek exists")
+            .1;
+        let guard = derive
+            .find("check_kdf_ceiling")
+            .expect("the guard is called");
+        let build = derive.find("Argon2::new").expect("the argon2 is built");
+        assert!(
+            guard < build,
+            "check_kdf_ceiling must run before Argon2::new, not after it"
+        );
+    }
+
+    /// KDF-04, and the reason it is a test rather than a review note: this
+    /// project has now shipped a user-facing message naming a `--kdf-memory`
+    /// flag that was never built, and a doc asserting that message protects
+    /// people. A refusal that names a remedy the CLI cannot parse is worse than
+    /// one that names none.
+    ///
+    /// This comment is the last surviving occurrence of that string in the
+    /// repository, and it is deliberate: the guard scans
+    /// [`guard::production_code`], which drops comments, so naming the mistake
+    /// here cannot trip the test that exists to prevent it.
+    #[test]
+    fn no_message_in_this_module_names_a_flag_this_build_does_not_parse() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sync/crypto.rs"),
+        )
+        .expect("readable module");
+        let production = crate::sync::guard::production_code(&source);
+
+        // Every `--word` in shipped code here. The module parses no CLI at all,
+        // so the honest count is zero; a future one has to be checked against
+        // `Cli` deliberately rather than by this test quietly widening.
+        let flags: Vec<&str> = production
+            .split_whitespace()
+            .filter(|w| w.starts_with("--") && w.len() > 2)
+            .collect();
+        assert!(
+            flags.is_empty(),
+            "crypto.rs names command-line flags it cannot verify exist: {flags:?}"
+        );
     }
 
     /// The ceiling belongs to `derive_kek`, not to the two paths that used to
@@ -1251,27 +1393,13 @@ mod tests {
         let err = derive_kek(b"a hostile remote", &[0u8; 16], absurd.kdf.params())
             .expect_err("the documented idiom must not reach a 4 TiB allocation")
             .to_string();
-        assert!(err.contains("ceiling this build will allocate"), "{err}");
+        assert!(err.contains("refusing this keyfile"), "{err}");
         // …and the message names no secret: the parameters are cleartext in the
         // keyfile, the password is not in it.
         assert!(!err.contains("a hostile remote"), "{err}");
 
         // The honest parameters still derive, so the refusal is the gate.
         assert!(derive_kek(b"a hostile remote", &[0u8; 16], keyfile.kdf.params()).is_ok());
-    }
-
-    #[test]
-    fn the_memory_budget_refuses_actionably_instead_of_letting_argon2_oom() {
-        let err = check_memory_budget(1_048_576, 900_000)
-            .expect_err("1 GiB must not be attempted on a 900 MiB budget")
-            .to_string();
-        assert!(err.contains("--kdf-memory"));
-        assert!(err.contains("1024 MiB"));
-        assert!(err.contains("878 MiB"));
-
-        assert!(check_memory_budget(1_048_576, 4_000_000).is_ok());
-        // Exactly enough is enough.
-        assert!(check_memory_budget(1_048_576, 1_048_576).is_ok());
     }
 
     #[test]

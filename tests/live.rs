@@ -606,8 +606,8 @@ async fn minimax_live() {
 ///
 /// The 1582 ms in the research is one Apple M3 Max number, and the shipped
 /// default plus the memory floor should not rest on it alone. This times the
-/// production parameters and then two steps down, so a user who must lower
-/// `--kdf-memory` on constrained hardware has a curve to choose from rather
+/// production parameters and then two steps down, so that if a lower cost is
+/// ever offered on constrained hardware there is a curve to choose from rather
 /// than a single point.
 ///
 /// `#[ignore]`d because it allocates a gibibyte and takes seconds, and the AUR
@@ -621,7 +621,7 @@ async fn minimax_live() {
 #[test]
 #[ignore = "calibration; allocates 1 GiB and takes seconds — run with --ignored --release"]
 fn cal3_argon2id_timing_at_production_parameters() {
-    use ai_usagebar::sync::crypto::{KdfParams, available_memory_kib, derive_kek};
+    use ai_usagebar::sync::crypto::{KdfParams, derive_kek};
 
     /// The shipped default, spelled out. If it ever drifts from
     /// [`KdfParams::default`], this probe calibrates something nobody runs.
@@ -641,12 +641,8 @@ fn cal3_argon2id_timing_at_production_parameters() {
     } else {
         "release"
     };
-    let available = available_memory_kib()
-        .map(|kib| format!("{} MiB", kib / 1024))
-        .unwrap_or_else(|| "unreported on this platform".into());
-
     println!(
-        "CAL-3 — {}/{}, {profile} profile, available memory {available}",
+        "CAL-3 — {}/{}, {profile} profile",
         std::env::consts::ARCH,
         std::env::consts::OS,
     );

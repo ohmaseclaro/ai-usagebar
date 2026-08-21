@@ -79,10 +79,12 @@ there is nothing useful to distinguish and nothing an attacker should learn from
 the difference.
 
 A reader must use the parameters **stored in the keyfile it is opening**, never
-its own compiled default. A bundle initialised at a lower `--kdf-memory` stays
-openable; one initialised higher stays strong.
+its own compiled default. A bundle initialised at a lower cost stays openable;
+one initialised higher stays strong — up to the ceilings below, which every
+derivation is held to whatever the keyfile asks for.
 
-**`m_kib` is bounded on both sides, and the two bounds are not symmetrical.**
+**Every parameter is bounded above, and `m_kib` is bounded on both sides — the
+two `m_kib` bounds are not symmetrical.**
 
 - **Writing** a new keyfile — at initialisation or at a password change — is
   refused below **8 MiB**. Argon2's own floor is `8 * p` KiB, which is the
@@ -96,13 +98,28 @@ openable; one initialised higher stays strong.
   characters from the generator are 100 uniform bits, 20 characters somebody
   chose may be worth half that, and an implementation holding only the string
   cannot tell which it has.
-- **Reading** is refused above **4 GiB**, and is deliberately unbounded below.
-  `m_kib` reaches a reader from a keyfile a hostile remote may have edited, and
-  an implementation whose Argon2 allocates infallibly turns one edited integer
-  into an abort — before the AAD binding gets a chance to reject it. Refuse the
-  value before allocating for it. Nothing is refused for being *too low* on
-  read: a bundle written before a floor existed must stay openable, or raising
-  a floor destroys data.
+- **Reading** is refused above **2 GiB** of memory, above **16** passes, and
+  above **16** lanes, and is deliberately unbounded below on memory. Every one
+  of these reaches a reader from a keyfile a hostile remote may have edited, and
+  every one is read and acted on *before* the AEAD can say the keyfile was
+  tampered with — that ordering is inherent, since the parameters are what
+  produce the key the tag is checked with. So they are bounded on their face.
+  Nothing is refused for being *too low* on read: a bundle written before a
+  floor existed must stay openable, or raising a floor destroys data.
+
+  Where the three numbers come from:
+
+  | | Bound | Above every published recommendation |
+  |---|---|---|
+  | `m_kib` | 2 GiB | RFC 9106 §4's **first** recommended option, and the most any published recommendation asks for. The previous 4 GiB was not a bound — it is a guaranteed OOM on the 4 GB aarch64 class this project ships binaries for, so the only machines it protected had enough memory not to need it. |
+  | `t` | 16 | RFC 9106 gives 1 and 3; OWASP 1–5; borg 3; Bitwarden 2–10. This is the sharper of the three: `t` is a pure linear CPU multiplier that allocates nothing, so no memory bound touches it, and it was previously bounded only by `u32::MAX` — about 1.4 × 10⁹ times the shipped cost. A keyfile could ask that opening it take a century. |
+  | `p` | 16 | Matches Bitwarden's published maximum. **A tamper signal, not a cost bound:** the `argon2` crate this project vendors has no parallel feature, so lanes fill sequentially and `p` multiplies neither memory nor work. What the bound does is refuse parameters no writer in this project could have produced. Not `p == 1`, which would refuse RFC 9106's own second option. |
+
+  Worth stating plainly, because it is what makes this a real finding rather
+  than a style note: **borg and restic — the closest threat model to this one —
+  do not bound these parameters at all.** age and rage do, and both express the
+  bound as a multiple of their own write default; Bitwarden publishes explicit
+  `(min, max, default)` triples. This format follows the latter two.
 
 ---
 
@@ -578,19 +595,29 @@ cargo test --release --test live -- --ignored --nocapture \
     cal3_argon2id_timing_at_production_parameters
 ```
 
-Cost is close to linear in the memory parameter, which is the useful part: a
-user who must halve `--kdf-memory` roughly halves both the wait and the
-attacker's cost per guess, and can make that trade knowingly.
+Cost is close to linear in the memory parameter, which is the useful part:
+halving the memory roughly halves both the wait and the attacker's cost per
+guess. Nothing currently offers that trade — the parameters are compiled in and
+`KdfParams::default` is the only thing that has ever written a keyfile — so the
+curve exists to inform a future decision, not a present one.
 
 **No aarch64 Linux measurement was obtained.** The roadmap wanted one on a slow
 aarch64 Linux box, and no such machine was reachable during this phase; a Linux
 VM on this same M3 Max silicon would have answered a question nobody asked and
 risked being read as a clearance for slow hardware. The documented fallback
-applies unchanged: `m = 1 GiB` stays the default, the parameters travel in the
-keyfile and are settable at initialisation, and a machine that cannot afford the
-working set gets an actionable refusal naming `--kdf-memory` rather than an OOM
-kill. Scaling the table above, a target four times slower than this one derives
-in about 6 s at 1 GiB and about 1.5 s at 256 MiB.
+applies unchanged: `m = 1 GiB` stays the default and the parameters travel in
+the keyfile. Scaling the table above, a target four times slower than this one
+derives in about 6 s at 1 GiB and about 1.5 s at 256 MiB.
+
+**An earlier version of this section claimed a machine that cannot afford the
+working set gets an actionable refusal naming a memory-tuning flag, rather than
+an OOM kill.** No such flag was ever built, so the refusal was unreachable and the
+sentence was false. The pre-flight behind it read total installed memory on
+macOS — a constant, which cannot fail — had no Windows implementation, and had
+no production call sites at all; it has been deleted rather than finished. What
+protects a constrained machine is the ceiling below, which bounds what a keyfile
+may *ask* for; nothing protects it from the shipped default being too large for
+it, and this document should not imply otherwise.
 
 The research figure this phase set out to check was 1582 ms on an M3 Max; the
 implementation measures 1492–1548 ms on the same class of machine, so the

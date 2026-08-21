@@ -165,32 +165,32 @@ found four defects no audit did.
 
 ### Bounded KDF (his finding 2 and 3 — the blocker)
 
-- [ ] **KDF-01**: Every path that opens a keyfile — restore, join, and open — enforces a
+- [x] **KDF-01**: Every path that opens a keyfile — restore, join, and open — enforces a
       ceiling on Argon2id memory, time **and** parallelism **before** any allocation or
       work begins. Today only `m` is checked, at 4 GiB, and `t` and `p` have no ceiling at
       all, so a hostile keyfile chooses the cost the victim pays before anything
       authenticates it.
 
-- [ ] **KDF-02**: The ceilings are `m ≤ 2 GiB`, `t ≤ 16`, `p ≤ 16`, each justified in
+- [x] **KDF-02**: The ceilings are `m ≤ 2 GiB`, `t ≤ 16`, `p ≤ 16`, each justified in
       writing against a published recommendation rather than chosen for looking large.
       2 GiB is RFC 9106 §4's first recommended option and the most any standard asks for;
       4 GiB was never a bound, since it is a guaranteed OOM on the 4 GB aarch64 class this
       project ships for.
 
-- [ ] **KDF-03**: `p` is documented as a **tamper signal, not a cost bound** — the vendored
+- [x] **KDF-03**: `p` is documented as a **tamper signal, not a cost bound** — the vendored
       `argon2` 0.5.3 has no `parallel` feature, so parallelism multiplies neither memory nor
       work. A ceiling that implies otherwise is the same defect being fixed.
 
-- [ ] **KDF-04**: Every ceiling has a test proving an oversized parameter is refused before
+- [x] **KDF-04**: Every ceiling has a test proving an oversized parameter is refused before
       allocation, and the refusal names a remedy that exists.
 
-- [ ] **KDF-05**: `check_memory_budget` and `available_memory_kib` are **deleted, not
+- [x] **KDF-05**: `check_memory_budget` and `available_memory_kib` are **deleted, not
       wired up**. The macOS arm reads `hw.memsize` — total installed memory, a constant —
       so it structurally cannot fail; there is no Windows arm; and it names a flag that
       does not exist. A preflight that cannot fire is worse than none, because the docs
       claim it protects the user.
 
-- [ ] **KDF-06**: The imaginary `--kdf-memory` flag is resolved — either implemented or
+- [x] **KDF-06**: The imaginary `--kdf-memory` flag is resolved — either implemented or
       struck from all six places that assume it, including the live refusal text
       (`crypto.rs:788`) and the doc line asserting that refusal ships
       (`docs/sync-format.md:591`). Found while verifying his finding; it is the same class.

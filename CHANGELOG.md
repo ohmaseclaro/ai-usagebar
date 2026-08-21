@@ -24,6 +24,37 @@ Each release is also published at
   objects reconstructing 9.7 MB of files already in the bundle, and Cursor's
   `extensions/` measured 2.9 GB of directories re-installable by name.
 
+### Security
+
+- **A keyfile no longer chooses what it costs to open.** Argon2id's parameters
+  live in cleartext in the keyfile and are read from a remote the format treats
+  as hostile — and they are necessarily consumed *before* the AEAD can say the
+  file was tampered with, since they are what produce the key the tag is checked
+  with. Only memory was bounded, at 4 GiB; `t` and `p` had no ceiling at all, so
+  `t = u32::MAX` — a pure CPU multiplier that allocates nothing, and about
+  1.4 × 10⁹ times the shipped cost — passed every check and then ran for
+  centuries.
+
+  Now `m ≤ 2 GiB` (RFC 9106 §4's first recommended option; the previous 4 GiB
+  was a guaranteed OOM on the 4 GB aarch64 class this project ships for), `t ≤
+  16` and `p ≤ 16`, all enforced in the single function every derivation routes
+  through, before anything is allocated or computed. `p` is documented as a
+  tamper signal rather than a cost bound, because the vendored `argon2` has no
+  parallel feature and claiming otherwise would repeat the defect being fixed.
+
+  The refusal now names the offending value, the bound, what a genuine keyfile
+  carries, and two commands that exist.
+
+### Removed
+
+- **The available-memory preflight, deleted rather than finished.** Its macOS
+  arm read total installed memory — a constant, so it could never fail — it had
+  no Windows implementation, it had no production call sites, and it named a
+  `--kdf-memory` flag that was never built. Six places in the code and three in
+  the docs assumed that flag existed, including a live error telling users to
+  re-run with it and a doc line asserting the refusal ships. All struck, with a
+  test that fails if any message here names a flag this build cannot parse.
+
 ### Fixed
 
 - **A per-account routine registry is no longer restored as a chat index.**

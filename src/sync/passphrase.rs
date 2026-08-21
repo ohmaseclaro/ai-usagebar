@@ -15,7 +15,7 @@
 //! **The floor and the KDF cost are one control, so [`check`] takes both.** That
 //! "rate the locked parameters buy" is the whole derivation of the number 12,
 //! and nothing used to hold the parameters to it: a bundle written at a lower
-//! `--kdf-memory` bought a cheaper guess while the length rule stayed put. Two
+//! KDF cost bought a cheaper guess while the length rule stayed put. Two
 //! halves close it — `crypto::MIN_KDF_MEMORY_KIB` refuses the absurd end
 //! outright, and below the shipped memory cost the accepted length rises from
 //! [`MIN_CHARS`] to [`RECOMMENDED_CHARS`]. Lowering the KDF therefore costs
@@ -163,7 +163,7 @@ pub fn generate() -> Result<Zeroizing<String>> {
 /// green checkmark for `correcthorsebattery`. The real control is [`generate`].
 ///
 /// `k` is not decoration. [`MIN_CHARS`] is arithmetic against the guess rate the
-/// *shipped* parameters buy, so a bundle written at a lower `--kdf-memory` moves
+/// *shipped* parameters buy, so a bundle written at a lower memory cost moves
 /// that arithmetic without moving the rule — the two controls were calibrated
 /// against each other and enforced apart. Below [`KdfParams::default`]'s memory
 /// the trade has to be paid for on the other side: the accepted length rises
