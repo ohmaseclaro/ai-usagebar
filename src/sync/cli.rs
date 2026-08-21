@@ -411,7 +411,7 @@ fn setup(
             return 1;
         }
     };
-    let mut prompt = TtyPrompt::new(stdout_style());
+    let mut prompt = TtyPrompt::new(stdout_style(), std::io::stdin().is_terminal());
     match rt.block_on(github::setup::run(
         &cfg.sync,
         roots,
@@ -815,7 +815,7 @@ fn rekey(
         Err(why) => return refuse(&why),
     };
 
-    let mut prompt = TtyPrompt::new(stdout_style());
+    let mut prompt = TtyPrompt::new(stdout_style(), std::io::stdin().is_terminal());
     prompt.say(
         "Changing the sync password rewraps the master key. Not one pack byte moves — and \
          this is NOT revocation: anyone who already holds a copy of the old keyfile can still \
@@ -902,18 +902,24 @@ const NO_PASSWORD: &str = "no sync password arrived on stdin";
 /// It arrives the same way it always has: stdin only, never argv, never an
 /// environment variable (T-2-29, T-5-66).
 fn sync_password(interactive: bool) -> std::result::Result<zeroize::Zeroizing<String>, String> {
-    if interactive {
-        eprintln!("{ECHOED_PROMPT}");
+    if !interactive {
+        return sync_password_from(std::io::stdin().lock(), None);
     }
-    sync_password_from(std::io::stdin().lock())
+    // Both halves of the prompt on **stderr**: the sentence, then the marker the
+    // cursor rests after. Splitting them across two streams would put the
+    // question in a log file and the cursor on the screen.
+    eprintln!("{ECHOED_PROMPT}");
+    sync_password_from(std::io::stdin().lock(), Some(&mut std::io::stderr()))
 }
 
-/// [`sync_password`] over an injected reader — the tested half, so neither arm
-/// needs a terminal or the process's real stdin to be covered.
+/// [`sync_password`] over an injected reader **and an injected marker stream** —
+/// the tested half, so neither arm needs a terminal or the process's real stdin
+/// to be covered, and `password: ` can be asserted without a pty.
 fn sync_password_from(
     r: impl std::io::BufRead,
+    marker: Option<&mut dyn std::io::Write>,
 ) -> std::result::Result<zeroize::Zeroizing<String>, String> {
-    let pw = passphrase::read_line(r).map_err(|e| e.to_string())?;
+    let pw = passphrase::read_line(r, marker).map_err(|e| e.to_string())?;
     // Without this an unattended run with stdin on /dev/null would spend a
     // gibibyte and a second and a half hashing the empty string first.
     if pw.is_empty() {
@@ -2535,26 +2541,46 @@ mod tests {
     #[test]
     fn the_sync_password_is_one_line_off_the_reader_and_an_empty_stream_is_refused() {
         assert_eq!(
-            *sync_password_from(&b"correct horse battery\n"[..]).unwrap(),
+            *sync_password_from(&b"correct horse battery\n"[..], None).unwrap(),
             "correct horse battery"
         );
         // Only the first line. The second belongs to whichever gate reads next.
         assert_eq!(
-            *sync_password_from(&b"first\nsecond\n"[..]).unwrap(),
+            *sync_password_from(&b"first\nsecond\n"[..], None).unwrap(),
             "first"
         );
 
         for empty in [&b""[..], &b"\n"[..]] {
-            let err = sync_password_from(empty).expect_err("an empty stream is not a password");
+            let err =
+                sync_password_from(empty, None).expect_err("an empty stream is not a password");
             assert_eq!(err, NO_PASSWORD);
         }
 
         // No refusal on this path echoes what it read.
         let secret = "a-password-that-must-not-travel";
-        let err = sync_password_from(format!("{secret}\n").as_bytes())
+        let err = sync_password_from(format!("{secret}\n").as_bytes(), None)
             .map(|_| String::new())
             .unwrap_or_else(|e| e);
         assert!(!err.contains(secret));
+    }
+
+    /// The prompt marker, through the same injected seam. `sync pull`'s prompt
+    /// sentence goes to **stderr**, so the marker does too — a marker on stdout
+    /// under a sentence on stderr is one prompt split across two streams, and
+    /// the half in the redirected file is the half nobody reads.
+    #[test]
+    fn a_terminal_gets_the_prompt_marker_on_the_same_stream_and_a_pipe_gets_nothing() {
+        let mut shown: Vec<u8> = Vec::new();
+        assert_eq!(
+            *sync_password_from(&b"correct horse battery\n"[..], Some(&mut shown)).unwrap(),
+            "correct horse battery"
+        );
+        let marker = String::from_utf8(shown).unwrap();
+        assert_eq!(marker, passphrase::MARKER);
+        assert!(!marker.ends_with('\n'), "{marker:?}");
+        // …and the sentence above it says the password is echoed, which is what
+        // makes the bare marker enough on its own.
+        assert!(ECHOED_PROMPT.contains("echoed"));
     }
 
     /// **Every refusal that does not need a password comes first.** A machine
