@@ -170,6 +170,30 @@ impl Disposition {
             Disposition::Create | Disposition::Update | Disposition::Overwrite { .. }
         )
     }
+
+    /// Would it, **once the credential consent has been given**?
+    ///
+    /// `sync pull` plans with `apply` off, runs the two gates against *that*
+    /// plan, and only then re-plans and writes — so any decision taken on the
+    /// first plan has to account for the two dispositions the credential gate
+    /// promotes into writes. It is not a widening of [`writes`]: by the time
+    /// anything acts on this, the gate has either been answered `yes` (and both
+    /// really do write) or the run has already stopped.
+    ///
+    /// The case that made this necessary is the ordinary one, not an edge:
+    /// restoring a Claude Desktop login onto a Mac that is already signed in as
+    /// somebody else is [`Disposition::ReplacesLiveCredential`], which
+    /// [`writes`] answers `false` for — so the app would have been left running
+    /// over the one write it most needed to be closed for.
+    ///
+    /// [`writes`]: Disposition::writes
+    pub fn writes_after_consent(&self) -> bool {
+        self.writes()
+            || matches!(
+                self,
+                Disposition::NeedsCredentialConfirm { .. } | Disposition::ReplacesLiveCredential
+            )
+    }
 }
 
 /// One manifest entry, resolved and decided.
@@ -208,13 +232,15 @@ impl RestorePlan {
     /// app alone; one that lands the app's cookie jar or its session indexes
     /// answers `true`, and `sync pull --apply` stops the app around the write.
     ///
-    /// Only [`Disposition::writes`] counts. An item the plan already decided to
-    /// skip — identical, locally newer, refused — puts no byte anywhere, and
-    /// closing the user's app over one would be disruption in exchange for
-    /// nothing.
+    /// Only what will really be written counts — see
+    /// [`Disposition::writes_after_consent`] for why that is not quite
+    /// [`Disposition::writes`]. An item the plan decided to skip for good
+    /// (identical, refused, excluded) puts no byte anywhere, and closing the
+    /// user's app over one would be disruption in exchange for nothing.
     pub fn touches_claude_desktop(&self) -> bool {
         self.items.iter().any(|item| {
-            item.disposition.writes() && layout::is_claude_desktop_state(&item.manifest_path)
+            item.disposition.writes_after_consent()
+                && layout::is_claude_desktop_state(&item.manifest_path)
         })
     }
 }
@@ -516,6 +542,88 @@ mod ordering_guard {
             "backup::take must precede write::apply in `run`: an archive taken \
              afterwards restores what the run had already overwritten"
         );
+    }
+}
+
+#[cfg(test)]
+mod desktop_reach {
+    use super::*;
+
+    fn item(manifest_path: &str, disposition: Disposition) -> ItemPlan {
+        ItemPlan {
+            manifest_path: manifest_path.into(),
+            dest: None,
+            category: SyncCategory::Credentials,
+            true_len: 1,
+            chunks: Vec::new(),
+            disposition,
+        }
+    }
+
+    fn plan(items: Vec<ItemPlan>) -> RestorePlan {
+        RestorePlan {
+            items,
+            counter: 1,
+            created_at: DateTime::from_timestamp(1_700_000_000, 0).expect("a fixed timestamp"),
+            repo_id: "github:1".into(),
+            packs_needed: 0,
+            bytes_to_fetch: 0,
+        }
+    }
+
+    /// The whole predicate, in the three answers that matter.
+    #[test]
+    fn only_a_plan_that_really_writes_the_apps_state_reaches_it() {
+        assert!(
+            plan(vec![item(
+                "desktop-data/claude-code-sessions/a/o/local_1.json",
+                Disposition::Create
+            )])
+            .touches_claude_desktop()
+        );
+        assert!(
+            !plan(vec![
+                item("config/config.toml", Disposition::Create),
+                item("claude-home/projects/r/s.jsonl", Disposition::Update),
+            ])
+            .touches_claude_desktop(),
+            "config and transcripts must not close a running app"
+        );
+        assert!(
+            !plan(vec![item(
+                "desktop-profiles/work/desktop-state/Cookies",
+                Disposition::SkipIdentical
+            )])
+            .touches_claude_desktop(),
+            "an item already byte-identical writes nothing, so nothing is disrupted"
+        );
+    }
+
+    /// **The ordinary case, and the one a naive `writes()` misses.** A Mac
+    /// already signed in as somebody else plans the incoming Desktop login as
+    /// `ReplacesLiveCredential`, which writes nothing *yet*; `sync pull` then
+    /// takes the credential consent and re-plans it into a write. Reading the
+    /// first plan with `writes()` alone would leave the app running over
+    /// exactly the write it most needs to be closed for.
+    #[test]
+    fn a_desktop_login_awaiting_the_credential_consent_still_counts() {
+        for awaiting in [
+            Disposition::ReplacesLiveCredential,
+            Disposition::NeedsCredentialConfirm {
+                local_mtime: DateTime::from_timestamp(2, 0).unwrap(),
+                remote_mtime: DateTime::from_timestamp(1, 0).unwrap(),
+            },
+        ] {
+            assert!(
+                !awaiting.writes(),
+                "it does not write until consent is given"
+            );
+            assert!(
+                plan(vec![item("keystore/desktop-cookies/work", awaiting)])
+                    .touches_claude_desktop(),
+                "…and by the time this is read, consent has been given or the run has stopped"
+            );
+        }
     }
 }
 
