@@ -206,18 +206,32 @@ pub fn apply(
         queue.push((item, Target::File(checked)));
     }
 
+    // **Files first, stores last, and never interleaved.**
+    //
+    // One path now has two writers. `cursor-user/globalStorage/state.vscdb` is
+    // carried as a file (it holds the conversations), and
+    // `keystore/cursor-auth` writes the `cursorAuth/*` rows into that very
+    // database. If the store ran first, the file write would replace the whole
+    // database and take the credential with it — and which ran first would
+    // otherwise depend on category order, which is not a thing this ordering
+    // should rest on. The file carries the conversations; the store's row-write
+    // lands on top of whatever database is there when it runs.
+    //
+    // `sort_by_key` on a `bool` is stable, so within each half the queue keeps
+    // manifest order — a partial restore still stops in the same place twice
+    // and is therefore debuggable.
+    queue.sort_by_key(|(_, target)| matches!(target, Target::Store(_)));
+
     progress.stage(
         crate::sync::push::progress::WRITE,
         queue.len(),
         queue.iter().map(|(item, _)| item.true_len).sum(),
     );
 
-    // Manifest order, so a partial restore stops in the same place twice and is
-    // therefore debuggable.
     for (index, (item, target)) in queue.into_iter().enumerate() {
         let outcome = match &target {
             Target::File(dest) => write_one(packs, item, dest, plan.created_at),
-            Target::Store(store) => write_store(ctx, packs, item, *store),
+            Target::Store(store) => write_store(ctx, packs, item, store),
         };
         if let Err(why) = outcome {
             // `Applied` carries where the run stopped, which is what the summary
@@ -284,7 +298,7 @@ fn write_store(
     ctx: &RestoreCtx<'_>,
     packs: &PackSource,
     item: &ItemPlan,
-    store: Store,
+    store: &Store,
 ) -> Result<()> {
     let mut value: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
     for id in &item.chunks {
@@ -1111,5 +1125,69 @@ mod tests {
                  destination's own directory"
             );
         }
+    }
+
+    /// **Two writers, one path, and a fixed order.**
+    ///
+    /// `cursor-user/globalStorage/state.vscdb` is carried as a file — it holds
+    /// the conversations — and `keystore/cursor-auth` writes the `cursorAuth/*`
+    /// rows into that same database. The file must land first, or it replaces
+    /// the database and takes the freshly written credential with it.
+    ///
+    /// Manifest order here deliberately puts the **store first**, so a run that
+    /// merely followed the manifest would write it first. The file's write is
+    /// then made to fail, and the store having stayed empty is the proof that
+    /// the file ran ahead of it.
+    #[test]
+    fn every_file_is_written_before_any_store_whatever_the_manifest_order_says() {
+        let m = Machine::new();
+        const DB: &str = "cursor-user/globalStorage/state.vscdb";
+        const ROWS: &str = r#"{"cursorAuth/accessToken":"from-the-bundle"}"#;
+
+        // The database's own directory, planted as a regular file, so the file
+        // half of the run cannot succeed.
+        let dest = m.dest(DB);
+        std::fs::create_dir_all(dest.parent().unwrap().parent().unwrap()).unwrap();
+        std::fs::write(dest.parent().unwrap(), b"in the way").unwrap();
+
+        let (packs, ids) = packed(&[ROWS.as_bytes(), b"a whole database"]);
+        let store_item = ItemPlan {
+            dest: None,
+            manifest_path: "keystore/cursor-auth".into(),
+            category: SyncCategory::Credentials,
+            true_len: ROWS.len() as u64,
+            chunks: ids[0].clone(),
+            disposition: Disposition::Create,
+        };
+        let file_item = item(
+            &m,
+            DB,
+            b"a whole database",
+            ids[1].clone(),
+            Disposition::Create,
+        );
+        let plan = plan_of(vec![store_item, file_item]);
+
+        let applied = apply(
+            &m.ctx(),
+            &plan,
+            &packs,
+            &mut crate::sync::push::progress::Silent,
+        )
+        .unwrap();
+        assert_eq!(
+            applied.failed_at.as_deref(),
+            Some(DB),
+            "the file half must have run first"
+        );
+        assert_eq!(applied.written, 0);
+        assert!(
+            m.roots
+                .stores
+                .edit()
+                .get(&crate::sync::keystore::Store::CursorAuth)
+                .is_none(),
+            "the store was written before the file it writes into"
+        );
     }
 }
