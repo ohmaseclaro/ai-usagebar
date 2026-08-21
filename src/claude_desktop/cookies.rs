@@ -227,14 +227,15 @@ pub fn write_sealed(path: &Path, rows: &[(CookieKey, Vec<u8>)]) -> Result<(usize
         AppError::Credentials(format!("could not set the cookie jar busy timeout: {e}"))
     })?;
     let tx = conn.transaction().map_err(|e| running(path, e))?;
-    let sql = format!(
-        "UPDATE cookies SET encrypted_value = ?1 WHERE \
+    // Every column of `cookies_unique_index`, in its order — the same identity
+    // `KEY_COLUMNS` selects, spelled out here because a bound parameter cannot
+    // be interpolated into a column list.
+    let sql = "UPDATE cookies SET encrypted_value = ?1 WHERE \
          host_key = ?2 AND top_frame_site_key = ?3 AND has_cross_site_ancestor = ?4 AND \
-         name = ?5 AND path = ?6 AND source_scheme = ?7 AND source_port = ?8"
-    );
+         name = ?5 AND path = ?6 AND source_scheme = ?7 AND source_port = ?8";
     let (mut updated, mut missing) = (0usize, 0usize);
     {
-        let mut stmt = tx.prepare(&sql).map_err(|e| running(path, e))?;
+        let mut stmt = tx.prepare(sql).map_err(|e| running(path, e))?;
         for (key, sealed) in rows {
             // `sealed` is a live session and appears in no message on any arm.
             // `key.name` is a cookie name — `sessionKey`, `__cf_bm` — which is
@@ -486,7 +487,8 @@ mod tests {
             (partitioned.clone(), b"v10-partitioned".to_vec()),
         ]);
 
-        let (updated, missing) = write_sealed(&path, &[(plain.clone(), b"v10-new".to_vec())]).unwrap();
+        let (updated, missing) =
+            write_sealed(&path, &[(plain.clone(), b"v10-new".to_vec())]).unwrap();
         assert_eq!((updated, missing), (1, 0));
 
         let got = read_sealed(&path).unwrap();
@@ -544,9 +546,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("Cookies");
         let mut messages = vec![
-            write_sealed(&missing, &[(key(".claude.ai", "sessionKey"), secret.clone())])
-                .unwrap_err()
-                .to_string(),
+            write_sealed(
+                &missing,
+                &[(key(".claude.ai", "sessionKey"), secret.clone())],
+            )
+            .unwrap_err()
+            .to_string(),
         ];
         let (_d, path) = jar(&[(key(".claude.ai", "other"), b"v10-x".to_vec())]);
         messages.push(
