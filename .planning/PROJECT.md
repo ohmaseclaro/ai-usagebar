@@ -24,8 +24,10 @@ akitaonrails's review of PR #113 before the first one ships.
 
 **Target features:**
 - Bounded KDF: mandatory memory, time and parallelism ceilings enforced **before** any
-  Argon2id work, on every path that opens a keyfile (restore, join, open), with an
-  available-memory preflight and a Windows implementation
+  Argon2id work, on every path that opens a keyfile (restore, join, open). The
+  available-memory preflight this originally promised is **deleted rather than finished**
+  — its macOS arm read total installed memory, a constant, so it could never fire, and it
+  named a `--kdf-memory` flag that does not exist. See KDF-05 and `research/KDF-BOUNDS.md`.
 - Portable archiving: `tar` resolved per-platform and its stderr sanitized through the
   project's usual terminal-control and sensitive-diagnostic path
 - Three staged PRs in the maintainer's own order: format + bounded KDF/keyfile core,

@@ -737,3 +737,609 @@ Assignment notes where a requirement could have gone elsewhere:
 
 ---
 *Roadmap created: 2026-08-19*
+
+---
+---
+
+# Roadmap: v1.1 — Staged upstream PRs
+
+**Created:** 2026-08-21
+**Milestone goal:** Decompose the encrypted-sync change — 75 files, **+53,409 / −71** against
+upstream `main` at `526ea17` (v1.4.0), `.planning/` excluded — into PRs a single reviewer can
+hold, and close every finding from akitaonrails's closing review of PR #113 before the first
+one opens.
+
+**Granularity:** standard (no `.planning/config.json`; defaults apply) · **Phase IDs:** sequential,
+continuing from Phase 6
+**Coverage:** 18/18 v1.1 requirements mapped, no orphans, no duplicates.
+
+This milestone builds almost nothing. It is subtraction, re-ordering, and one small seam — see
+D-5. The work is done, green on macOS and Linux (**1,813** `#[test]`/`#[tokio::test]` in `src/`,
+81 in `tests/`), and has been the user's daily driver on two Macs since 2026-08-21. What it is
+not is reviewable, and that is the whole of v1.1.
+
+Inputs, not re-opened here: `.planning/research/KDF-BOUNDS.md` (ceilings, prior art, three
+defects found in passing) and `.planning/research/PR-SPLIT-INVENTORY.md` (the measured
+file-by-file split).
+
+---
+
+## Sequencing rationale (v1.1)
+
+Six constraints drove this split. Each is load-bearing and each came from him or from a
+measurement, not from a preference.
+
+1. **The KDF blocker gates literally everything, so it is Phase 7 and nothing precedes it.**
+   Today a hostile keyfile chooses the memory *and* the CPU the victim spends before one byte
+   is authenticated: `check_kdf_ceiling` tests `m` only, at 4 GiB, and `t` and `p` are bounded
+   by nothing but `u32::MAX`. Ordering the fix first is also what removes an ambiguity — his
+   rule reads "no PR opens before KDF is closed", and Phase 8 opens a PR. Since the fix is
+   ~40 lines plus two deletions, obeying the rule literally costs a day and settles the
+   question.
+
+2. **The first thing he sees is not our change.** Phase 8's PR fixes three *pre-existing*
+   upstream sites carrying the identical defect he faulted ours for (DIAG-02) — his own code,
+   his own bug class, ~80 lines. A maintainer who has just written a five-finding review has a
+   prior about this fork; the cheapest way to move it is to hand him something small, correct
+   and not ours. It is also, structurally, the rehearsal: a branch off v1.4.0, `.planning/`-free,
+   four CI jobs green — the whole pipeline proven at 80 lines instead of 4,448.
+
+3. **Windows has never actually run.** Three Windows defects were fixed this session and
+   `gh run list --repo ohmaseclaro/ai-usagebar` returns **nothing** — Actions is off on the
+   fork, as GitHub defaults it. PORTAB-01/02/03 are committed and *unobserved*, and PORTAB-04
+   says plainly that nothing counts until seen. Phase 8 is where a real `windows-latest` job
+   runs for the first time, which is also why the two open Windows calibrations (CAL-5, CAL-7's
+   sibling) land there and nowhere earlier.
+
+4. **PR 1 is a gate, not a step.** If he rejects the format or the bounded-KDF approach, every
+   phase after it changes shape. That is the definition of a phase boundary, so PR 1 gets its
+   own phase even though it carries two requirements.
+
+5. **His third PR is 19,100 lines and it is not going to become one.** Measured: 4,448 /
+   12,618 / 19,100. The third splits by *ownership* rather than by size (D-4) — the GitHub
+   transport and the credential stores go to the companion repository, which is the boundary he
+   named himself. What remains of it upstream is a thin local CLI surface that rides the PRs
+   whose modules it drives.
+
+6. **The fork stays the daily driver, so no PR branch is ever the working branch.** Work lands
+   on `milestone/encrypted-sync`; every PR branch is a *derived, throwaway view* produced with
+   `/gsd-pr-branch`. Invert that once and the two-Mac setup that found four defects no audit
+   did stops being exercised.
+
+---
+
+## Milestone-wide invariants (v1.1)
+
+These apply to every phase below **in addition to** the v1.0 invariants above, which still hold.
+
+- **No upstream PR opens before Phase 7 is merged to `milestone/encrypted-sync`.** Including
+  Phase 8's.
+
+- **Every PR branch is rebased onto upstream `main` at v1.4.0 or later and contains no
+  `.planning/`.** Verified mechanically (`git log --stat | grep -c '^\s*\.planning/'` == 0)
+  before the branch is pushed, not by inspection.
+
+- **All four CI jobs — `ubuntu-latest`, `rust 1.88`, `macos-latest`, `windows-latest` — are
+  observed green on the *exact head* of every PR before it is opened.** A green run on an
+  earlier commit is not evidence. (PORTAB-04, restated per-PR.)
+
+- **Every PR states in its description that its dependency additions were already in the tree.**
+  `Cargo.toml` gains 24 lines and the milestone held a zero-new-crate rule; a reviewer should
+  not have to verify that by hand. (SPLIT-04, restated per-PR.)
+
+- **The fork's two Macs keep syncing throughout.** Any phase that would break the working
+  setup stops and says so instead.
+
+- **`extensions` never enters an upstream PR** (D-6).
+
+---
+
+## Decisions taken by this roadmap
+
+| # | Decision | Why |
+|---|---|---|
+| **D-1** | **`--kdf-memory` is struck, not implemented** (KDF-06) | Six sites assume a flag that exists nowhere in `src/`, including a live refusal at `crypto.rs:788` and `docs/sync-format.md:591` asserting that refusal ships. Striking is a net-negative diff in a milestone whose entire purpose is a smaller change; implementing adds a CLI surface to a PR he already called too big, and widens the compatibility set from the single point every released keyfile occupies (`m=1 GiB, t=3, p=1`) to a range nothing was tested against. **Reversal condition:** a real user hits a machine where 1 GiB is too much — the new ceiling refusal is what will tell us, and it names two actions that work today. |
+| **D-2** | **`check_memory_budget` and `available_memory_kib` are deleted outright — including the working Linux arm** (KDF-05) | Zero production call sites, so deletion is strictly the smaller diff. The macOS arm reads `hw.memsize` (total installed, a constant) and therefore *cannot fail*; there is no Windows arm at all, which is the exact Unix-only shape of his first finding; and its message names D-1's imaginary flag. Keeping only the Linux arm was considered and rejected as an asymmetry that has to be defended in a PR whose job is to be uncontroversial. **Note the conflict:** `PROJECT.md`'s v1.1 target-feature bullet still says "with an available-memory preflight and a Windows implementation" — that line predates KDF-05, which was written on 2026-08-21 and is explicit that both functions are *deleted, not wired up*. **REQUIREMENTS.md wins**; PROJECT.md's bullet is stale and should be corrected at the next transition. **Reversal condition:** CAL-7. |
+| **D-3** | **`try_reserve_exact` + `hash_password_into_with_memory` deferred behind CAL-5** | Measured on this Mac: `try_reserve_exact` of **4 TiB succeeded** on a 36 GiB host. It buys nothing on macOS or Linux. Its entire value is converting Windows's `handle_alloc_error` abort into a `Result` — which is inferred from the commit-charge model and **never observed**. Phase 8 is the first time a Windows runner exists; measure there, implement only on `Err`. |
+| **D-4** | **His third PR becomes the companion repository, not a fourth upstream PR** | SPLIT-01 asks for his order — format/KDF, then local archive/restore, then remote transport — and OWN-01 says remote transport and credential backup live elsewhere. Both are honoured: the order stands, the third destination changes. He is told this in PR 1's description, not discovered in PR 3's absence. |
+| **D-5** | **The upstream core is a *working local encrypted backup*, and that is the milestone's only net-new code** | Verified: `restore::PackSource` is already transport-agnostic (`add(id, bytes)`, content-address checked, sealed-header bounded) — only `restore::fetch::resolve` is GitHub-bound. A `Source` seam yielding (pointer, keyfile, pack bytes) with a local-directory impl is ~250–400 lines, and it makes upstream's three PRs deliver `sync archive` / `sync restore --from <dir>` end to end with no token, no network and no credential category. Without it upstream merges 17k lines of library nobody can invoke — his objection restated in a new shape. It also makes the ownership split a plug-in rather than a fork: the companion repo adds GitHub as a *second* `Source`. |
+| **D-6** | **`extensions` stays fork-only** | The sixth category (Claude Code skills/agents/hooks/plugins, Cursor agents/rules; 10.64 MiB stored) widens scope in precisely the way he objected to. Contained: **15 references across five files** (`src/config.rs`, `src/tui/settings.rs`, `src/sync/scope.rs`, `src/sync/restore/merge.rs`, `docs/configuration.md`) — one enum arm, one collector, its tests, one doc block. Dropping it from a derived PR branch is mechanical; it must stay mechanical, so no upstream-bound module may grow a second `Extensions` reference. |
+| **D-7** | **The goodwill PR carries the shared sanitizer *and* the `AppError::Io` root-cause fix** | Verified: upstream `src/display.rs` at v1.4.0 has `sanitize_untrusted_field` only — `sanitize_untrusted_line` and `sanitize_untrusted_path` are ours. And upstream's `AppError::Io` renders `{path}` raw, while ours routes it through `sanitize_untrusted_path`. That is a crate-wide error-format change; landing it inside a 12.6k-line sync PR asks a reviewer to evaluate it in the worst possible context. Landing it in an 80-line PR that fixes three of his own sites asks him to evaluate it in the best one — and it seeds the helper PR 2 depends on. Kept as a separate commit inside that PR so he can ask for it split without a re-do. |
+
+---
+
+## Calibrations
+
+The v1.0 roadmap scheduled four; CAL-3 (Argon2id on aarch64) was never obtained after six
+phases, and `docs/sync-format.md` still records that. v1.1 adds three, each with a fallback so
+none can block, and CAL-6 finally retires CAL-3.
+
+| # | Measurement | Scheduled | Gates | Fallback if unanswered |
+|---|---|---|---|---|
+| CAL-5 | On a real `windows-latest` runner: `try_reserve_exact` a `Vec<argon2::Block>` larger than RAM + pagefile — `Err` or abort? | Phase 8 | D-3 | Assume no value → ceilings only, and say so in the PR |
+| CAL-6 | Argon2id wall clock at the **ceiling** (m=2 GiB, t=16) and at the **default** (m=1 GiB, t=3), on an idle M-series Mac **and** a slow aarch64 Linux box | Phase 7 | The numbers PR 1's description quotes | Quote the **ratio** only (10.7× the shipped default's `m×t`), never an absolute — the research's own rationale is built this way for exactly this reason |
+| CAL-7 | In a 1 GB-memory container, open a bundle at m=2 GiB: SIGKILL, or an allocation error? | Phase 7 | D-2's reversal | Assume SIGKILL, delete anyway, record the gap in `docs/sync-format.md` |
+
+Every one is `#[ignore]`d in `tests/live.rs` or a CI-job one-liner. **None blocks a phase.**
+The research's remaining four unmeasured items (§7.2, §7.5, §7.6, §7.7) are recorded there and
+deliberately not scheduled — no decision in this roadmap rests on any of them.
+
+---
+
+## Phases (v1.1)
+
+- [ ] **Phase 7: The KDF Blocker, Closed** - Three ceilings, two deletions, one imaginary flag struck
+- [ ] **Phase 8: A Windows Job That Has Actually Run** - The pipeline proven, and a PR that fixes his bugs, not ours
+- [ ] **Phase 9: PR 1 — Format and Bounded KDF** - The first 4.7k lines upstream, and the gate on everything after
+- [ ] **Phase 10: PRs 2 and 3 — The Local Archive, and a Restore With a Local Source** - Upstream gets a backup tool that works with no network
+- [ ] **Phase 11: The Companion Repository** - Transport and credentials find their home, behind an independent review
+
+---
+
+## Phase Details (v1.1)
+
+### Phase 7: The KDF Blocker, Closed
+
+**Goal**: No keyfile chooses what it costs to open. Every path that opens one — restore, join,
+open — refuses an out-of-bounds parameter before a single block is allocated, and every claim
+the codebase makes about protecting the user is one the code actually keeps.
+
+**Depends on**: Nothing (first v1.1 phase; gates all four that follow)
+
+**Requirements**: KDF-01, KDF-02, KDF-03, KDF-04, KDF-05, KDF-06
+
+**Security-sensitive**: **yes** — this is the blocker, and it is the milestone's one genuine
+vulnerability. Security audit required.
+
+**Scope — in**:
+
+- Three ceilings, all inside the existing `check_kdf_ceiling`, which `derive_kek` already calls
+  before `Params::new` at `crypto.rs:176`. **No new call sites, no plumbing, no platform code,
+  no dependency, no `unsafe`** — the function's own doc comment already argues why the guard
+  belongs in the shared function rather than at each caller, and that argument is correct.
+  - `MAX_KDF_MEMORY_KIB`: 4 GiB → **2 GiB** (`2_097_152`). RFC 9106 §4's first recommended
+    option and the most any published recommendation asks for. 4 GiB was never a bound — it is
+    a guaranteed OOM on the 4 GB aarch64 class this project ships binaries for and names in
+    `docs/sync-format.md`.
+  - `MAX_KDF_TIME` = **16**, new. This is the sharper half: `t` is a pure linear CPU multiplier
+    (RFC 9106 §3.2) needing no allocation at all, and today it is bounded by `u32::MAX` — ~1.43
+    × 10⁹ times the shipped cost. 16 sits strictly above every published `t` (RFC 9106: 1, 3;
+    OWASP: 1–5; borg: 3; Bitwarden: 2–10).
+  - `MAX_KDF_PAR` = **16**, new, and documented as a **tamper signal, not a cost bound**
+    (KDF-03) — the vendored `argon2` 0.5.3 has no `parallel` feature, so lanes fill sequentially
+    and `p` multiplies neither memory nor work. Saying otherwise would be the same defect being
+    fixed. Not `p == 1`, because that would refuse both of RFC 9106's own options.
+
+- The refusal text, replacing the current one that explains the implementation rather than the
+  remedy: names the offending values *and* the bounds (all public, all attacker-supplied, so
+  nothing leaks), states what a genuine keyfile carries (`m=1024, t=3, p=1` — sayable only
+  because the compatibility set is verifiably a single point), and gives two actions that exist.
+  **It must not say "re-run with a lower `--kdf-memory`"** (D-1).
+
+- The deletion (D-2): `check_memory_budget`, all three `available_memory_kib` `#[cfg]` arms,
+  their three tests, the subprocess spawn, and `tests/live.rs`'s one caller.
+
+- The strike (D-1): all six `--kdf-memory` references — `crypto.rs:397`, `crypto.rs:776`,
+  `passphrase.rs:18`, `passphrase.rs:166`, `docs/sync-format.md:82`, `:582` — plus the live
+  refusal at `crypto.rs:788`, the test asserting that text at `crypto.rs:1268`, and
+  `docs/sync-format.md:591`'s claim that the refusal ships.
+
+- Tests (KDF-04): each ceiling at boundary and boundary+1; one proving the **shipped default**
+  still passes; one proving refusal happens **before allocation** (assert no large allocation
+  occurs, not that it is fast); one asserting the refusal text names a remedy that exists —
+  i.e. that it contains no `--` flag this build does not parse.
+
+**Scope — out**: `try_reserve_exact` and `hash_password_into_with_memory` (D-3, deferred to
+Phase 8's measurement); any new CLI flag (D-1); any per-machine calibration of the ceiling —
+rage's approach is the best-argued alternative in the prior art and it costs a ~1 s benchmark on
+*every* open against a ~1.5 s derivation, which is his call to make, not this roadmap's. Recorded
+as weighed, not missed.
+
+**Calibration scheduled here**: CAL-6, CAL-7.
+
+**Deliverables**: the three ceilings and the new refusal in `crypto.rs`; the deletions; the
+struck flag across nine sites; the KDF-04 test set; `docs/sync-format.md` updated to describe
+what the code does — with the 2 GiB / t=16 / p=16 rationale written out against RFC 9106,
+OWASP, borg, Bitwarden and age/rage, because KDF-02 asks for justification in writing and
+because *"borg and restic do not bound at all"* is the sentence that makes this a real finding
+rather than a style note.
+
+**Success Criteria** (what must be TRUE):
+
+1. A keyfile carrying `m = 2 GiB + 1 KiB`, or `t = 17`, or `p = 17` is refused on **all three**
+   of restore, join and open, with no allocation attempted — proven by a test per parameter per
+   path, not by one test and an argument.
+
+2. A keyfile carrying the shipped `(m=1 GiB, t=3, p=1)` still opens, on every path, unchanged.
+
+3. `grep -rn 'kdf-memory' src/ docs/ tests/` returns nothing, and no error message in `src/sync/`
+   names a flag the CLI does not parse — asserted by a test, since this is the second time this
+   class of claim has shipped.
+
+4. `check_memory_budget` and `available_memory_kib` do not exist, and `cargo build` is clean on
+   all three platforms without them.
+
+5. The refusal names the offending value, the bound, what a genuine keyfile looks like, and two
+   actions — and a wrong password still collapses to the *same* message as a downgraded `m`,
+   because that collapse is deliberate and must survive.
+
+6. `cargo test`, `cargo clippy --all-targets -- -D warnings` and `cargo machete` clean; the two
+   Macs still sync.
+
+**Plans**: TBD
+
+---
+
+### Phase 8: A Windows Job That Has Actually Run
+
+**Goal**: The four-job CI matrix has been observed green on this fork, and the maintainer has
+received a small, correct PR that fixes three of his own pre-existing bugs — proving the
+pipeline, the rebase discipline and the `.planning/` filter at 80 lines rather than at 4,448.
+
+**Depends on**: Phase 7 (no PR opens before the blocker is closed)
+
+**Requirements**: PORTAB-01, PORTAB-02, PORTAB-03, PORTAB-04, DIAG-02, SPLIT-03
+
+**Security-sensitive**: no — the sanitizer itself was audited when DIAG-01 landed; this phase
+moves it, it does not design it.
+
+**Scope — in**:
+
+- **Enable Actions on the fork.** `gh run list --repo ohmaseclaro/ai-usagebar` returns nothing
+  today; GitHub disables workflows on forks by default. Until this is done, PORTAB-04 cannot be
+  satisfied by any amount of code, and the three committed Windows fixes (a9f3ee4, 3b20ef7,
+  bc1f8e2) remain unobserved claims.
+
+- **Observe all four jobs green on `milestone/encrypted-sync` post-Phase-7**: `ubuntu-latest`,
+  `rust 1.88`, `macos-latest`, `windows-latest`. This closes PORTAB-01/02/03 — the absolute
+  `tar` path, the five tests that needed a `/bin/sh` stand-in, and the CRLF-fragile structural
+  guard — by observation rather than by assertion.
+
+- **The DIAG-02 PR**, off upstream `main` at v1.4.0 or later:
+  - `src/display.rs` gains `sanitize_untrusted_line` (three lines and its doc — upstream has
+    only `sanitize_untrusted_field`, verified).
+  - `src/claude_desktop/app.rs:231`, `src/anthropic/keychain.rs:142` and `:233` route their
+    `String::from_utf8_lossy(&…stderr)` through it. All three are the identical defect ours was
+    faulted for, and all three predate this fork's work.
+  - A separate commit in the same PR: `sanitize_untrusted_path` and `AppError::Io`'s `Display`
+    (D-7). Upstream renders `{path}` raw from a dozen call sites; this is the root-cause fix for
+    the whole class, and it is one attribute plus two functions.
+  - One test per site, with `\x1b` — **not** `\033`, which is not a Rust escape and which
+    silently made the original assertion pass on text carrying no ESC at all (98fb0bb).
+    `keychain.rs`'s two tests are macOS-gated and the `macos-latest` job covers them.
+
+- **The branch mechanics, proven here and reused four more times**: `/gsd-pr-branch` filters
+  `.planning/`; a `git log --stat` grep asserts zero `.planning/` paths; the branch is rebased,
+  pushed, CI observed green **on its exact head**, then opened.
+
+**Scope — out**: any `src/sync/` file (the PR must be about his code, not ours); the
+`try_reserve_exact` change itself — Phase 8 only *measures* CAL-5 and hands D-3 a real answer;
+opening more than one PR.
+
+**Calibration scheduled here**: CAL-5 — a Windows-job one-liner, not a research task.
+
+**Deliverables**: Actions enabled and one four-job green run recorded by URL; the DIAG-02 PR
+opened upstream; CAL-5's answer written into `docs/sync-format.md`; the branch recipe recorded
+so Phases 9–11 execute it rather than re-derive it.
+
+**Success Criteria** (what must be TRUE):
+
+1. A `windows-latest` run exists on this fork with a green `Test` step, and its URL is in the
+   phase record. This is the first time that has ever been true.
+
+2. All four jobs are green on the same commit, and that commit is the head of
+   `milestone/encrypted-sync` after Phase 7.
+
+3. The DIAG-02 PR is open upstream, touches no file under `src/sync/`, contains no `.planning/`
+   path, and is based on v1.4.0 or later.
+
+4. Feeding `ESC [ 2 J` and an embedded newline through each of the three fixed sites produces no
+   control byte and no forged line — one test per site, ESC written `\x1b`.
+
+5. `AppError::Io`'s `Display` renders a path containing an escape sequence with the escape
+   removed, asserted once at the `Display` rather than at any print site.
+
+6. CAL-5 has an answer, and D-3 is resolved in writing either way.
+
+**Plans**: TBD
+
+---
+
+### Phase 9: PR 1 — Format and Bounded KDF
+
+**Goal**: The bundle format and the now-bounded KDF are merged into `akitaonrails/ai-usagebar` —
+the first of this work upstream, in the order he asked for, at a size one reviewer can hold.
+
+**Depends on**: Phase 8 (the pipeline, and the goodwill it buys)
+
+**Requirements**: SPLIT-01, SPLIT-04
+
+**Security-sensitive**: **yes** — it is the crypto, now bounded. The Phase 7 audit is the input;
+this phase re-runs it against the *derived branch*, because a rebase can drop a guard.
+
+**Scope — in**:
+
+- **The PR's contents** — the inventory's group 1 plus `anchor.rs`, **6 + 1 files, 2,561 code +
+  2,161 test ≈ 4,722 lines**:
+  `src/sync/crypto.rs` · `src/sync/mod.rs` · `src/sync/model.rs` · `src/sync/pack.rs` ·
+  `src/sync/passphrase.rs` · `src/sync/chunk.rs` · `src/sync/anchor.rs`.
+  `anchor.rs` moves here from group 3: the rollback high-water mark is part of the format's
+  tamper story (CRYPTO-05), not part of the transport.
+
+- **No CLI, deliberately.** He asked for the format first; a format PR with no user-facing verb
+  is the correct shape, and its justification is its 2,161 lines of adversarial tests — wrong
+  password, downgraded params, substituted chunk, flipped bit, truncated manifest, rolled-back
+  counter — each asserting **zero** plaintext. Say this in the description rather than letting
+  him find dead code and infer it.
+
+- **The description does four jobs**: states the three-PR order and that the third is the
+  companion repository (D-4) *before* he asks; states that all 24 `Cargo.toml` lines were
+  already in the tree under a zero-new-crate rule (SPLIT-04); states the bounded-KDF rationale
+  with its citations and CAL-6's ratio; and states that borg and restic — the two projects with
+  the closest threat model — do not bound at all, so his finding was a real gap and not a
+  stylistic preference.
+
+- **`.planning/`-free, rebased on v1.4.0+, four jobs green on the exact head** — the Phase 8
+  recipe, executed.
+
+**Scope — out**: anything in groups 2 or 3; the `Source` seam (Phase 10); `keystore.rs` and
+`restore/merge.rs` (Phase 11); `extensions` (D-6 — verify zero references reach this branch).
+
+**Deliverables**: the PR, open, green and described; a record of what he asks for; the rebase
+applied back to `milestone/encrypted-sync` if he requires changes, so the fork and the PR never
+diverge.
+
+**Success Criteria** (what must be TRUE):
+
+1. The PR is open upstream at ≤ ~4,800 lines across 7 files, based on v1.4.0 or later, with zero
+   `.planning/` paths and four green jobs on its head commit.
+
+2. Its description names all three PRs in his order and says plainly that the third is a
+   companion repository and why — he learns the ownership split from us, not from its absence.
+
+3. Every `Cargo.toml` addition is listed with the pre-existing use that already justified it.
+
+4. `grep -rn 'Extensions' <branch>/src/` returns nothing.
+
+5. The adversarial tests pass on all four CI jobs, and the Phase 7 ceilings are present and
+   enforced on the derived branch — asserted by running the KDF-04 tests there, because a rebase
+   is exactly how a guard goes missing.
+
+6. Merged, or a written record of what he requires — and if he rejects the approach, Phases 10
+   and 11 are re-planned rather than executed.
+
+**Plans**: TBD
+
+---
+
+### Phase 10: PRs 2 and 3 — The Local Archive, and a Restore With a Local Source
+
+**Goal**: Upstream gets a **working** encrypted backup tool — `sync archive` writes a bundle to
+a directory, `sync restore` reads one back — with no token, no network call and no credential
+category anywhere in it.
+
+**Depends on**: Phase 9 (merged, or its requirements met)
+
+**Requirements**: SPLIT-02, DIAG-01
+
+**Security-sensitive**: **yes** — this is the restore path: hostile-manifest paths, the
+pre-restore backup, and the no-surviving-plaintext rule. Security audit required on the derived
+branches.
+
+**Scope — in**:
+
+- **The `Source` seam (D-5) — the milestone's only net-new code, ~250–400 lines.**
+  `restore::PackSource` is already transport-agnostic: `add(id, bytes)` content-address-checks
+  the pack and bounds every offset against its own sealed header. Only `restore::fetch::resolve`
+  is GitHub-bound (`push::pointer::load`, `find_release`, `download_asset`). Extract the three
+  things `resolve` actually needs — a pointer, a keyfile, pack bytes by id — behind a trait, and
+  give it a local-directory implementation of a handful of `fs::read`s. The push side is
+  symmetric: `push/packer.rs` is already transport-free, so a local writer emits packs, pointer
+  and keyfile into a directory.
+
+- **PR 2 — what to archive** (group 2's front half plus its CLI, ≈ 7k lines): `src/sync/scope.rs`
+  (minus `Extensions`, D-6) · `src/sync/index.rs` · `src/sync/plan.rs` ·
+  `src/sync/push/packer.rs` · `src/sync/transcripts.rs`, plus the slice of `src/sync/cli.rs` and
+  `src/sync/report.rs` that implements `sync status`, `sync archive` and their `--dry-run`.
+
+- **PR 3 — putting it back** (group 2's restore half plus its CLI, ≈ 7k lines):
+  `src/sync/restore/{mod,fetch,write,layout,backup,report}.rs` and the local `Source` impl, plus
+  the `sync restore --from <dir>` slice of `cli.rs`/`report.rs`. `backup.rs` carries DIAG-01 —
+  `tar`'s stderr through `sanitize_untrusted_line`, whose home upstream Phase 8 already
+  established, so this PR adds a *call*, not a helper.
+
+- **Splitting the CLI rather than deferring it.** The inventory names both options; this is the
+  one that leaves no PR shipping code nobody can invoke. The rule is mechanical: **each PR
+  carries exactly the subcommands its own modules implement and nothing else.** `cli.rs` and
+  `report.rs` are therefore touched by three PRs and finished by none of them, which is stated
+  up front.
+
+- **`restore/merge.rs` does not come.** Its three-way merge is generic, but
+  `ReplacesLiveCredential` and `force_credentials` are the exact disposition he wants behind an
+  independent review. The file is split rather than assigned: the generic newest-wins merge can
+  follow later; the credential disposition goes to Phase 11.
+
+- **SPLIT-02's threshold, applied and stated.** 12,618 lines is not holdable, so group 2 becomes
+  two PRs of ~7k (≈2.5k code each). The threshold is written down here so Phase 11 inherits it
+  rather than re-deriving it.
+
+**Scope — out**: every `src/sync/github/**` file; `push/{mod,upload,pointer,progress,prune,rekey}.rs`;
+`keystore.rs`; the credential category; `Extensions`; the macOS menu bar and TUI sync surfaces
+(fork-only until the core is upstream).
+
+**Deliverables**: the `Source` seam with a local implementation and its hermetic tests; two PRs
+opened in order, the second rebased on the first; a `docs/` page describing local archive/restore
+as a standalone feature — because that is what upstream is being asked to merge, not "part one
+of a sync product".
+
+**Success Criteria** (what must be TRUE):
+
+1. On a clean checkout of PR 3's branch with no token and no network, `sync archive` writes a
+   bundle to a temp directory and `sync restore --from <dir>` reproduces a seeded tree
+   byte-exactly — asserted by a hermetic test, not a manual run.
+
+2. Neither PR exceeds ~7,500 lines, and each opens with four green jobs on its exact head.
+
+3. Every subcommand either PR adds is implemented by a module in that same PR — no PR ships an
+   unreachable verb and no PR ships a module with no way to reach it.
+
+4. `tar`'s stderr on the restore path carries no control byte, no forged line and no unbounded
+   length, through the helper Phase 8 landed rather than a second copy of it (DIAG-01).
+
+5. `grep -rn 'Extensions\|keystore\|github::' ` over both branches returns nothing.
+
+6. The pre-restore backup is taken before the first write, its rollback command is printed, and
+   no plaintext reaches a temp path that outlives the operation — the v1.0 SAFE-03/04/05
+   properties, re-asserted on the derived branch.
+
+**Plans**: TBD
+
+---
+
+### Phase 11: The Companion Repository
+
+**Goal**: The GitHub transport and the credential stores live in a repository of their own,
+plugging into the upstream core through the `Source` seam — and credential backup is not offered
+to anyone else until someone qualified has looked at it.
+
+**Depends on**: Phase 10
+
+**Requirements**: OWN-01, OWN-02
+
+**Security-sensitive**: **yes** — this is where every credential path ends up. OWN-02 *is* the
+audit, and it is external.
+
+**Scope — in**:
+
+- **The companion repository**, taking group 3's remainder plus the credential pair —
+  17 files, ≈ 19k lines: `src/sync/github/{mod,setup,write,token,gate,http,pairing,keychain}.rs` ·
+  `src/sync/push/{mod,upload,pointer,progress,prune,rekey}.rs` · `src/sync/keystore.rs` ·
+  `src/sync/restore/merge.rs`'s credential disposition · the remote slice of `cli.rs`/`report.rs`
+  (`push`, `pull`, `setup`, `join`).
+
+- **A GitHub `Source` implementation against the upstream trait** (D-5) — which is the whole
+  argument for the seam: the companion adds a second source rather than forking the core. If it
+  cannot, the seam is wrong and Phase 10 gets the feedback.
+
+- **`keystore.rs`'s upstream shadow.** `Store::` is referenced from `scope.rs` and the restore
+  path, so the *seam* has to exist upstream even where the credential stores do not. Verify in
+  Phase 10 that what upstream carries is a trait with no credential-bearing implementation, and
+  that the companion supplies the implementation. This is a Phase 10 risk surfaced here.
+
+- **OWN-02 — the independent crypto/security review.** Obtained before credential backup is
+  enabled for anyone but this user. Its inputs: `docs/sync-format.md`, the Phase 7 bounded-KDF
+  rationale, the adversarial test suite, and the threat model. Its scope: the key hierarchy, the
+  AAD binding, the rollback anchor's TOFU gap, and the credential disposition in `merge.rs`.
+
+- **The fork's own reckoning.** `extensions`, the menu bar and the TUI sync surfaces stay here.
+  Once the core is upstream and the transport is in the companion, the fork's `milestone/`
+  branch should be reduced to what is genuinely fork-only, or it becomes a third copy that
+  drifts from both.
+
+**Scope — out**: shipping credential backup to other users before OWN-02 returns; any further
+upstream PR (the core is complete at Phase 10); non-GitHub remotes (v2 PORT-01).
+
+**Deliverables**: the companion repository, building against upstream's core as a dependency,
+with its own CI; a `Source` implementation that required no change to the upstream trait, or a
+written record of the change it did require; OWN-02's report; a reduced fork branch.
+
+**Success Criteria** (what must be TRUE):
+
+1. The companion repository builds and tests green against upstream `main` as a dependency, with
+   no patched or vendored copy of the core.
+
+2. A push and a pull work end to end from the companion against a private repo — the two-Mac
+   setup keeps working through the move, which is the only test that has ever caught anything
+   here.
+
+3. Upstream contains no credential-bearing code: `grep -rn 'keystore\|force_credentials\|ReplacesLiveCredential'`
+   over the merged upstream tree returns only trait declarations.
+
+4. OWN-02's review has been obtained and its findings are recorded, with each either fixed or
+   accepted in writing — and credential backup is documented as not-for-general-use until then.
+
+5. The fork's branch carries only what is fork-only, and the user's two Macs still sync on it.
+
+**Plans**: TBD
+
+---
+
+## Requirement Traceability (v1.1)
+
+| Requirement | Phase | Status |
+|-------------|-------|--------|
+| KDF-01 | Phase 7 | Pending |
+| KDF-02 | Phase 7 | Pending |
+| KDF-03 | Phase 7 | Pending |
+| KDF-04 | Phase 7 | Pending |
+| KDF-05 | Phase 7 | Pending |
+| KDF-06 | Phase 7 | Pending (D-1: strike) |
+| PORTAB-01 | Phase 8 | Code complete (a9f3ee4) · unobserved |
+| PORTAB-02 | Phase 8 | Code complete (3b20ef7) · unobserved |
+| PORTAB-03 | Phase 8 | Code complete (bc1f8e2) · unobserved |
+| PORTAB-04 | Phase 8 | Pending |
+| DIAG-01 | Phase 10 | Code complete (98fb0bb) · not yet upstream |
+| DIAG-02 | Phase 8 | Pending |
+| SPLIT-01 | Phase 9 | Pending |
+| SPLIT-02 | Phase 10 | Pending |
+| SPLIT-03 | Phase 8 | Pending |
+| SPLIT-04 | Phase 9 | Pending |
+| OWN-01 | Phase 11 | Pending |
+| OWN-02 | Phase 11 | Pending |
+
+**Coverage: 18/18 v1.1 requirements mapped. No orphans, no duplicates.**
+
+Assignment notes where a requirement could have gone elsewhere:
+
+- **PORTAB-01/02/03** are committed on the fork and mapped to **Phase 8** rather than marked done,
+  because PORTAB-04 says outright that nothing above it counts as closed until observed, and no
+  Windows job has ever run on this fork. Phase 8 is the observation.
+
+- **PORTAB-04** and **SPLIT-03** are per-PR obligations, so each is also a milestone-wide
+  invariant. They map to **Phase 8** — where the mechanism is built and first demonstrated —
+  rather than being duplicated across Phases 9–11.
+
+- **DIAG-01** is closed on the fork (98fb0bb) but maps to **Phase 10**, the PR that actually
+  carries `restore/backup.rs` upstream. Phase 8 lands the *helper* it calls (DIAG-02, D-7); this
+  is the call site.
+
+- **KDF-06** is one requirement with two legal answers. D-1 chooses *strike*, so its Phase 7
+  work is a deletion across nine sites and a test that the class cannot recur.
+
+- **SPLIT-01** (three PRs in his order) maps to **Phase 9**, the phase that commits to the order
+  and states the third destination. **SPLIT-02** (nothing too big; the third split further) maps
+  to **Phase 10**, the first phase that actually splits an oversized group and where the
+  ~7,500-line threshold is set. Phase 11 inherits that threshold rather than owning it.
+
+- **Phase 10 carries two requirements and Phase 9 two**, which understates both. v1.1's
+  requirements are *findings*, not features, so requirement count is a poor proxy for phase
+  weight here: Phase 10 moves ~14,000 lines across two PRs and writes the milestone's only new
+  code. Phase 9 exists as its own phase because PR 1 is a **gate** — if the format or the
+  bounded-KDF approach is rejected, Phases 10 and 11 are re-planned, not executed.
+
+- **The v1.0 requirements are unaffected.** v1.1 relocates and bounds code that already
+  satisfies them; it does not re-open the 37-requirement table above. Where a v1.0 requirement's
+  code moves to the companion repository (SAFE-01/02, REPO-*, SYNC-04/05/07, CRYPTO-04, UX-03/04),
+  it remains satisfied — in a different repository, which is what OWN-01 decided.
+
+---
+
+## Progress (v1.1)
+
+| Phase | Plans Complete | Status | Completed |
+|-------|----------------|--------|-----------|
+| 7. The KDF Blocker, Closed | 0/? | Not planned | - |
+| 8. A Windows Job That Has Actually Run | 0/? | Not planned | - |
+| 9. PR 1 — Format and Bounded KDF | 0/? | Not planned | - |
+| 10. PRs 2 and 3 — The Local Archive, and a Restore With a Local Source | 0/? | Not planned | - |
+| 11. The Companion Repository | 0/? | Not planned | - |
+
+**Security audits required:** Phases 7, 10, 11. Phase 9 re-runs Phase 7's audit against the
+derived branch. Phase 11's OWN-02 audit is **external and independent** — it is not the
+`gsd-security-auditor` pass.
+
+**Externally gated:** Phases 9, 10 and 11 each depend on a maintainer's review latency, and
+Phase 11 on a third party's. None of the three can be scheduled; all three can be prepared.
+
+---
+*v1.1 roadmap created: 2026-08-21 · continues Phase numbering from v1.0's Phase 6*

@@ -309,5 +309,38 @@ found four defects no audit did.
 
 *(The earlier "33 total" count was a miscount: SCOPE 5 + CRYPTO 7 + SAFE 5 + SYNC 7 + REPO 7 + UX 6 = 37.)*
 
+## Traceability — v1.1 (Staged upstream PRs)
+
+| Requirement | Phase | Status |
+|-------------|-------|--------|
+| KDF-01 | Phase 7 | Pending |
+| KDF-02 | Phase 7 | Pending |
+| KDF-03 | Phase 7 | Pending |
+| KDF-04 | Phase 7 | Pending |
+| KDF-05 | Phase 7 | Pending |
+| KDF-06 | Phase 7 | Pending (roadmap D-1: strike, not implement) |
+| PORTAB-01 | Phase 8 | Code complete (a9f3ee4) · unobserved |
+| PORTAB-02 | Phase 8 | Code complete (3b20ef7) · unobserved |
+| PORTAB-03 | Phase 8 | Code complete (bc1f8e2) · unobserved |
+| PORTAB-04 | Phase 8 | Pending |
+| DIAG-01 | Phase 10 | Code complete (98fb0bb) · not yet upstream |
+| DIAG-02 | Phase 8 | Pending |
+| SPLIT-01 | Phase 9 | Pending |
+| SPLIT-02 | Phase 10 | Pending |
+| SPLIT-03 | Phase 8 | Pending |
+| SPLIT-04 | Phase 9 | Pending |
+| OWN-01 | Phase 11 | Pending |
+| OWN-02 | Phase 11 | Pending |
+
+**Coverage:**
+
+- v1.1 requirements: 18 total (KDF 6 + PORTAB 4 + DIAG 2 + SPLIT 4 + OWN 2)
+- Mapped to phases: 18 ✓
+- Unmapped: 0
+
+The four `[x]` requirements above stay in this table: PORTAB-01/02/03 are committed but
+**unobserved** — PORTAB-04 gates them on a Windows job that has never run on this fork — and
+DIAG-01's code is closed on the fork but has not reached upstream.
+
 ---
 *Requirements defined: 2026-08-17 · Traceability filled during roadmap creation: 2026-08-19*

@@ -2,11 +2,11 @@
 gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: Staged upstream PRs
-status: planning
-last_updated: "2026-08-21T17:07:59.741Z"
+status: roadmapped
+last_updated: "2026-08-21T18:30:00.000Z"
 last_activity: 2026-08-21
 progress:
-  total_phases: 0
+  total_phases: 5
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
@@ -22,14 +22,14 @@ See: .planning/PROJECT.md (updated 2026-08-17)
 **Core value:** Answer "how much quota do I have left, and on which account?" instantly and
 correctly — without the user opening a browser, and without ever mis-reporting one account's
 usage as another's.
-**Current focus:** Phase 1 — encrypted-bundle-core
+**Current focus:** Phase 7 — the bounded-KDF blocker, which gates every PR in v1.1
 
 ## Current Position
 
-Phase: Not started (defining requirements)
+Phase: 7 — The KDF Blocker, Closed (not started)
 Plan: —
-Status: Defining requirements
-Last activity: 2026-08-21 — Milestone v1.1 started
+Status: Roadmapped, not planned
+Last activity: 2026-08-21 — v1.1 roadmap created: Phases 7–11, 18/18 requirements mapped
 
 ## Performance Metrics
 
