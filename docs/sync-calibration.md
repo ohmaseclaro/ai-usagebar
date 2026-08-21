@@ -34,6 +34,25 @@ hand-picked sample — reads each file in 256 KiB windows, and runs every window
 through `sync::chunk::frame` (zstd level 3, then the power-of-two pad) plus the
 40 bytes each seal appends (24-byte nonce, 16-byte Poly1305 tag).
 
+### `extensions` — measured 2026-08-21, when the category was added
+
+The tables below predate the `extensions` category and are left at the numbers
+they were measured at. This is its own row, taken on the same machine with
+`AI_USAGEBAR_CAL4_ALL=1`:
+
+| category | files | raw | zstd | stored | raw→stored |
+|---|---:|---:|---:|---:|---:|
+| `extensions` | 1474 | 17.20 MiB | 7.92 MiB | 10.64 MiB | 1.62x |
+
+10.64 MiB stored is the whole argument for having it on by default: it is a
+third of one day's `chat_index` and a ten-thousandth of the transcripts. The
+1.62x is the worst ratio of any category, which is expected — a skill tree is
+markdown that zstd already squeezed hard, so the power-of-two pad dominates on
+files this small.
+
+The same run's totals, for comparison against the 2026-08-19 numbers below:
+5571 files, 2.32 GiB raw, 1.10 GiB stored.
+
 ### The default bundle — `config`, `credentials`, `routines`, `chat_index`
 
 | category | files | raw | zstd | stored | raw→stored |
