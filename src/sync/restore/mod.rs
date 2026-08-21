@@ -835,7 +835,7 @@ mod tests {
             restorer
                 .roots
                 .stores
-                .read(Store::ClaudeCodeOauth)
+                .read(&Store::ClaudeCodeOauth)
                 .unwrap()
                 .is_none(),
             "the second Mac starts with no Claude login, which is the premise"
@@ -861,7 +861,7 @@ mod tests {
             restorer
                 .roots
                 .stores
-                .read(Store::ClaudeCodeOauth)
+                .read(&Store::ClaudeCodeOauth)
                 .unwrap()
                 .map(|v| v.to_string())
                 .as_deref(),

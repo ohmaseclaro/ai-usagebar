@@ -351,13 +351,13 @@ fn decide_store(ctx: &RestoreCtx<'_>, keys: &Keys, file: &FileEntry) -> Disposit
     // A store this build has no way to write — a macOS Keychain entry arriving
     // on Linux, where Claude Code keeps a real file instead. Refused here, in
     // the planner, rather than failing part-way through the write.
-    if !ctx.roots.stores.writable(store) {
+    if !ctx.roots.stores.writable(&store) {
         return Disposition::ExcludedByPolicy;
     }
     // A read failure is not "there is nothing here". A locked Keychain read as
     // an empty one would make the next line call a live credential absent and
     // replace it without ever asking.
-    let Ok(local) = ctx.roots.stores.read(store) else {
+    let Ok(local) = ctx.roots.stores.read(&store) else {
         return Disposition::ReplacesLiveCredential;
     };
     let Some(local) = local.filter(|v| !v.is_empty()) else {
@@ -590,6 +590,11 @@ fn category_of(manifest_path: &str) -> SyncCategory {
         // the switch deciding whether it travels at all.
         keystore::PREFIX => SyncCategory::Credentials,
         "desktop-profiles" => SyncCategory::Credentials,
+        // Cursor's conversation databases, which `scope` collects under the
+        // same opt-in switch as Claude Code's transcripts because they are the
+        // same thing and the same order of magnitude. Both directions must
+        // agree, or the report files them under a category nobody switched on.
+        "cursor-user" => SyncCategory::Transcripts,
         // Claude Code's own credential file, which `scope` collects under
         // `Credentials`. Both directions must agree, or the report files it
         // under a category its owner never switched on.
@@ -1482,7 +1487,7 @@ mod tests {
             m.roots
                 .stores
                 .edit()
-                .get(Store::ClaudeCodeOauth)
+                .get(&Store::ClaudeCodeOauth)
                 .map(str::to_string)
         }
 
@@ -1687,7 +1692,7 @@ mod tests {
             assert!(
                 m.roots
                     .stores
-                    .read(Store::ClaudeCodeOauth)
+                    .read(&Store::ClaudeCodeOauth)
                     .unwrap()
                     .is_none()
             );

@@ -235,17 +235,21 @@ pub fn build<F: Fn(&[u8]) -> [u8; 32]>(
         // store read that trusted the loop alone would carry a live OAuth token
         // into a bundle whose owner had switched credentials off.
         if category == SyncCategory::Credentials && cfg.includes(category) {
-            for store in keystore::Store::ALL {
+            // Enumerated from the machine, not from a constant: a Mac with four
+            // Claude Desktop accounts has four token caches, and all four
+            // travel.
+            for store in roots.stores.all()? {
                 // A read failure is an error, not an empty result: a locked
                 // Keychain must stop the push, because a bundle that silently
-                // omitted the credential is the defect this exists to end.
-                let Some(value) = roots.stores.read(store)? else {
+                // omitted the credential is the defect this exists to end. The
+                // one exception is per-profile and lives in `read_or_skip`.
+                let Some(value) = roots.stores.read_or_skip(&store)? else {
                     continue;
                 };
                 if value.is_empty() {
                     continue; // an empty credential is not a credential
                 }
-                let file_plan = plan_store(store, value.as_bytes(), &chunk_id, &mut known)?;
+                let file_plan = plan_store(&store, value.as_bytes(), &chunk_id, &mut known)?;
                 store_files += 1;
                 store_raw_bytes = store_raw_bytes.saturating_add(value.len() as u64);
                 new_bytes += file_plan.new_bytes;
@@ -337,7 +341,7 @@ pub fn build_with_keys(
 /// The cost is a few hundred bytes; the packer still de-duplicates against what
 /// the remote already holds, so an unchanged credential re-uploads nothing.
 fn plan_store<F: Fn(&[u8]) -> [u8; 32]>(
-    store: keystore::Store,
+    store: &keystore::Store,
     value: &[u8],
     chunk_id: &F,
     known: &mut HashSet<[u8; 32]>,

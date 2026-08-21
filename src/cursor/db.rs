@@ -256,7 +256,9 @@ pub fn write_auth_rows(path: &Path, rows: &BTreeMap<String, String>) -> Result<(
         ))
     })?;
     conn.busy_timeout(WRITE_BUSY_TIMEOUT).map_err(|e| {
-        AppError::Credentials(format!("could not set the Cursor database busy timeout: {e}"))
+        AppError::Credentials(format!(
+            "could not set the Cursor database busy timeout: {e}"
+        ))
     })?;
     let tx = conn.transaction().map_err(|e| {
         AppError::Credentials(format!(
@@ -630,7 +632,11 @@ mod tests {
         seed_db(&path, Some("this-macs-old-token"));
         put(&path, "cursorAuth/cachedEmail", "old@example.com");
         for i in 0..500 {
-            put(&path, &format!("workbench.state.{i}"), &format!("value {i}"));
+            put(
+                &path,
+                &format!("workbench.state.{i}"),
+                &format!("value {i}"),
+            );
         }
         let before: BTreeMap<String, String> = all_rows(&path)
             .into_iter()
@@ -638,7 +644,10 @@ mod tests {
             .collect();
 
         let incoming = BTreeMap::from([
-            ("cursorAuth/accessToken".to_string(), "other-mac".to_string()),
+            (
+                "cursorAuth/accessToken".to_string(),
+                "other-mac".to_string(),
+            ),
             (
                 "cursorAuth/refreshToken".to_string(),
                 "other-refresh".to_string(),
@@ -687,7 +696,10 @@ mod tests {
         let path = dir.path().join("state.vscdb");
         let rows = BTreeMap::from([("cursorAuth/accessToken".to_string(), "t".to_string())]);
         let err = write_auth_rows(&path, &rows).unwrap_err();
-        assert!(err.to_string().contains("Open the Cursor IDE once"), "{err}");
+        assert!(
+            err.to_string().contains("Open the Cursor IDE once"),
+            "{err}"
+        );
         assert!(!path.exists(), "no database was fabricated");
     }
 

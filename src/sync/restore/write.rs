@@ -194,12 +194,26 @@ pub fn apply(ctx: &RestoreCtx<'_>, plan: &RestorePlan, packs: &PackSource) -> Re
         queue.push((item, Target::File(checked)));
     }
 
-    // Manifest order, so a partial restore stops in the same place twice and is
-    // therefore debuggable.
+    // **Files first, stores last, and never interleaved.**
+    //
+    // One path now has two writers. `cursor-user/globalStorage/state.vscdb` is
+    // carried as a file (it holds the conversations), and
+    // `keystore/cursor-auth` writes the `cursorAuth/*` rows into that very
+    // database. If the store ran first, the file write would replace the whole
+    // database and take the credential with it — and which ran first would
+    // otherwise depend on category order, which is not a thing this ordering
+    // should rest on. The file carries the conversations; the store's row-write
+    // lands on top of whatever database is there when it runs.
+    //
+    // `sort_by_key` on a `bool` is stable, so within each half the queue keeps
+    // manifest order — a partial restore still stops in the same place twice
+    // and is therefore debuggable.
+    queue.sort_by_key(|(_, target)| matches!(target, Target::Store(_)));
+
     for (item, target) in queue {
         let outcome = match &target {
             Target::File(dest) => write_one(packs, item, dest, plan.created_at),
-            Target::Store(store) => write_store(ctx, packs, item, *store),
+            Target::Store(store) => write_store(ctx, packs, item, store),
         };
         if let Err(why) = outcome {
             // `Applied` carries where the run stopped, which is what the summary
@@ -265,7 +279,7 @@ fn write_store(
     ctx: &RestoreCtx<'_>,
     packs: &PackSource,
     item: &ItemPlan,
-    store: Store,
+    store: &Store,
 ) -> Result<()> {
     let mut value: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
     for id in &item.chunks {
