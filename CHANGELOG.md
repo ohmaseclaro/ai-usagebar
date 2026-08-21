@@ -26,6 +26,11 @@ Each release is also published at
 
 ### Fixed
 
+- **A per-account routine registry is no longer restored as a chat index.**
+  `scheduled-tasks.json` and `local_*.json` share one directory, and the restore
+  told them apart by directory alone — so a user syncing `routines` with
+  `chat_index` switched off had the registry come back under the switch they
+  left off. Both directions now use the collector's own predicate.
 - **A restored executable comes back runnable.** Every restored file landed at
   mode 0600, which is right for a credential and silently wrong for a hook or a
   skill script — it failed later, with an error about the hook rather than about

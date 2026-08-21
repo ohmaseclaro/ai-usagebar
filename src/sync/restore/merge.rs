@@ -598,7 +598,7 @@ fn to_fetch(index: &IndexObject, items: &[ItemPlan]) -> (usize, u64) {
 
 /// Which category a bundle path belongs to, from its root prefix and the shape
 /// beneath it — the same split `scope`'s collectors made on the way out.
-fn category_of(manifest_path: &str) -> SyncCategory {
+pub(crate) fn category_of(manifest_path: &str) -> SyncCategory {
     let (prefix, rest) = manifest_path.split_once('/').unwrap_or((manifest_path, ""));
     match prefix {
         // A store is a credential and nothing else, which is what puts it under
@@ -621,12 +621,49 @@ fn category_of(manifest_path: &str) -> SyncCategory {
         {
             SyncCategory::Credentials
         }
-        "desktop-data" if rest.starts_with("claude-code-sessions/") => SyncCategory::ChatIndex,
+        // Two categories share this tree, and only the file name tells them
+        // apart: `scope`'s chat-index collector keeps `local_*.json` and its
+        // routines collector takes the `scheduled-tasks.json` sitting in the
+        // same folder. Matching the directory alone filed every account's
+        // routine registry as a chat index — so a user syncing routines with
+        // `chat_index` switched off had it restored under the switch they left
+        // off. The predicate here is the collector's, spelled once.
+        "desktop-data" if is_session_index(rest) => SyncCategory::ChatIndex,
         "desktop-data" => SyncCategory::Routines,
         "claude-home" if rest.starts_with("projects/") => SyncCategory::Transcripts,
+        "claude-home" if is_claude_tooling(rest) => SyncCategory::Extensions,
         "claude-home" => SyncCategory::Routines,
+        // Everything `scope` collects under this root is tooling; the root
+        // exists for no other category.
+        "cursor-home" => SyncCategory::Extensions,
         _ => SyncCategory::Config,
     }
+}
+
+/// Whether a `desktop-data/` entry is a chat session index rather than the
+/// per-account routine registry beside it.
+fn is_session_index(rest: &str) -> bool {
+    rest.starts_with("claude-code-sessions/")
+        && rest.rsplit('/').next().is_some_and(|n| {
+            n.starts_with(crate::sync::scope::SESSION_PREFIX) && n.ends_with(".json")
+        })
+}
+
+/// Whether a `claude-home/` entry is one of the shapes
+/// [`SyncCategory::Extensions`] collects.
+///
+/// Reads `scope`'s own constants rather than restating them. The comments on
+/// the arms above are emphatic that both directions must agree "or the report
+/// files it under a category nobody switched on" — and when `extensions` was
+/// added, this function did not exist and every skill, agent and hook came back
+/// filed as `routines`. One vocabulary, or two that drift.
+fn is_claude_tooling(rest: &str) -> bool {
+    use crate::sync::scope::{CLAUDE_TOOLING_DIRS, CLAUDE_TOOLING_FILES, PLUGINS_DIR};
+    CLAUDE_TOOLING_FILES.contains(&rest)
+        || CLAUDE_TOOLING_DIRS
+            .iter()
+            .chain(std::iter::once(&PLUGINS_DIR))
+            .any(|dir| rest.starts_with(&format!("{dir}/")))
 }
 
 #[cfg(test)]

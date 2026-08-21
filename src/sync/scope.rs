@@ -102,18 +102,18 @@ const SCHEDULED_TASKS: &str = "scheduled-tasks.json";
 const SCHEDULED_TASKS_DIR: &str = "scheduled-tasks";
 /// A chat session index. The sibling `scheduled-tasks.json` lives in the same
 /// folder but belongs to the routines category, so the two never double-count.
-const SESSION_PREFIX: &str = "local_";
+pub(crate) const SESSION_PREFIX: &str = "local_";
 
 // The [`SyncCategory::Extensions`] allow-list. See [`collect_extensions`] for
 // what each line is and why the obvious neighbours are missing.
-const CLAUDE_TOOLING_FILES: [&str; 2] = ["CLAUDE.md", "settings.json"];
-const CLAUDE_TOOLING_DIRS: [&str; 4] = ["skills", "agents", "hooks", "gsd-core"];
-const PLUGINS_DIR: &str = "plugins";
+pub(crate) const CLAUDE_TOOLING_FILES: [&str; 2] = ["CLAUDE.md", "settings.json"];
+pub(crate) const CLAUDE_TOOLING_DIRS: [&str; 4] = ["skills", "agents", "hooks", "gsd-core"];
+pub(crate) const PLUGINS_DIR: &str = "plugins";
 /// `cache/` and `repos/` are derived from these two and are not carried.
-const PLUGIN_SUBDIRS: [&str; 2] = ["marketplaces", "data"];
-const CURSOR_TOOLING_DIRS: [&str; 2] = ["agents", "rules"];
+pub(crate) const PLUGIN_SUBDIRS: [&str; 2] = ["marketplaces", "data"];
+pub(crate) const CURSOR_TOOLING_DIRS: [&str; 2] = ["agents", "rules"];
 /// `cli-config.json` is deliberately absent: it carries `authInfo`.
-const CURSOR_TOOLING_FILES: [&str; 1] = ["mcp.json"];
+pub(crate) const CURSOR_TOOLING_FILES: [&str; 1] = ["mcp.json"];
 
 // The three shapes under Cursor's user-data directory that carry conversations.
 // Exact names, matched by [`Path::join`] rather than by a suffix test, because
@@ -821,6 +821,78 @@ mod tests {
 
     fn scan_of(cat: SyncCategory, dir: &TempDir) -> CategoryScan {
         collect(cat, &roots_at(dir), &SyncConfig::default(), Utc::now())
+    }
+
+    /// **The guard that was missing.** `scope` decides a file's category on the
+    /// way out and `restore::merge::category_of` decides it again on the way
+    /// back, from the manifest path alone. Nothing made the two agree, and when
+    /// `extensions` was added the collector was updated and the classifier was
+    /// not — so every skill, agent and hook would have been collected as
+    /// `extensions`, uploaded, and then reported and gated on restore as
+    /// `routines`, a category its owner never chose for it.
+    ///
+    /// Every category, not just the new one: the next collector added inherits
+    /// this test rather than rediscovering the bug.
+    #[test]
+    fn every_collected_file_comes_back_under_the_category_it_left_in() {
+        use crate::sync::push::packer::manifest_path;
+        use crate::sync::restore::merge::category_of;
+
+        let dir = TempDir::new().unwrap();
+        let roots = roots_at(&dir);
+
+        // One representative file per category, in the shape its collector looks for.
+        seed(dir.path(), "config.toml", "");
+        seed(dir.path(), "accounts/work/.credentials.json", "{}");
+        seed(dir.path(), "claude-home/.credentials.json", "{}");
+        seed(dir.path(), "profiles/gmail/meta.json", "{}");
+        seed(dir.path(), "profiles/gmail/desktop-state/Cookies", "x");
+        seed(dir.path(), "claude-home/scheduled-tasks/a.json", "{}");
+        seed(
+            dir.path(),
+            "desktop/claude-code-sessions/acct/org/local_1.json",
+            "{}",
+        );
+        seed(
+            dir.path(),
+            "desktop/claude-code-sessions/acct/org/scheduled-tasks.json",
+            "{}",
+        );
+        seed(dir.path(), "claude-home/projects/p/a.jsonl", "{}");
+        seed(dir.path(), "claude-home/skills/s/SKILL.md", "s");
+        seed(dir.path(), "claude-home/agents/a.md", "a");
+        seed(dir.path(), "claude-home/hooks/h.js", "h");
+        seed(dir.path(), "claude-home/gsd-core/w.md", "w");
+        seed(dir.path(), "claude-home/plugins/marketplaces/m/p.json", "p");
+        seed(dir.path(), "claude-home/CLAUDE.md", "#");
+        seed(dir.path(), "claude-home/settings.json", "{}");
+        seed(dir.path(), "cursor-home/agents/c.md", "c");
+        seed(dir.path(), "cursor-home/mcp.json", "{}");
+
+        // Every category on, transcripts included.
+        let cfg = SyncConfig {
+            categories: SyncCategory::ALL.to_vec(),
+            ..SyncConfig::default()
+        };
+
+        let mut checked = 0usize;
+        for cat in SyncCategory::ALL {
+            let scan = collect(cat, &roots, &cfg, Utc::now());
+            for file in &scan.files {
+                let wire = manifest_path(&roots, &file.path).expect("a path under some root");
+                assert_eq!(
+                    category_of(&wire),
+                    cat,
+                    "{wire:?} was collected as {cat:?} and classifies back as {:?}",
+                    category_of(&wire)
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= 14,
+            "only {checked} files were checked — the fixture stopped covering the collectors"
+        );
     }
 
     // ---- extensions: the tooling allow-list --------------------------------
