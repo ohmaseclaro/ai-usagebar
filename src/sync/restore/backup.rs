@@ -335,6 +335,10 @@ mod tests {
             .collect()
     }
 
+    /// Unix only: `PermissionsExt` does not exist on Windows, and the mode this
+    /// module preserves is a Unix concept. The assertions that use it are gated
+    /// the same way rather than asking for a number Windows cannot answer.
+    #[cfg(unix)]
     fn mode_of(path: &Path) -> u32 {
         use std::os::unix::fs::PermissionsExt;
         fs::metadata(path).unwrap().permissions().mode() & 0o777
@@ -477,8 +481,11 @@ mod tests {
         let targets = vec![fixture.seed(".claude/a.jsonl", b"a", 0o600)];
         let record = take_with(&fixture.ctx(), &targets, &tar).unwrap().unwrap();
 
-        assert_eq!(mode_of(&fixture.backups_dir), 0o700);
-        assert_eq!(mode_of(&record.archive), 0o600);
+        #[cfg(unix)]
+        {
+            assert_eq!(mode_of(&fixture.backups_dir), 0o700);
+            assert_eq!(mode_of(&record.archive), 0o600);
+        }
     }
 
     /// A customised `CLAUDE_CONFIG_DIR` outside the home is supported, and the
@@ -600,6 +607,7 @@ mod tests {
                 "{} not restored",
                 path.display()
             );
+            #[cfg(unix)]
             assert_eq!(
                 mode_of(path),
                 *mode,
