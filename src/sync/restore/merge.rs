@@ -196,6 +196,7 @@ fn plan_with_safe_key(
                 manifest_path: file.path.clone(),
                 dest,
                 category,
+                mode: file.mode,
                 true_len: file.true_len,
                 chunks: file.chunks.clone(),
                 disposition,

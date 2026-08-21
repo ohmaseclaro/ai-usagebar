@@ -136,6 +136,11 @@ pub enum SyncCategory {
     Config,
     /// The claude-acc profile store — the saved Desktop logins.
     Credentials,
+    /// What makes a machine *yours* rather than merely logged in: Claude Code's
+    /// skills, agents, hooks and installed plugins, plus Cursor's agents and
+    /// rules. An allow-list, like Cursor's conversations are — see
+    /// [`crate::sync::scope`].
+    Extensions,
     /// `~/.claude/scheduled-tasks/**` and the per-account registries.
     Routines,
     /// Claude Desktop's `claude-code-sessions/<account>/<org>/local_*.json`.
@@ -147,9 +152,10 @@ pub enum SyncCategory {
 impl SyncCategory {
     /// Canonical D1 order — what `sync status` lists and what any later
     /// per-category loop iterates.
-    pub const ALL: [SyncCategory; 5] = [
+    pub const ALL: [SyncCategory; 6] = [
         SyncCategory::Config,
         SyncCategory::Credentials,
+        SyncCategory::Extensions,
         SyncCategory::Routines,
         SyncCategory::ChatIndex,
         SyncCategory::Transcripts,
@@ -161,6 +167,7 @@ impl SyncCategory {
         match self {
             SyncCategory::Config => "config",
             SyncCategory::Credentials => "credentials",
+            SyncCategory::Extensions => "extensions",
             SyncCategory::Routines => "routines",
             SyncCategory::ChatIndex => "chat_index",
             SyncCategory::Transcripts => "transcripts",
@@ -214,6 +221,7 @@ impl Default for SyncConfig {
             categories: vec![
                 SyncCategory::Config,
                 SyncCategory::Credentials,
+                SyncCategory::Extensions,
                 SyncCategory::Routines,
                 SyncCategory::ChatIndex,
             ],
@@ -1358,13 +1366,14 @@ mod tests {
     // --- [sync] ------------------------------------------------------------
 
     #[test]
-    fn sync_defaults_are_the_four_d6_categories_with_transcripts_off() {
+    fn sync_defaults_are_every_light_category_with_transcripts_off() {
         let c = SyncConfig::default();
         assert_eq!(
             c.categories,
             vec![
                 SyncCategory::Config,
                 SyncCategory::Credentials,
+                SyncCategory::Extensions,
                 SyncCategory::Routines,
                 SyncCategory::ChatIndex,
             ]
@@ -1378,7 +1387,7 @@ mod tests {
     fn config_without_a_sync_section_still_loads_and_gets_the_defaults() {
         let f = write_toml("[anthropic]\nenabled = true\n");
         let c = Config::load_from(f.path()).unwrap();
-        assert_eq!(c.sync.categories.len(), 4);
+        assert_eq!(c.sync.categories.len(), SyncCategory::ALL.len() - 1);
         assert!(!c.sync.includes(SyncCategory::Transcripts));
         assert_eq!(c.sync.transcript_days, 30);
     }

@@ -63,22 +63,26 @@ fn claude_home(roots: &SyncRoots) -> &Path {
 fn cursor_user_dir(roots: &SyncRoots) -> &Path {
     roots.cursor_user_dir.as_path()
 }
+fn cursor_home(roots: &SyncRoots) -> &Path {
+    roots.cursor_home.as_path()
+}
 
 type RootOf = fn(&SyncRoots) -> &Path;
 
 /// The prefix table, once: name on the wire, and the root it resolves against
 /// on *this* machine. A second table is a second thing to get wrong.
 ///
-/// The push direction reads the same five literals from
+/// The push direction reads the same six literals from
 /// [`crate::sync::push::packer::manifest_path`], which predates this module;
 /// `the_two_directions_agree_on_every_prefix` below is the mechanical guard
 /// that keeps them one vocabulary rather than two.
-const ROOT_PREFIXES: [(&str, RootOf); 5] = [
+const ROOT_PREFIXES: [(&str, RootOf); 6] = [
     ("config", config_dir),
     ("desktop-data", desktop_data_dir),
     ("desktop-profiles", desktop_profiles_dir),
     ("claude-home", claude_home),
     ("cursor-user", cursor_user_dir),
+    ("cursor-home", cursor_home),
 ];
 
 /// Ceilings on the *size* of a manifest entry, alongside the eight checks on

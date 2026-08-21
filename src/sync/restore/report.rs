@@ -825,6 +825,7 @@ mod tests {
 
     fn item(path: &str, disposition: Disposition) -> ItemPlan {
         ItemPlan {
+            mode: 0o600,
             manifest_path: path.into(),
             dest: None,
             category: SyncCategory::Config,

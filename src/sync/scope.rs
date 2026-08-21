@@ -49,11 +49,18 @@ const EXCLUDED_NAMES: [FixedName; 5] = [
 /// is machine-specific. `local-agent-mode-sessions` is Cowork: its paths embed
 /// the owning account UUID plus an unreconstructable suffix, so a copy renders
 /// as an empty chat — already documented as unmigratable.
-const EXCLUDED_DIRS: [FixedName; 4] = [
+/// `.git` and `node_modules` are here for [`SyncCategory::Extensions`], which
+/// carries installed plugin trees: both are large, churn on every operation,
+/// and are reproducible from what travels beside them. They are excluded
+/// globally rather than in that collector because no category wants either, and
+/// a rule stated once cannot be forgotten by the next collector added.
+const EXCLUDED_DIRS: [FixedName; 6] = [
     FixedName::new("backups"),
     FixedName::new("prelogin-backup"),
     FixedName::new("hidden"),
     FixedName::new("local-agent-mode-sessions"),
+    FixedName::new(".git"),
+    FixedName::new("node_modules"),
 ];
 
 /// Regenerable or in-flight. `.tmp.` is the prefix [`crate::cache::atomic_write`]
@@ -96,6 +103,17 @@ const SCHEDULED_TASKS_DIR: &str = "scheduled-tasks";
 /// A chat session index. The sibling `scheduled-tasks.json` lives in the same
 /// folder but belongs to the routines category, so the two never double-count.
 const SESSION_PREFIX: &str = "local_";
+
+// The [`SyncCategory::Extensions`] allow-list. See [`collect_extensions`] for
+// what each line is and why the obvious neighbours are missing.
+const CLAUDE_TOOLING_FILES: [&str; 2] = ["CLAUDE.md", "settings.json"];
+const CLAUDE_TOOLING_DIRS: [&str; 4] = ["skills", "agents", "hooks", "gsd-core"];
+const PLUGINS_DIR: &str = "plugins";
+/// `cache/` and `repos/` are derived from these two and are not carried.
+const PLUGIN_SUBDIRS: [&str; 2] = ["marketplaces", "data"];
+const CURSOR_TOOLING_DIRS: [&str; 2] = ["agents", "rules"];
+/// `cli-config.json` is deliberately absent: it carries `authInfo`.
+const CURSOR_TOOLING_FILES: [&str; 1] = ["mcp.json"];
 
 // The three shapes under Cursor's user-data directory that carry conversations.
 // Exact names, matched by [`Path::join`] rather than by a suffix test, because
@@ -386,6 +404,7 @@ pub fn collect(
                 walk(&profile.join(DESKTOP_STATE), &mut scan);
             }
         }
+        SyncCategory::Extensions => collect_extensions(roots, &mut scan),
         SyncCategory::Routines => {
             // D1: Claude Code's own routine definitions, plus each account's
             // registry. The account and org levels are enumerated by listing,
@@ -420,6 +439,56 @@ pub fn collect(
         }
     }
     scan
+}
+
+/// The tooling that makes a machine *yours*, as an allow-list.
+///
+/// # What travels, and what does not
+///
+/// Claude Code keeps everything under `~/.claude`, but only some of it is
+/// portable. `skills/`, `agents/`, `hooks/` and `gsd-core/` are authored
+/// content — the custom skills, subagents and hook scripts a user wrote or
+/// installed — and `CLAUDE.md` and `settings.json` are the preferences that
+/// decide how all of it behaves. Those travel.
+///
+/// `plugins/` is split. `marketplaces/` and `data/` are the working trees an
+/// installed plugin actually runs from, so they travel; `cache/` and `repos/`
+/// are derived from them and are left behind, and each marketplace's `.git`
+/// is dropped by [`EXCLUDED_DIRS`] — 12 MB of git objects reconstructing 9.7 MB
+/// of files that are already in the bundle.
+///
+/// Cursor contributes `~/.cursor/agents/`, `rules/` and `mcp.json`. **Not
+/// `extensions/`**: measured at 2.9 GB on this user's Mac, every one of them
+/// re-installable from the marketplace by name. And **not `cli-config.json`**,
+/// which carries an `authInfo` block — a credential, and credentials belong in
+/// [`SyncCategory::Credentials`] where D-04's private-repo gate and the
+/// restore's second consent apply to them. Collecting it here would move a
+/// login into a category that is neither gated nor confirmed, which is the
+/// whole reason those two mechanisms exist.
+///
+/// # Why an allow-list
+///
+/// The same reason [`collect_cursor`] is one: `~/.claude` and `~/.cursor` are
+/// application-owned directories that grow whatever the next release wants
+/// them to. A deny-list admits that by default. This names what travels, and
+/// everything else is excluded by not being named.
+fn collect_extensions(roots: &SyncRoots, scan: &mut CategoryScan) {
+    for name in CLAUDE_TOOLING_FILES {
+        push_path(&roots.claude_home.join(name), scan);
+    }
+    for dir in CLAUDE_TOOLING_DIRS {
+        walk(&roots.claude_home.join(dir), scan);
+    }
+    let plugins = roots.claude_home.join(PLUGINS_DIR);
+    for dir in PLUGIN_SUBDIRS {
+        walk(&plugins.join(dir), scan);
+    }
+    for dir in CURSOR_TOOLING_DIRS {
+        walk(&roots.cursor_home.join(dir), scan);
+    }
+    for name in CURSOR_TOOLING_FILES {
+        push_path(&roots.cursor_home.join(name), scan);
+    }
 }
 
 /// Cursor's conversations, as an **allow-list of three shapes**.
@@ -752,6 +821,107 @@ mod tests {
 
     fn scan_of(cat: SyncCategory, dir: &TempDir) -> CategoryScan {
         collect(cat, &roots_at(dir), &SyncConfig::default(), Utc::now())
+    }
+
+    // ---- extensions: the tooling allow-list --------------------------------
+
+    #[test]
+    fn extensions_carry_the_authored_tooling_and_leave_the_derived_trees_behind() {
+        let dir = TempDir::new().unwrap();
+        let claude = "claude-home";
+        seed(dir.path(), &format!("{claude}/CLAUDE.md"), "# prefs");
+        seed(dir.path(), &format!("{claude}/settings.json"), "{}");
+        seed(
+            dir.path(),
+            &format!("{claude}/skills/graphify/SKILL.md"),
+            "s",
+        );
+        seed(dir.path(), &format!("{claude}/agents/gsd-planner.md"), "a");
+        seed(dir.path(), &format!("{claude}/hooks/guard.js"), "h");
+        seed(
+            dir.path(),
+            &format!("{claude}/gsd-core/workflows/new.md"),
+            "w",
+        );
+        seed(
+            dir.path(),
+            &format!("{claude}/plugins/marketplaces/ponytail/plugin.json"),
+            "p",
+        );
+        seed(
+            dir.path(),
+            &format!("{claude}/plugins/data/ponytail/db"),
+            "d",
+        );
+
+        // Derived, reconstructable, or enormous — none of these travel.
+        seed(
+            dir.path(),
+            &format!("{claude}/plugins/cache/ponytail/x"),
+            "c",
+        );
+        seed(
+            dir.path(),
+            &format!("{claude}/plugins/repos/ponytail/x"),
+            "r",
+        );
+        seed(
+            dir.path(),
+            &format!("{claude}/plugins/marketplaces/ponytail/.git/HEAD"),
+            "g",
+        );
+        seed(dir.path(), &format!("{claude}/projects/a/b.jsonl"), "t");
+        seed(dir.path(), &format!("{claude}/history.jsonl"), "hist");
+
+        seed(dir.path(), "cursor-home/agents/researcher.md", "ca");
+        seed(dir.path(), "cursor-home/rules/style.md", "cr");
+        seed(dir.path(), "cursor-home/mcp.json", "{}");
+        // 2.9 GB of marketplace-installable extensions, and a credential.
+        seed(
+            dir.path(),
+            "cursor-home/extensions/some.ext/package.json",
+            "e",
+        );
+        seed(
+            dir.path(),
+            "cursor-home/cli-config.json",
+            "{\"authInfo\":1}",
+        );
+
+        assert_eq!(
+            names(&scan_of(SyncCategory::Extensions, &dir)),
+            vec![
+                "CLAUDE.md",
+                "SKILL.md",
+                "db",
+                "gsd-planner.md",
+                "guard.js",
+                "mcp.json",
+                "new.md",
+                "plugin.json",
+                "researcher.md",
+                "settings.json",
+                "style.md",
+            ]
+        );
+    }
+
+    /// `cli-config.json` holds an `authInfo` block. A login that travelled in
+    /// this category would skip D-04's private-repo gate and the restore's
+    /// second consent, both of which key off [`SyncCategory::Credentials`].
+    #[test]
+    fn cursors_logged_in_cli_config_is_not_swept_up_as_tooling() {
+        let dir = TempDir::new().unwrap();
+        seed(
+            dir.path(),
+            "cursor-home/cli-config.json",
+            "{\"authInfo\":1}",
+        );
+        seed(dir.path(), "cursor-home/mcp.json", "{}");
+        assert_eq!(
+            names(&scan_of(SyncCategory::Extensions, &dir)),
+            vec!["mcp.json"]
+        );
     }
 
     // ---- credentials: the four D1 profile members, and nothing else --------

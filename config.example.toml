@@ -45,7 +45,10 @@ layout = "full"
 [sync]
 # Transcripts is deliberately NOT in this list: it is the only category big
 # enough to change what "fast, light sync" means. Add "transcripts" to opt in.
-categories = ["config", "credentials", "routines", "chat_index"]
+# "extensions" is Claude Code's skills, agents, hooks and installed plugins,
+# plus Cursor's agents and rules — about 20 MB, and what makes a second machine
+# feel like this one rather than merely logged in to the same accounts.
+categories = ["config", "credentials", "extensions", "routines", "chat_index"]
 # Bounds applied to transcripts when you do opt in — newest-first, both
 # applied, whichever binds first wins. A file is taken whole or not at all.
 transcript_days = 30

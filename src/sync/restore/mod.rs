@@ -206,6 +206,13 @@ pub struct ItemPlan {
     pub manifest_path: String,
     pub dest: Option<PathBuf>,
     pub category: SyncCategory,
+    /// The mode the file had when it was packed.
+    ///
+    /// Only the execute bits are honoured on restore, and only as "make it
+    /// 0700" — see [`write`]. A restore never widens a file, but a skill or a
+    /// hook that arrives without its `+x` is a file the tool that owns it can
+    /// no longer run, and that failure is silent.
+    pub mode: u32,
     pub true_len: u64,
     pub chunks: Vec<ChunkId>,
     pub disposition: Disposition,
@@ -551,6 +558,7 @@ mod desktop_reach {
 
     fn item(manifest_path: &str, disposition: Disposition) -> ItemPlan {
         ItemPlan {
+            mode: 0o600,
             manifest_path: manifest_path.into(),
             dest: None,
             category: SyncCategory::Credentials,
@@ -1410,6 +1418,7 @@ mod tests {
     #[test]
     fn a_rejected_path_is_visible_in_the_plan_and_has_no_destination() {
         let item = ItemPlan {
+            mode: 0o600,
             manifest_path: "config/../../../../etc/shadow".into(),
             dest: None,
             category: SyncCategory::Config,

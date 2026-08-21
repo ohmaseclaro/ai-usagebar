@@ -269,6 +269,15 @@ pub struct SyncRoots {
     /// against *this* machine's layout — and Cursor's differs per platform
     /// (`~/Library/Application Support/Cursor/User` against `~/.config/Cursor/User`).
     pub cursor_user_dir: PathBuf,
+    /// `~/.cursor` — Cursor's *agent* configuration, which is not the same tree
+    /// as [`cursor_user_dir`](SyncRoots::cursor_user_dir).
+    ///
+    /// The IDE keeps its databases under `.../Cursor/User`; the CLI and the
+    /// agent definitions live in a dotfile directory beside `~/.claude`. A root
+    /// of its own for the same reason every other root is one: a bundle written
+    /// on a Mac has to resolve against a Linux layout, and a path derived at the
+    /// collector is a path that only knows the machine it was collected on.
+    pub cursor_home: PathBuf,
     /// The change-detection index db. In the *cache* dir in production — it is
     /// a wipeable hint, not durable state — and inside the injected tree under
     /// [`SyncRoots::at`], so no test writes to an installer's real `$XDG`.
@@ -304,6 +313,7 @@ impl SyncRoots {
             config_file,
             index_file: config_dir.join("sync").join("index.sqlite3"),
             cursor_user_dir: config_dir.join("cursor-user"),
+            cursor_home: config_dir.join("cursor-home"),
             config_dir,
             desktop_data_dir,
             desktop_profiles_dir,
@@ -356,6 +366,7 @@ impl SyncRoots {
             claude_home: crate::cache::home_dir()?.join(".claude"),
             index_file: index::default_path()?,
             cursor_user_dir,
+            cursor_home: crate::cache::home_dir()?.join(".cursor"),
             // The one door to a real login Keychain, a real Cursor database and
             // a real profile store in the whole crate's sync tree, guarded by
             // `keystore`'s own structural test.

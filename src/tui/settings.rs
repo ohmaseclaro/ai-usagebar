@@ -1151,6 +1151,7 @@ fn sync_note(cat: SyncCategory) -> &'static str {
     match cat {
         SyncCategory::Config => "this file, inline keys included",
         SyncCategory::Credentials => "saved logins — encrypted before anything leaves",
+        SyncCategory::Extensions => "skills, agents, hooks and installed plugins",
         SyncCategory::Routines => "scheduled tasks",
         SyncCategory::ChatIndex => "Claude Desktop session index",
         SyncCategory::Transcripts => "opt-in · large — gigabytes of local JSONL",
@@ -1269,7 +1270,19 @@ mod tests {
             .unwrap()
     }
 
-    const TRANSCRIPTS: usize = 4;
+    /// Derived, not typed: the row index moves whenever a category is added
+    /// ahead of it, and a hard-coded 4 turned five assertions here into
+    /// failures the day `Extensions` landed.
+    const TRANSCRIPTS: usize = {
+        let mut i = 0;
+        while i < SyncCategory::ALL.len() {
+            if matches!(SyncCategory::ALL[i], SyncCategory::Transcripts) {
+                break;
+            }
+            i += 1;
+        }
+        i
+    };
 
     /// State with a Z.AI key and an OpenRouter key, both marked dirty.
     fn state_with(zai: &str, opr: &str, primary: VendorId) -> SettingsState {
@@ -1899,8 +1912,11 @@ enabled = true
         for (cat, flag) in &s.sync_categories {
             assert_eq!(*flag, cfg.sync.includes(*cat), "{cat:?}");
         }
-        // The default is the four cheap categories; transcripts is opt-in.
-        assert_eq!(s.sync_categories.iter().filter(|(_, f)| *f).count(), 4);
+        // The default is every cheap category; transcripts is the one opt-in.
+        assert_eq!(
+            s.sync_categories.iter().filter(|(_, f)| *f).count(),
+            SyncCategory::ALL.len() - 1
+        );
         assert!(!on(&s, SyncCategory::Transcripts));
         assert!(on(&s, SyncCategory::Credentials));
     }
@@ -2044,7 +2060,7 @@ enabled = true
     }
 
     #[test]
-    fn toggling_transcripts_on_writes_all_five_labels_and_off_writes_four() {
+    fn toggling_transcripts_on_writes_every_label_and_off_writes_the_rest() {
         let cfg = Config::default();
         let (_dir, path) = temp_config(Some("[sync]\ncategories = [\"config\"]\n"));
 
@@ -2061,7 +2077,7 @@ enabled = true
         let reopened = Config::load_from(&path).unwrap();
         let off = toggled_sync_state(&reopened, SyncCategory::Transcripts);
         save_to_path(&off, &path).unwrap();
-        assert_eq!(written_categories(&path).len(), 4);
+        assert_eq!(written_categories(&path).len(), SyncCategory::ALL.len() - 1);
         assert!(
             !Config::load_from(&path)
                 .unwrap()

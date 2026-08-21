@@ -394,6 +394,23 @@ fn write_one(
 
     tmp.persist(dest)
         .map_err(|e| AppError::io_at(dest, e.error))?;
+
+    // Everything lands at 0600 above, which is right for a credential and wrong
+    // for a hook: `~/.claude/hooks/` and the skill trees beside it hold 73
+    // executable files on this user's Mac, and one that arrives without its
+    // `+x` fails at the moment the tool that owns it tries to run it — with an
+    // error about the hook, not about the restore that broke it.
+    //
+    // 0700 rather than the recorded mode: the execute bit is restored, and the
+    // group and other bits stay closed no matter how open they were on the
+    // machine that packed the file. A restore may narrow; it may never widen.
+    #[cfg(unix)]
+    if item.mode & 0o111 != 0 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| AppError::io_at(dest, e))?;
+    }
+
     Ok(())
 }
 
@@ -552,6 +569,7 @@ mod tests {
         disposition: Disposition,
     ) -> ItemPlan {
         ItemPlan {
+            mode: 0o600,
             dest: layout::from_manifest_path(&m.roots, manifest_path).ok(),
             manifest_path: manifest_path.into(),
             category: SyncCategory::Config,
@@ -602,6 +620,51 @@ mod tests {
     fn mode_of(p: &Path) -> u32 {
         use std::os::unix::fs::PermissionsExt;
         std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    /// A hook or a skill script that arrives without its `+x` is a file the
+    /// tool that owns it can no longer run, and nothing says so until that tool
+    /// fails. 0700 and not the recorded mode: the execute bit comes back, the
+    /// group and other bits stay shut however open they were on the machine
+    /// that packed it.
+    #[cfg(unix)]
+    #[test]
+    fn an_executable_comes_back_runnable_but_never_wider_than_its_owner() {
+        let m = Machine::new();
+        let body = b"#!/bin/sh\necho hook\n".to_vec();
+        let (packs, ids) = packed(&[&body]);
+
+        let mut plan_item = item(
+            &m,
+            "claude-home/hooks/guard.sh",
+            &body,
+            ids[0].clone(),
+            Disposition::Create,
+        );
+        // As packed on a machine where the file was group- and world-readable.
+        plan_item.mode = 0o755;
+        let dest = plan_item.dest.clone().expect("a resolvable destination");
+
+        apply(&m.ctx(), &plan_of(vec![plan_item]), &packs, &mut Silent).unwrap();
+
+        assert_eq!(mode_of(&dest), 0o700, "the execute bit did not survive");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+    }
+
+    /// The complement: an ordinary file is not made executable by a restore.
+    #[cfg(unix)]
+    #[test]
+    fn a_plain_file_stays_0600_however_the_other_machine_had_it() {
+        let m = Machine::new();
+        let body = b"{}".to_vec();
+        let (packs, ids) = packed(&[&body]);
+        let mut plan_item = item(&m, CREDENTIAL, &body, ids[0].clone(), Disposition::Create);
+        plan_item.mode = 0o644;
+        let dest = plan_item.dest.clone().expect("a resolvable destination");
+
+        apply(&m.ctx(), &plan_of(vec![plan_item]), &packs, &mut Silent).unwrap();
+
+        assert_eq!(mode_of(&dest), 0o600);
     }
 
     /// The headline: a credential spanning several chunks comes back byte for
@@ -1152,6 +1215,7 @@ mod tests {
 
         let (packs, ids) = packed(&[ROWS.as_bytes(), b"a whole database"]);
         let store_item = ItemPlan {
+            mode: 0o600,
             dest: None,
             manifest_path: "keystore/cursor-auth".into(),
             category: SyncCategory::Credentials,
@@ -1216,6 +1280,7 @@ mod tests {
 
         let (packs, ids) = packed(&[b"the re-sealed values", b"a whole cookie jar"]);
         let store_item = ItemPlan {
+            mode: 0o600,
             dest: None,
             manifest_path: store.manifest_path(),
             category: SyncCategory::Credentials,

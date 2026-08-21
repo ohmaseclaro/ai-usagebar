@@ -542,6 +542,7 @@ pub fn manifest_path(roots: &SyncRoots, path: &Path) -> Result<String> {
         ("desktop-profiles", roots.desktop_profiles_dir.as_path()),
         ("claude-home", roots.claude_home.as_path()),
         ("cursor-user", roots.cursor_user_dir.as_path()),
+        ("cursor-home", roots.cursor_home.as_path()),
     ];
     candidates.sort_by_key(|(_, root)| std::cmp::Reverse(root.as_os_str().len()));
 

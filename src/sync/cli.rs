@@ -2893,6 +2893,7 @@ mod tests {
         let app = Desktop::refusing("quit", PathBuf::from("/nonexistent"));
         let plan = restore::RestorePlan {
             items: vec![restore::ItemPlan {
+                mode: 0o600,
                 manifest_path: "desktop-data/claude-code-sessions/a/o/local_1.json".into(),
                 dest: Some(PathBuf::from("/nonexistent")),
                 category: SyncCategory::ChatIndex,

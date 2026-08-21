@@ -123,7 +123,7 @@ enabled = true             # disabled by default; enable once you've run `kiro-c
 
 [sync]
 # repo = "owner/name"      # required for backup; no default. See docs/sync-github.md
-# categories = ["config", "credentials", "routines", "chat_index"]
+# categories = ["config", "credentials", "extensions", "routines", "chat_index"]
 # transcript_days = 30            # newest-first age bound, when transcripts is on
 # transcript_max_bytes = 2147483648   # 2 GiB backstop, when transcripts is on
 # keep_snapshots = 10             # must be >= 1; 0 is refused at load

@@ -9,6 +9,39 @@ Each release is also published at
 
 ## [Unreleased]
 
+### Added
+
+- **A sixth sync category, `extensions`** — the tooling that makes a machine
+  yours rather than merely logged in to the same accounts. It carries Claude
+  Code's `skills/`, `agents/`, `hooks/` and `gsd-core/`, its `CLAUDE.md` and
+  `settings.json`, and the working trees of installed plugins, plus Cursor's
+  `agents/`, `rules/` and `mcp.json`. On by default: about 20 MB, against a
+  transcript category measured in gigabytes.
+
+  It is an allow-list, like Cursor's conversations already were. What is
+  deliberately absent is the point of the design: plugin `cache/` and `repos/`
+  are derived from what does travel, each marketplace's `.git` is 12 MB of
+  objects reconstructing 9.7 MB of files already in the bundle, and Cursor's
+  `extensions/` measured 2.9 GB of directories re-installable by name.
+
+### Fixed
+
+- **A restored executable comes back runnable.** Every restored file landed at
+  mode 0600, which is right for a credential and silently wrong for a hook or a
+  skill script — it failed later, with an error about the hook rather than about
+  the restore that broke it. A file packed with any execute bit is now restored
+  at 0700: the bit comes back, and group and other stay shut however open they
+  were on the machine that packed it.
+- **`tar`'s stderr is sanitized like every other untrusted diagnostic.** It
+  names the member it failed on, and a restore's members are paths a hostile
+  manifest chose, so an escape sequence could repaint the line and an embedded
+  newline could forge a report line under it.
+- **The HTTP-client guard reads a CRLF checkout the same as an LF one.** It
+  searched for a literal `"\n#[cfg(test)]\nmod tests"`; a Windows checkout writes
+  `\r\n`, so the marker matched nothing and every file's test module counted as
+  production code — the one test that failed on `windows-latest` for a reason
+  other than `tar`.
+
 ## [1.4.0] — 2026-08-20
 
 ### Added
