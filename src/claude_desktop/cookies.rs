@@ -33,17 +33,16 @@
 //! # What is deliberately *not* here
 //!
 //! - **`bridge-state.json`** — the remote-control / cloud-session bridge. It is
-//!   not in the profile store at all (a switch deletes it and never snapshots
-//!   it; see `super::BRIDGE_FILE`), and `crate::sync::scope`'s credentials
-//!   collector reads only the profile store, so no bundle has ever carried one.
-//!   Carrying it would restore a `cse_…` id that was already stale on the
-//!   machine that wrote it, and `/remote-control` would fail to disconnect.
+//!   in `crate::sync::scope`'s `EXCLUDED_NAMES` and is not in the profile store
+//!   to begin with (a switch deletes it and never snapshots it; see
+//!   `super::BRIDGE_FILE`), so no bundle has ever carried one. Carrying it would
+//!   restore a `cse_…` id that was already stale on the machine that wrote it,
+//!   and `/remote-control` would fail to disconnect.
 //! - **`ant-device-registry.json`** — browser-extension device registrations,
-//!   account-keyed and *per machine*. It lives directly in the profile
-//!   directory rather than under `desktop-state/`, which the collector walks, so
-//!   it does not travel either. That is right: a registration describes the Mac
-//!   that made it, and [`super::merge::merge_device_registry`] is additive
-//!   precisely because each machine keeps its own.
+//!   account-keyed and *per machine*. Excluded the same way, and rightly: a
+//!   registration describes the Mac that made it, which is exactly why
+//!   [`super::merge::merge_device_registry`] is additive locally. Nothing
+//!   arrives from another machine, so there is nothing to merge here.
 //!
 //! # Identity is the seven-column unique index, not `(host_key, name, path)`
 //!
