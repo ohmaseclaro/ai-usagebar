@@ -609,11 +609,23 @@ fn machine_writable(paths: &MachinePaths, store: &Store) -> bool {
 /// Every store this machine could carry, sorted so the wire order is stable
 /// across runs and machines.
 fn machine_all(paths: &MachinePaths) -> Vec<Store> {
+    // Cursor is the one store with no platform condition; see
+    // [`machine_writable`].
     let mut out = vec![Store::CursorAuth];
     if cfg!(target_os = "macos") {
         out.push(Store::ClaudeCodeOauth);
+        // Only where a Safe Storage key could exist. Elsewhere every one of
+        // these would be enumerated, then read, then fail for want of a key,
+        // then be skipped with a line on stderr — a warning about a credential
+        // the platform never had.
+        //
+        // A *directory listing*, deliberately, and not `MachinePaths::safe_key`:
+        // `sync status` reaches this, the macOS menu bar runs `sync status
+        // --json` on every menu open, and reading the Safe Storage key runs
+        // `security(1)` against an item whose ACL does not name it — which can
+        // raise a Keychain prompt. Existence is answered with a stat.
+        out.extend(desktop_caches(&paths.desktop_profiles_dir));
     }
-    out.extend(desktop_caches(&paths.desktop_profiles_dir));
     out.sort();
     out
 }
@@ -1101,9 +1113,12 @@ mod tests {
         std::fs::write(profiles.join("loose-file"), b"x").unwrap();
         seal_into(&profiles, ".hidden", TokenSlot::V2, &this_mac(), "{}");
 
-        let found = machine_all(&MachinePaths::new(dir.path().join("db"), profiles));
+        // `desktop_caches` rather than `machine_all`: the enumeration is pure
+        // and runs the same everywhere, while `machine_all` gates the Keychain-
+        // shaped stores on the platform (asserted separately below).
+        let mut found = desktop_caches(&profiles);
+        found.sort();
         let wire: Vec<String> = found.iter().map(Store::manifest_path).collect();
-        assert!(wire.contains(&"keystore/cursor-auth".to_string()));
         for label in ["gmail", "hotmail", "struct", "toptal"] {
             assert!(
                 wire.contains(&format!(
@@ -1121,6 +1136,21 @@ mod tests {
         let mut sorted = found.clone();
         sorted.sort();
         assert_eq!(found, sorted);
+
+        // And the platform gate on the whole enumeration: Cursor always, the
+        // two Keychain-shaped kinds only on a Mac.
+        let all = machine_all(&MachinePaths::new(dir.path().join("db"), profiles));
+        assert!(all.contains(&Store::CursorAuth));
+        assert_eq!(
+            all.contains(&Store::ClaudeCodeOauth),
+            cfg!(target_os = "macos")
+        );
+        assert_eq!(
+            all.iter()
+                .any(|s| matches!(s, Store::DesktopTokenCache { .. })),
+            cfg!(target_os = "macos"),
+            "off-Mac these would be read, fail for want of a key, and warn"
+        );
     }
 
     /// **The whole Claude Desktop feature, in one assertion.** A blob sealed

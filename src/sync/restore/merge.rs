@@ -1858,6 +1858,57 @@ mod tests {
             }
         }
 
+        /// **The gate cannot be walked around through the file.**
+        ///
+        /// `cursor-user/globalStorage/state.vscdb` is not credential-bearing —
+        /// it holds conversations, and `--force` is the right consent for
+        /// those. But the source machine's `cursorAuth/*` rows are *inside*
+        /// that database, so a run that wrote the file while refusing the store
+        /// would replace a live Cursor login with `--force` alone: exactly what
+        /// [`Disposition::ReplacesLiveCredential`] exists to prevent.
+        ///
+        /// It cannot, because the refusal is whole-run: `write::apply`'s
+        /// preflight sweeps every item before the first byte, so the file never
+        /// lands either. This asserts that, rather than trusting it.
+        #[test]
+        fn a_refused_cursor_store_stops_the_database_file_landing_too() {
+            let m = Machine::new();
+            m.roots
+                .stores
+                .edit()
+                .set(Store::CursorAuth, r#"{"a":"live"}"#);
+            const DB: &str = "cursor-user/globalStorage/state.vscdb";
+            let resolved = snapshot_with_packs(&[
+                (DB, b"the pushing machine's whole database, rows included"),
+                (CURSOR, CURSOR_ROWS.as_bytes()),
+            ]);
+
+            // `--force` and nothing else: the conversations would be written…
+            let plan = plan_of(&m, &resolved, opts(true, false));
+            assert!(
+                disposition_of(&plan, DB).writes(),
+                "the file half is not itself credential-bearing"
+            );
+            // …but the credential inside them is refused, and that refusal is
+            // the whole run's.
+            assert_eq!(
+                disposition_of(&plan, CURSOR),
+                &Disposition::ReplacesLiveCredential
+            );
+            let client = m.client();
+            let err = write::apply(&m.ctx(&client, applying()), &plan, &resolved.packs)
+                .expect_err("the preflight must refuse the run");
+            assert!(err.to_string().contains("credential confirmation"), "{err}");
+            assert!(
+                !layout::from_manifest_path(&m.roots, DB).unwrap().exists(),
+                "the database landed anyway, carrying another machine's login"
+            );
+            assert_eq!(
+                m.roots.stores.edit().get(&Store::CursorAuth),
+                Some(r#"{"a":"live"}"#)
+            );
+        }
+
         /// Cursor's conversation databases are files, and they are filed under
         /// the same opt-in switch as Claude Code's transcripts — not under
         /// `Config`, which the fall-through would otherwise have given them.
