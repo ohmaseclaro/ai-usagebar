@@ -545,6 +545,23 @@ fn footer(plan: &RestorePlan, applying: bool) -> String {
     } else if counts.writes > 0 {
         out.push_str("  Every item to write is new here, so there is nothing to archive.\n");
     }
+    // Closing an app someone is using is disruptive, so it is said here — above
+    // the one question `confirm_apply` asks, and inside the report the `--apply`
+    // arm prints too. Consent for the restore is therefore consent for this,
+    // and `--yes` answers it exactly like the rest of the report.
+    //
+    // Conditional on the *plan*, not on liveness: whether the app is up is a
+    // question for the moment of the write, and asking it here would run
+    // `osascript` on every dry run.
+    if plan.touches_claude_desktop() {
+        out.push_str(
+            "\n  If Claude Desktop is running, it is closed before the first write and\n\
+             \x20 opened again when the run ends.\n\
+             \x20 Some of what is written above is state the app holds open while it runs,\n\
+             \x20 and it would write its own copy back over the restored one on quit.\n\
+             \x20 If it is not running it is left closed.\n",
+        );
+    }
     if !applying {
         out.push_str(&format!("  To apply it, run:  {APPLY_COMMAND}\n"));
     }

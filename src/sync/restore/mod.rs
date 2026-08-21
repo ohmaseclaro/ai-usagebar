@@ -200,6 +200,25 @@ pub struct RestorePlan {
     pub bytes_to_fetch: u64,
 }
 
+impl RestorePlan {
+    /// Would applying this plan write state the Claude Desktop app owns?
+    ///
+    /// **Derived from the items, never from a flag.** A restore that carries
+    /// only `config/` or only transcripts answers `false` and leaves a running
+    /// app alone; one that lands the app's cookie jar or its session indexes
+    /// answers `true`, and `sync pull --apply` stops the app around the write.
+    ///
+    /// Only [`Disposition::writes`] counts. An item the plan already decided to
+    /// skip — identical, locally newer, refused — puts no byte anywhere, and
+    /// closing the user's app over one would be disruption in exchange for
+    /// nothing.
+    pub fn touches_claude_desktop(&self) -> bool {
+        self.items.iter().any(|item| {
+            item.disposition.writes() && layout::is_claude_desktop_state(&item.manifest_path)
+        })
+    }
+}
+
 /// What the write half did. Returned by [`write::apply`]; plan 5-04 owns it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Applied {
