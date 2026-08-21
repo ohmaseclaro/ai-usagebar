@@ -122,7 +122,19 @@ use super::{Applied, Disposition, ItemPlan, PackSource, RestoreCtx, RestorePlan,
 /// during the writing itself is a partial restore, which is an `Ok` carrying
 /// [`Applied::failed_at`] — the caller must not advance the rollback anchor on
 /// one, and [`super::run`] does not.
-pub fn apply(ctx: &RestoreCtx<'_>, plan: &RestorePlan, packs: &PackSource) -> Result<Applied> {
+///
+/// `progress` is reported from the **queue**, after the preflight and so after
+/// every refusal: the count and the byte total are the items that will really be
+/// written, never the manifest's length. The item's manifest path is passed to
+/// `asset_done` and no reporter prints it — it is attacker-chosen, and
+/// `an_attacker_chosen_manifest_path_never_reaches_a_progress_line` in
+/// `push::progress` is what keeps that true.
+pub fn apply(
+    ctx: &RestoreCtx<'_>,
+    plan: &RestorePlan,
+    packs: &PackSource,
+    progress: &mut dyn crate::sync::push::progress::Progress,
+) -> Result<Applied> {
     let mut out = Applied::default();
     let mut queue: Vec<(&ItemPlan, Target)> = Vec::new();
 
@@ -194,9 +206,15 @@ pub fn apply(ctx: &RestoreCtx<'_>, plan: &RestorePlan, packs: &PackSource) -> Re
         queue.push((item, Target::File(checked)));
     }
 
+    progress.stage(
+        crate::sync::push::progress::WRITE,
+        queue.len(),
+        queue.iter().map(|(item, _)| item.true_len).sum(),
+    );
+
     // Manifest order, so a partial restore stops in the same place twice and is
     // therefore debuggable.
-    for (item, target) in queue {
+    for (index, (item, target)) in queue.into_iter().enumerate() {
         let outcome = match &target {
             Target::File(dest) => write_one(packs, item, dest, plan.created_at),
             Target::Store(store) => write_store(ctx, packs, item, *store),
@@ -210,6 +228,7 @@ pub fn apply(ctx: &RestoreCtx<'_>, plan: &RestorePlan, packs: &PackSource) -> Re
             break;
         }
         out.written += 1;
+        progress.asset_done(index, &item.manifest_path, item.true_len);
         if matches!(item.disposition, Disposition::Overwrite { .. }) {
             out.overwritten.push(item.manifest_path.clone());
         }
@@ -389,6 +408,7 @@ mod tests {
     use crate::sync::github::token::TokenSource;
     use crate::sync::github::{Client, Endpoints, RepoRef};
     use crate::sync::pack::PackWriter;
+    use crate::sync::push::progress::Silent;
     use crate::sync::restore::RestoreOptions;
     use crate::sync::{CHUNK_SIZE, SyncRoots, chunk};
     use chrono::{DateTime, Utc};
@@ -586,7 +606,7 @@ mod tests {
             Disposition::Create,
         )]);
 
-        let applied = apply(&m.ctx(), &plan, &packs).unwrap();
+        let applied = apply(&m.ctx(), &plan, &packs, &mut Silent).unwrap();
         assert_eq!(applied.written, 1);
         assert_eq!(applied.failed_at, None);
 
@@ -617,7 +637,7 @@ mod tests {
             Disposition::Create,
         )]);
 
-        apply(&m.ctx(), &plan, &packs).unwrap();
+        apply(&m.ctx(), &plan, &packs, &mut Silent).unwrap();
 
         let mut dir = m.dest(path).parent().unwrap().to_path_buf();
         loop {
@@ -653,7 +673,7 @@ mod tests {
             ids[0].clone(),
             Disposition::Create,
         )]);
-        apply(&m.ctx(), &plan, &packs).unwrap();
+        apply(&m.ctx(), &plan, &packs, &mut Silent).unwrap();
 
         assert_eq!(
             mode_of(&m.roots.config_dir),
@@ -677,7 +697,7 @@ mod tests {
             Disposition::Create,
         )]);
 
-        let applied = apply(&m.ctx(), &plan, &packs).unwrap();
+        let applied = apply(&m.ctx(), &plan, &packs, &mut Silent).unwrap();
         assert_eq!(applied.failed_at.as_deref(), Some(CREDENTIAL));
         assert_eq!(applied.written, 0);
         assert!(!m.dest(CREDENTIAL).exists());
@@ -698,7 +718,7 @@ mod tests {
         only.true_len += 1;
         let plan = plan_of(vec![only]);
 
-        let applied = apply(&m.ctx(), &plan, &packs).unwrap();
+        let applied = apply(&m.ctx(), &plan, &packs, &mut Silent).unwrap();
         assert_eq!(applied.failed_at.as_deref(), Some(CREDENTIAL));
         assert!(!m.dest(CREDENTIAL).exists());
         assert!(files_under(&m.roots.config_dir).is_empty());
@@ -720,7 +740,7 @@ mod tests {
             Disposition::Create,
         )]);
 
-        let applied = apply(&m.ctx(), &plan, &packs).unwrap();
+        let applied = apply(&m.ctx(), &plan, &packs, &mut Silent).unwrap();
         assert_eq!(applied.failed_at.as_deref(), Some(CREDENTIAL));
         assert_eq!(applied.written, 0);
     }
@@ -792,7 +812,7 @@ mod tests {
         items[5].dest = None;
         items[6].dest = None;
 
-        let applied = apply(&m.ctx(), &plan_of(items), &packs).unwrap();
+        let applied = apply(&m.ctx(), &plan_of(items), &packs, &mut Silent).unwrap();
 
         assert_eq!(applied.written, 3);
         assert_eq!(applied.skipped, 4);
@@ -824,7 +844,7 @@ mod tests {
             item(&m, "config/a.toml", b"c", ids[2].clone(), overwrite),
         ]);
 
-        let applied = apply(&m.ctx(), &plan, &packs).unwrap();
+        let applied = apply(&m.ctx(), &plan, &packs, &mut Silent).unwrap();
         assert_eq!(
             applied.overwritten,
             vec![
@@ -866,7 +886,7 @@ mod tests {
             ),
         ]);
 
-        let applied = apply(&m.ctx(), &plan, &packs).unwrap();
+        let applied = apply(&m.ctx(), &plan, &packs, &mut Silent).unwrap();
 
         assert_eq!(applied.written, 1);
         assert_eq!(applied.failed_at.as_deref(), Some("config/2.toml"));
@@ -903,7 +923,8 @@ mod tests {
             ),
         ]);
 
-        let err = apply(&m.ctx(), &plan, &packs).expect_err("an unresolved credential");
+        let err =
+            apply(&m.ctx(), &plan, &packs, &mut Silent).expect_err("an unresolved credential");
         assert!(err.to_string().contains(CREDENTIAL), "{err}");
         assert!(
             files_under(&m.roots.config_dir).is_empty(),
@@ -936,7 +957,8 @@ mod tests {
             tampered,
         ]);
 
-        let err = apply(&m.ctx(), &plan, &packs).expect_err("a plan that disagrees with itself");
+        let err = apply(&m.ctx(), &plan, &packs, &mut Silent)
+            .expect_err("a plan that disagrees with itself");
         assert!(err.to_string().contains("config/b.toml"), "{err}");
         assert!(
             files_under(&m.roots.config_dir).is_empty(),
@@ -959,7 +981,7 @@ mod tests {
         );
         orphan.dest = None;
 
-        let err = apply(&m.ctx(), &plan_of(vec![orphan]), &packs)
+        let err = apply(&m.ctx(), &plan_of(vec![orphan]), &packs, &mut Silent)
             .expect_err("a writable item with nowhere to go");
         assert!(err.to_string().contains("config/a.toml"), "{err}");
     }
@@ -979,8 +1001,8 @@ mod tests {
             Disposition::Create,
         )]);
 
-        apply(&m.ctx(), &plan, &packs).unwrap();
-        apply(&m.ctx(), &plan, &packs).unwrap();
+        apply(&m.ctx(), &plan, &packs, &mut Silent).unwrap();
+        apply(&m.ctx(), &plan, &packs, &mut Silent).unwrap();
 
         let dest = m.dest(CREDENTIAL);
         assert_eq!(std::fs::read(&dest).unwrap(), body);
@@ -1056,7 +1078,7 @@ mod tests {
             ),
         ]);
 
-        let err = apply(&m.ctx(), &plan, &packs)
+        let err = apply(&m.ctx(), &plan, &packs, &mut Silent)
             .expect_err("a machine-bound path must not reach the write path")
             .to_string();
         assert!(err.contains("bridge-state.json"), "{err}");

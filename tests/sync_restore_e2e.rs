@@ -1004,7 +1004,11 @@ async fn pull(
     let repo = repo();
     let anchor_path = m.anchor_path();
     let backups = m.backups();
-    restore::run(m.restore_ctx(&client, &repo, &anchor_path, &backups, opts)).await
+    restore::run(
+        m.restore_ctx(&client, &repo, &anchor_path, &backups, opts),
+        &mut Silent,
+    )
+    .await
 }
 
 /// `sync setup`'s prompt seam, scripted — the second machine's operator.
