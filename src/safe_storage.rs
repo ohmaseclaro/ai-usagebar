@@ -56,31 +56,58 @@ pub fn looks_like_value(value: &str) -> bool {
     value.trim_start().starts_with(PREFIX_B64)
 }
 
+/// Is this a safeStorage value in its **raw** framing — the shape a Chromium
+/// `Cookies` row stores, where `encrypted_value` is a `BLOB` holding the `v10`
+/// tag and ciphertext directly rather than base64 of them?
+///
+/// The bytewise twin of [`looks_like_value`], and it exists for the same
+/// reason: it separates *"not this format"* from *"this format, another
+/// machine's key"* without needing a key.
+pub fn looks_like_raw(raw: &[u8]) -> bool {
+    raw.len() > PREFIX.len() && &raw[..PREFIX.len()] == PREFIX
+}
+
+/// Decrypt a raw `v10…` safeStorage blob into its plaintext bytes.
+///
+/// Two framings of one value exist in the wild and both are read here: Claude
+/// Desktop's `config-tokenCache*` files hold the base64 spelling ([`decrypt`]),
+/// while a Chromium cookie jar's `encrypted_value` column holds these same
+/// bytes raw. Splitting the transform out rather than base64-encoding a blob
+/// just to decode it again keeps one AES path for both.
+pub fn decrypt_raw(key: &[u8; KEY_LEN], raw: &[u8]) -> Result<Vec<u8>> {
+    if !looks_like_raw(raw) {
+        return Err(AppError::Other(
+            "safeStorage value is missing the v10 prefix".into(),
+        ));
+    }
+    Aes128CbcDec::new(key.into(), &IV.into())
+        .decrypt_padded_vec::<Pkcs7>(&raw[PREFIX.len()..])
+        .map_err(|e| AppError::Other(format!("safeStorage decrypt failed: {e}")))
+}
+
+/// Encrypt plaintext into a raw `v10…` blob, byte-compatible with what the app
+/// wrote (deterministic: fixed IV, no random salt).
+pub fn encrypt_raw(key: &[u8; KEY_LEN], plaintext: &[u8]) -> Vec<u8> {
+    let ct = Aes128CbcEnc::new(key.into(), &IV.into()).encrypt_padded_vec::<Pkcs7>(plaintext);
+    let mut out = Vec::with_capacity(PREFIX.len() + ct.len());
+    out.extend_from_slice(PREFIX);
+    out.extend_from_slice(&ct);
+    out
+}
+
 /// Decrypt a base64 `v10…` safeStorage value into its plaintext bytes.
 pub fn decrypt(key: &[u8; KEY_LEN], value_b64: &str) -> Result<Vec<u8>> {
     let raw = base64::engine::general_purpose::STANDARD
         .decode(value_b64.trim())
         .map_err(|e| AppError::Other(format!("safeStorage value is not base64: {e}")))?;
-    if raw.len() < PREFIX.len() || &raw[..PREFIX.len()] != PREFIX {
-        return Err(AppError::Other(
-            "safeStorage value is missing the v10 prefix".into(),
-        ));
-    }
-    let ct = &raw[PREFIX.len()..];
-    Aes128CbcDec::new(key.into(), &IV.into())
-        .decrypt_padded_vec::<Pkcs7>(ct)
-        .map_err(|e| AppError::Other(format!("safeStorage decrypt failed: {e}")))
+    decrypt_raw(key, &raw)
 }
 
 /// Encrypt plaintext back into a base64 `v10…` value, byte-compatible with what
 /// the app wrote (deterministic: fixed IV, no random salt). Used for the token
 /// write-back after a refresh.
 pub fn encrypt(key: &[u8; KEY_LEN], plaintext: &[u8]) -> String {
-    let ct = Aes128CbcEnc::new(key.into(), &IV.into()).encrypt_padded_vec::<Pkcs7>(plaintext);
-    let mut out = Vec::with_capacity(PREFIX.len() + ct.len());
-    out.extend_from_slice(PREFIX);
-    out.extend_from_slice(&ct);
-    base64::engine::general_purpose::STANDARD.encode(out)
+    base64::engine::general_purpose::STANDARD.encode(encrypt_raw(key, plaintext))
 }
 
 /// The derived AES key for Claude Desktop, read from the login Keychain.

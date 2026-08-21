@@ -127,9 +127,16 @@ pub const PREFIX: &str = "keystore";
 /// component at all.
 const WIRE_CLAUDE_CODE: &str = "keystore/claude-code-oauth";
 const WIRE_CURSOR: &str = "keystore/cursor-auth";
-/// The one that does, and everything after it is checked by [`plain_component`]
-/// and [`TokenSlot::from_wire`] before it means anything.
+/// The two that carry a bundle-chosen profile label, and everything after each
+/// prefix is checked by [`plain_component`] (and, for the token cache,
+/// [`TokenSlot::from_wire`]) before it means anything.
 const WIRE_DESKTOP: &str = "keystore/desktop-token-cache/";
+const WIRE_COOKIES: &str = "keystore/desktop-cookies/";
+
+/// `desktop-state/Cookies` inside a profile directory — the Chromium jar whose
+/// values [`Store::DesktopCookies`] re-seals. Mirrors `claude_desktop`'s private
+/// `DESKTOP_STATE` and the first entry of its `COOKIE_FILES`.
+const COOKIE_JAR: [&str; 2] = ["desktop-state", "Cookies"];
 
 /// A profile label longer than this is not one claude-acc wrote. The bound is
 /// `NAME_MAX` on every mainstream filesystem, matching
@@ -192,6 +199,26 @@ pub enum Store {
     /// bundle-chosen component in this module's whole vocabulary, and
     /// [`plain_component`] has already accepted it wherever this exists.
     DesktopTokenCache { profile: String, slot: TokenSlot },
+    /// The **values** in one Claude Desktop profile's Chromium cookie jar,
+    /// `desktop-state/Cookies`.
+    ///
+    /// The token cache above signs the *API* in — it is what
+    /// [`crate::anthropic::desktop_creds`] reads, and moving it is what made
+    /// `usage` report all four accounts on a second Mac. It does not sign the
+    /// *app* in: Claude Desktop's renderer authenticates from `sessionKey` /
+    /// `sessionKeyV3` on `.claude.ai`, and those live here. A restore that
+    /// carried only the token cache left the app on a login screen while its
+    /// quota displayed correctly, which is the defect this closes.
+    ///
+    /// Only the values travel. The jar itself is an ordinary file in the
+    /// bundle and lands first (see [`crate::sync::restore::write`]); it brings
+    /// every other column, and this brings the one column a copy cannot —
+    /// each `encrypted_value`, decrypted with the pushing Mac's Safe Storage
+    /// key and re-sealed under the target's. That is one carrier for the row
+    /// and one for the secret inside it, not two carriers for one thing: the
+    /// store's `UPDATE` supersedes the file's inert ciphertext on every row it
+    /// carries, and deliberately leaves the rest alone.
+    DesktopCookies { profile: String },
 }
 
 impl Store {
@@ -203,6 +230,7 @@ impl Store {
             Store::DesktopTokenCache { profile, slot } => {
                 format!("{WIRE_DESKTOP}{profile}/{}", slot.file_name())
             }
+            Store::DesktopCookies { profile } => format!("{WIRE_COOKIES}{profile}"),
         }
     }
 
@@ -219,6 +247,11 @@ impl Store {
             WIRE_CLAUDE_CODE => Some(Store::ClaudeCodeOauth),
             WIRE_CURSOR => Some(Store::CursorAuth),
             _ => {
+                if let Some(profile) = s.strip_prefix(WIRE_COOKIES) {
+                    return plain_component(profile).then(|| Store::DesktopCookies {
+                        profile: profile.to_string(),
+                    });
+                }
                 let (profile, slot) = s.strip_prefix(WIRE_DESKTOP)?.split_once('/')?;
                 if !plain_component(profile) {
                     return None;
@@ -244,7 +277,10 @@ impl Store {
     /// must be named and skipped, not allowed to take the other three down with
     /// it. The failure is still reported; it is only not fatal.
     pub fn read_failure_is_fatal(&self) -> bool {
-        !matches!(self, Store::DesktopTokenCache { .. })
+        !matches!(
+            self,
+            Store::DesktopTokenCache { .. } | Store::DesktopCookies { .. }
+        )
     }
 
     /// Does this manifest entry name a store at all? Cheaper than
@@ -272,6 +308,9 @@ impl Store {
                 "the Claude Desktop login for profile {profile:?} ({})",
                 slot.file_name()
             ),
+            Store::DesktopCookies { profile } => {
+                format!("the Claude Desktop app session for profile {profile:?} (cookies)")
+            }
         }
     }
 }
@@ -477,7 +516,9 @@ impl Stores {
             Stores::Fixture(_) => match store {
                 // A fixture's "this machine has a key" answer is its injected
                 // one, so `set_safe_key(None)` is a target that cannot re-seal.
-                Store::DesktopTokenCache { .. } => self.edit().safe_key.is_some(),
+                Store::DesktopTokenCache { .. } | Store::DesktopCookies { .. } => {
+                    self.edit().safe_key.is_some()
+                }
                 _ => true,
             },
             Stores::Machine(paths) => machine_writable(paths, store),
@@ -595,15 +636,24 @@ impl Stores {
 ///   gating it on the platform would refuse a working restore for no reason.
 ///   The database's *existence* is the real condition: this build will not
 ///   fabricate one (see [`crate::cursor::db::write_auth_rows`]).
-/// - **Desktop token cache**: only where there is a Safe Storage key to re-seal
-///   the value with. Off-Mac there is none, and on a Mac without Claude Desktop
-///   there is none either; both are the same refusal.
+/// - **Desktop token cache and Desktop cookies**: only where there is a Safe
+///   Storage key to re-seal the value with. Off-Mac there is none, and on a Mac
+///   without Claude Desktop there is none either; both are the same refusal.
 fn machine_writable(paths: &MachinePaths, store: &Store) -> bool {
     match store {
         Store::ClaudeCodeOauth => cfg!(target_os = "macos"),
         Store::CursorAuth => paths.cursor_db.exists(),
-        Store::DesktopTokenCache { .. } => paths.safe_key().is_some(),
+        Store::DesktopTokenCache { .. } | Store::DesktopCookies { .. } => {
+            paths.safe_key().is_some()
+        }
     }
+}
+
+/// One profile's cookie jar, `<profiles>/<profile>/desktop-state/Cookies`.
+fn cookie_jar(profiles_dir: &Path, profile: &str) -> PathBuf {
+    let mut path = profiles_dir.join(profile);
+    path.extend(COOKIE_JAR);
+    path
 }
 
 /// Every store this machine could carry, sorted so the wire order is stable
@@ -630,7 +680,13 @@ fn machine_all(paths: &MachinePaths) -> Vec<Store> {
     out
 }
 
-/// One [`Store::DesktopTokenCache`] per profile per slot that actually exists.
+/// Per profile: one [`Store::DesktopTokenCache`] per slot that exists, plus one
+/// [`Store::DesktopCookies`] if that profile has a cookie jar.
+///
+/// The two together are the whole of a Claude Desktop login — the token cache
+/// signs the API in and the jar signs the app's web view in — and a profile can
+/// legitimately have either without the other, so each is listed on its own
+/// file's existence.
 ///
 /// Listed from the profile store rather than from a constant — that is what
 /// makes four Claude Desktop accounts travel where one used to. A directory
@@ -662,6 +718,12 @@ fn desktop_caches(profiles_dir: &Path) -> Vec<Store> {
                 });
             }
         }
+        // A stat, never an open: this is on `sync status`'s path.
+        if cookie_jar(profiles_dir, profile).is_file() {
+            out.push(Store::DesktopCookies {
+                profile: profile.to_string(),
+            });
+        }
     }
     out
 }
@@ -676,6 +738,9 @@ fn machine_read(paths: &MachinePaths, store: &Store) -> Result<Option<Zeroizing<
             *slot,
             paths.safe_key(),
         ),
+        Store::DesktopCookies { profile } => {
+            cookies_read(&paths.desktop_profiles_dir, profile, paths.safe_key())
+        }
     }
 }
 
@@ -691,6 +756,12 @@ fn machine_has(paths: &MachinePaths, store: &Store) -> Result<bool> {
             .join(slot.file_name())
             .metadata()
             .is_ok_and(|md| md.is_file() && md.len() > 0)),
+        // `SELECT 1 … LIMIT 1`, so no cookie value is read to answer it — the
+        // same rule, and the same reason, as [`crate::cursor::db::has_auth_rows`].
+        Store::DesktopCookies { profile } => crate::claude_desktop::cookies::has_rows(&cookie_jar(
+            &paths.desktop_profiles_dir,
+            profile,
+        )),
     }
 }
 
@@ -702,6 +773,12 @@ fn machine_write(paths: &MachinePaths, store: &Store, value: &str) -> Result<()>
             &paths.desktop_profiles_dir,
             profile,
             *slot,
+            paths.safe_key(),
+            value,
+        ),
+        Store::DesktopCookies { profile } => cookies_write(
+            &paths.desktop_profiles_dir,
+            profile,
             paths.safe_key(),
             value,
         ),
@@ -836,6 +913,177 @@ fn desktop_write(
     )
 }
 
+// ---------------------------------------------------------------------------
+// Claude Desktop cookie jars. The same decrypt-out / re-encrypt-in transform as
+// the token cache above and, like it, pure: the key is an argument, so both
+// directions are exercised on Linux CI with a test key and neither can reach a
+// real login Keychain.
+//
+// # What travels
+//
+// One entry per row: its seven-column identity, and its **whole plaintext**,
+// base64'd. Chromium seals `SHA256(host_key) || value` rather than the value
+// alone — measured on all 26 rows of a real jar, every one of them — and
+// carrying the plaintext verbatim rather than splitting off that prefix means
+// this build never has to agree with Chromium about where the value starts. It
+// also preserves the domain binding for free: the row is written back under the
+// same `host_key` it came from, so the hash inside still matches, and a bundle
+// that paired one domain's identity with another's plaintext produces a cookie
+// Chromium itself rejects.
+//
+// # What does not travel
+//
+// A row whose value is not a `v10` blob at all is skipped silently — it is not
+// this scheme's and never was. A row that *is* one but will not open under this
+// Mac's key is skipped and **named**, because that is a fact worth telling: one
+// bad row must not cost the other 25, and the target's copy of it is left
+// exactly as it was.
+// ---------------------------------------------------------------------------
+
+/// The wire form of one jar: `[[identity, base64(plaintext)], …]`, ordered by
+/// identity so the same jar hashes to the same chunk ids twice and
+/// `merge::decide_store` can answer *identical* for a session that did not
+/// change.
+type WireCookies = Vec<(crate::claude_desktop::cookies::CookieKey, String)>;
+
+/// Decrypt one profile's cookie jar with **this** machine's key.
+///
+/// `Ok(None)` is "there is no app session in this profile" — an empty or absent
+/// jar. Every other failure is an `Err`, which [`Stores::read_or_skip`] turns
+/// into "this one profile is skipped, and here is why" rather than a failed
+/// push of the other three.
+///
+/// Nothing here renders a cookie value, a plaintext or the key. The only
+/// bundle- or jar-derived text in any message is a **cookie name** — `sessionKey`,
+/// `__cf_bm` — which is not a secret, and it is rendered with `{:?}`.
+fn cookies_read(
+    profiles_dir: &Path,
+    profile: &str,
+    key: Option<safe_storage::Key>,
+) -> Result<Option<Zeroizing<String>>> {
+    let jar = cookie_jar(profiles_dir, profile);
+    let sealed = crate::claude_desktop::cookies::read_sealed(&jar)?;
+    if sealed.is_empty() {
+        return Ok(None);
+    }
+    let key = key.ok_or_else(|| {
+        AppError::Credentials(format!(
+            "{} is sealed, and this machine has no Claude Safe Storage key to open it with",
+            cookies_label(profile)
+        ))
+    })?;
+    let mut out: WireCookies = Vec::with_capacity(sealed.len());
+    let mut skipped = Vec::new();
+    for (id, blob) in sealed {
+        // Not this scheme's value at all. Nothing to carry and nothing to say.
+        if !safe_storage::looks_like_raw(&blob) {
+            continue;
+        }
+        let Ok(plain) = safe_storage::decrypt_raw(&key, &blob).map(Zeroizing::new) else {
+            skipped.push(format!("{:?}", id.name));
+            continue;
+        };
+        out.push((
+            id,
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &*plain),
+        ));
+    }
+    if !skipped.is_empty() {
+        eprintln!(
+            "sync: {} — {} cookie(s) would not open with this Mac's key and are not carried: {}",
+            cookies_label(profile),
+            skipped.len(),
+            skipped.join(", ")
+        );
+    }
+    if out.is_empty() {
+        return Err(AppError::Credentials(format!(
+            "no cookie in {} opened with this Mac's Safe Storage key",
+            cookies_label(profile)
+        )));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    let json = serde_json::to_string(&out)
+        .map_err(|e| AppError::Other(format!("could not encode a Claude Desktop session: {e}")))?;
+    Ok(Some(Zeroizing::new(json)))
+}
+
+/// Re-seal one profile's cookie values under the **target's** key, into the
+/// target's own jar.
+///
+/// The jar is not created here: it arrives as an ordinary file in the same
+/// restore, ahead of every store, and if it did not arrive then the honest
+/// outcome is a refusal of this item rather than a fabricated database with no
+/// schema Chromium recognises.
+///
+/// No path is a read-modify-write. Every value is decoded and re-encrypted
+/// before the database is opened, so a malformed payload refuses without ever
+/// having touched the jar, and the write itself is one transaction.
+fn cookies_write(
+    profiles_dir: &Path,
+    profile: &str,
+    key: Option<safe_storage::Key>,
+    value: &str,
+) -> Result<()> {
+    if !plain_component(profile) {
+        return Err(AppError::Credentials(format!(
+            "refusing to write a Claude Desktop session for the profile name {profile:?}"
+        )));
+    }
+    let key = key.ok_or_else(|| {
+        AppError::Credentials(format!(
+            "this machine has no Claude Safe Storage key, so {} cannot be sealed for it — \
+             install and sign in to Claude Desktop once, then restore again",
+            cookies_label(profile)
+        ))
+    })?;
+    // `serde_json`'s own message can quote its input, and the input is a jar
+    // full of live sessions. A fixed string instead.
+    let wire: WireCookies = serde_json::from_str(value).map_err(|_| {
+        AppError::Credentials(format!(
+            "the snapshot's {} is not the object this build writes — refusing it",
+            cookies_label(profile)
+        ))
+    })?;
+    if wire.is_empty() {
+        return Err(AppError::Credentials(format!(
+            "the snapshot's {} is empty — refusing to replace a live one with it",
+            cookies_label(profile)
+        )));
+    }
+    let mut rows = Vec::with_capacity(wire.len());
+    for (id, b64) in wire {
+        let plain = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &b64)
+            .map(Zeroizing::new)
+            .map_err(|_| {
+                AppError::Credentials(format!(
+                    "the snapshot's cookie {:?} for {} is not the shape this build writes",
+                    id.name,
+                    cookies_label(profile)
+                ))
+            })?;
+        rows.push((id, safe_storage::encrypt_raw(&key, &plain)));
+    }
+    let (updated, missing) =
+        crate::claude_desktop::cookies::write_sealed(&cookie_jar(profiles_dir, profile), &rows)?;
+    if missing > 0 {
+        // Not a failure: the jar file travels beside this and lands first, so a
+        // miss means it did not (skipped as identical, or excluded). Worth
+        // saying, because the app's session is only as complete as this count.
+        eprintln!(
+            "sync: {} — re-sealed {updated} cookie(s); {missing} were not in this machine's jar",
+            cookies_label(profile)
+        );
+    }
+    Ok(())
+}
+
+/// A cookie jar named for a message. The profile label is bundle data on the
+/// restore side, so `{:?}` escapes it.
+fn cookies_label(profile: &str) -> String {
+    format!("the Claude Desktop app session for profile {profile:?}")
+}
+
 /// A Desktop cache named for a message. The profile label is bundle data on the
 /// restore side, so `{:?}` escapes it.
 fn profile_label(profile: &str, slot: TokenSlot) -> String {
@@ -917,6 +1165,49 @@ mod tests {
         }
     }
 
+    fn cookies(profile: &str) -> Store {
+        Store::DesktopCookies {
+            profile: profile.to_string(),
+        }
+    }
+
+    /// Seed one profile's cookie jar, sealed under `key`, exactly as Chromium
+    /// wrote it: `encrypted_value` is a raw `v10` blob over
+    /// `SHA256(host_key) || value` — the framing measured on every one of the
+    /// 26 rows of a real Claude Desktop jar.
+    fn seal_jar_into(
+        dir: &Path,
+        profile: &str,
+        key: &safe_storage::Key,
+        cookies: &[(&str, &str)],
+    ) -> PathBuf {
+        let jar = cookie_jar(dir, profile);
+        std::fs::create_dir_all(jar.parent().unwrap()).unwrap();
+        let rows: Vec<_> = cookies
+            .iter()
+            .map(|(name, value)| {
+                let id = crate::claude_desktop::cookies::testing::key(".claude.ai", name);
+                let mut plain = domain_hash(&id.host_key);
+                plain.extend_from_slice(value.as_bytes());
+                (id, safe_storage::encrypt_raw(key, &plain))
+            })
+            .collect();
+        crate::claude_desktop::cookies::testing::seed(&jar, &rows);
+        jar
+    }
+
+    /// Chromium's domain binding, as a test writes it. Not reimplemented in
+    /// production: the plaintext travels whole, prefix included, so this build
+    /// never has to agree with Chromium about where the value begins.
+    fn domain_hash(host: &str) -> Vec<u8> {
+        use sha1::Digest;
+        // Any fixed 32-byte function of the host serves the test's purpose —
+        // that a prefix exists, travels intact, and stays bound to its row.
+        let mut out = sha1::Sha1::digest(host.as_bytes()).to_vec();
+        out.resize(32, 0);
+        out
+    }
+
     /// Seed one profile's sealed token cache, as claude-acc wrote it.
     fn seal_into(dir: &Path, profile: &str, slot: TokenSlot, key: &safe_storage::Key, plain: &str) {
         let path = dir.join(profile).join(slot.file_name());
@@ -934,6 +1225,8 @@ mod tests {
             desktop("gmail", TokenSlot::V2),
             desktop("gmail", TokenSlot::V1),
             desktop("toptal", TokenSlot::V2),
+            cookies("gmail"),
+            cookies("toptal"),
         ];
         let mut seen: Vec<String> = Vec::new();
         for store in &stores {
@@ -949,6 +1242,10 @@ mod tests {
         }
         assert_eq!(
             seen[2], "keystore/desktop-token-cache/gmail/config-tokenCacheV2",
+            "the wire spelling is part of the format"
+        );
+        assert_eq!(
+            seen[5], "keystore/desktop-cookies/gmail",
             "the wire spelling is part of the format"
         );
     }
@@ -986,16 +1283,22 @@ mod tests {
             "with\nnewline",
             "with\u{1b}[2Jescape",
         ] {
-            let wire = format!("keystore/desktop-token-cache/{hostile}/config-tokenCacheV2");
-            assert!(
-                Store::from_manifest_path(&wire).is_none(),
-                "{hostile:?} was accepted as a profile name"
-            );
-            assert!(
-                Store::is_store_path(&wire),
-                "{hostile:?} must still be recognised as a store entry, so it is skipped \
-                 rather than resolved as a file path"
-            );
+            // Both wire spellings that take a profile label, so the second one
+            // cannot silently skip the check the first one applies.
+            for wire in [
+                format!("keystore/desktop-token-cache/{hostile}/config-tokenCacheV2"),
+                format!("keystore/desktop-cookies/{hostile}"),
+            ] {
+                assert!(
+                    Store::from_manifest_path(&wire).is_none(),
+                    "{hostile:?} was accepted as a profile name in {wire}"
+                );
+                assert!(
+                    Store::is_store_path(&wire),
+                    "{hostile:?} must still be recognised as a store entry, so it is skipped \
+                     rather than resolved as a file path"
+                );
+            }
         }
         assert!(!plain_component(&"x".repeat(MAX_PROFILE_BYTES + 1)));
         // And the ordinary ones still work.
@@ -1109,9 +1412,16 @@ mod tests {
             seal_into(&profiles, label, TokenSlot::V2, &this_mac(), "{}");
         }
         seal_into(&profiles, "gmail", TokenSlot::V1, &this_mac(), "{}");
+        // Three of the four have opened the app, so three have a cookie jar.
+        // `hotmail` has a token cache and no jar: each is listed on its own
+        // file's existence, because a profile can legitimately have either.
+        for label in ["gmail", "struct", "toptal"] {
+            seal_jar_into(&profiles, label, &this_mac(), &[("sessionKey", "x")]);
+        }
         // Not a profile: a file, and a name that cannot be spelled on the wire.
         std::fs::write(profiles.join("loose-file"), b"x").unwrap();
         seal_into(&profiles, ".hidden", TokenSlot::V2, &this_mac(), "{}");
+        seal_jar_into(&profiles, ".hidden", &this_mac(), &[("sessionKey", "x")]);
 
         // `desktop_caches` rather than `machine_all`: the enumeration is pure
         // and runs the same everywhere, while `machine_all` gates the Keychain-
@@ -1128,6 +1438,16 @@ mod tests {
             );
         }
         assert!(wire.contains(&"keystore/desktop-token-cache/gmail/config-tokenCache".to_string()));
+        for label in ["gmail", "struct", "toptal"] {
+            assert!(
+                wire.contains(&format!("keystore/desktop-cookies/{label}")),
+                "{label}'s app session did not travel: {wire:?}"
+            );
+        }
+        assert!(
+            !wire.contains(&"keystore/desktop-cookies/hotmail".to_string()),
+            "a profile with no jar must not be listed as having one: {wire:?}"
+        );
         assert!(
             !wire.iter().any(|w| w.contains(".hidden")),
             "a name that cannot be spelled on the wire must not be carried: {wire:?}"
@@ -1145,12 +1465,18 @@ mod tests {
             all.contains(&Store::ClaudeCodeOauth),
             cfg!(target_os = "macos")
         );
-        assert_eq!(
+        for present in [
             all.iter()
                 .any(|s| matches!(s, Store::DesktopTokenCache { .. })),
-            cfg!(target_os = "macos"),
-            "off-Mac these would be read, fail for want of a key, and warn"
-        );
+            all.iter()
+                .any(|s| matches!(s, Store::DesktopCookies { .. })),
+        ] {
+            assert_eq!(
+                present,
+                cfg!(target_os = "macos"),
+                "off-Mac these would be read, fail for want of a key, and warn"
+            );
+        }
     }
 
     /// **The whole Claude Desktop feature, in one assertion.** A blob sealed
@@ -1198,6 +1524,219 @@ mod tests {
             Some(secret.to_string())
         );
         assert!(desktop_read(target.path(), "gmail", TokenSlot::V2, Some(this_mac())).is_err());
+    }
+
+    /// **The whole of this plan, in one assertion.** A cookie sealed under Mac
+    /// A's key opens on Mac B, which has never seen that key — and the jar's
+    /// other twenty columns arrive exactly as the file carried them.
+    #[test]
+    fn a_cookie_sealed_by_one_mac_opens_on_another() {
+        let source = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+        let session = "sk-ant-sid01-the-live-web-session";
+        seal_jar_into(
+            source.path(),
+            "gmail",
+            &this_mac(),
+            &[("sessionKey", session), ("lastActiveOrg", "org-abc")],
+        );
+        // The target's jar is the file the restore lands first: same rows,
+        // still sealed under the *source* machine's key, and therefore inert.
+        let jar = seal_jar_into(
+            target.path(),
+            "gmail",
+            &this_mac(),
+            &[("sessionKey", session), ("lastActiveOrg", "org-abc")],
+        );
+        let before = crate::claude_desktop::cookies::testing::dump(&jar);
+
+        // Push: decrypt with the machine that has the key.
+        let carried = cookies_read(source.path(), "gmail", Some(this_mac()))
+            .unwrap()
+            .expect("the source Mac can open its own jar");
+
+        // Restore: re-seal under a key the source machine never had.
+        cookies_write(target.path(), "gmail", Some(other_mac()), &carried).unwrap();
+
+        // The target now opens it, and only with its own key.
+        let opened = cookies_read(target.path(), "gmail", Some(other_mac()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(opened.as_str(), carried.as_str());
+        assert!(
+            cookies_read(target.path(), "gmail", Some(this_mac())).is_err(),
+            "the source Mac's key must no longer open the target's jar"
+        );
+
+        // The value that came back is the whole plaintext, domain prefix and
+        // all, so Chromium's own binding check still passes on the target.
+        let wire: WireCookies = serde_json::from_str(&opened).unwrap();
+        let (id, b64) = wire.iter().find(|(k, _)| k.name == "sessionKey").unwrap();
+        let plain =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).unwrap();
+        assert_eq!(&plain[..32], &domain_hash(&id.host_key)[..]);
+        assert_eq!(&plain[32..], session.as_bytes());
+
+        // Nothing but `encrypted_value` moved, on any row.
+        let after = crate::claude_desktop::cookies::testing::dump(&jar);
+        assert_eq!(before.len(), after.len());
+        for (b, a) in before.iter().zip(&after) {
+            let differing = b
+                .split('|')
+                .zip(a.split('|'))
+                .filter(|(x, y)| x != y)
+                .count();
+            assert_eq!(differing, 1, "only the sealed value changed:\n{b}\n{a}");
+        }
+        // And the session is nowhere on the target's disk in clear.
+        assert!(!String::from_utf8_lossy(&std::fs::read(&jar).unwrap()).contains(session));
+    }
+
+    /// One row that will not open must not cost the other twenty-five, and the
+    /// target's copy of that row must be left exactly as it was.
+    #[test]
+    fn a_cookie_that_will_not_decrypt_is_skipped_and_the_targets_row_survives() {
+        let source = TempDir::new().unwrap();
+        let jar = seal_jar_into(
+            source.path(),
+            "gmail",
+            &this_mac(),
+            &[
+                ("sessionKey", "mine"),
+                ("lastActiveOrg", "org-abc"),
+                ("_fbp", "analytics"),
+            ],
+        );
+        let row = |name: &str| crate::claude_desktop::cookies::testing::key(".claude.ai", name);
+        crate::claude_desktop::cookies::write_sealed(
+            &jar,
+            &[
+                // A `v10` blob under a key nothing here holds — a different
+                // Chromium profile's, or one since rotated. Skipped and named.
+                (
+                    row("lastActiveOrg"),
+                    safe_storage::encrypt_raw(&safe_storage::derive_key(b"a-third-mac"), b"x"),
+                ),
+                // Not this scheme's framing at all. Skipped silently: it was
+                // never ours, so there is nothing to report about it.
+                (row("_fbp"), b"v11-some-future-scheme".to_vec()),
+            ],
+        )
+        .unwrap();
+
+        let carried = cookies_read(source.path(), "gmail", Some(this_mac()))
+            .unwrap()
+            .expect("the readable row still travels");
+        let wire: WireCookies = serde_json::from_str(&carried).unwrap();
+        assert_eq!(
+            wire.iter()
+                .map(|(k, _)| k.name.as_str())
+                .collect::<Vec<_>>(),
+            ["sessionKey"],
+            "the undecryptable row is not carried; the other one is"
+        );
+
+        // The target keeps its own copy of the row that did not travel.
+        let target = TempDir::new().unwrap();
+        let target_jar = seal_jar_into(
+            target.path(),
+            "gmail",
+            &other_mac(),
+            &[("sessionKey", "old"), ("lastActiveOrg", "keep-me")],
+        );
+        let before = crate::claude_desktop::cookies::testing::dump(&target_jar);
+        cookies_write(target.path(), "gmail", Some(other_mac()), &carried).unwrap();
+        let after = crate::claude_desktop::cookies::testing::dump(&target_jar);
+        let row = |rows: &[String]| {
+            rows.iter()
+                .find(|r| r.contains("lastActiveOrg"))
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(
+            row(&before),
+            row(&after),
+            "the untouched row is byte-identical"
+        );
+    }
+
+    /// A jar this machine cannot open at all is a fact, not a silent nothing —
+    /// and per profile, so it is skipped rather than fatal.
+    #[test]
+    fn a_jar_with_no_key_or_no_readable_row_refuses_that_profile_only() {
+        let dir = TempDir::new().unwrap();
+        // Absent: this profile has never opened the app.
+        assert!(
+            cookies_read(dir.path(), "gmail", Some(this_mac()))
+                .unwrap()
+                .is_none()
+        );
+        seal_jar_into(dir.path(), "gmail", &other_mac(), &[("sessionKey", "x")]);
+        // Sealed, and this machine has no key: told, never shrugged off.
+        let err = cookies_read(dir.path(), "gmail", None).unwrap_err();
+        assert!(err.to_string().contains("Safe Storage key"), "{err}");
+        // A key that opens nothing in the jar is the same refusal.
+        assert!(cookies_read(dir.path(), "gmail", Some(this_mac())).is_err());
+        // Per profile, so the other three accounts still travel.
+        assert!(!cookies("gmail").read_failure_is_fatal());
+    }
+
+    /// A target with no Safe Storage key refuses and changes nothing.
+    #[test]
+    fn a_target_with_no_key_refuses_the_cookie_jar_and_leaves_it_alone() {
+        let target = TempDir::new().unwrap();
+        let jar = seal_jar_into(
+            target.path(),
+            "gmail",
+            &other_mac(),
+            &[("sessionKey", "mine")],
+        );
+        let before = std::fs::read(&jar).unwrap();
+
+        let err = cookies_write(
+            target.path(),
+            "gmail",
+            None,
+            r#"[[{"host_key":".claude.ai",
+            "top_frame_site_key":"https://claude.ai","has_cross_site_ancestor":0,
+            "name":"sessionKey","path":"/","source_scheme":2,"source_port":443},"dGhlaXJz"]]"#,
+        )
+        .expect_err("nothing here can seal it");
+        assert!(err.to_string().contains("Safe Storage key"), "{err}");
+        assert!(
+            !err.to_string().contains("dGhlaXJz"),
+            "no value in a message"
+        );
+        assert_eq!(std::fs::read(&jar).unwrap(), before);
+        // And `writable` says so in the planner, before a byte is written.
+        let stores = Stores::fixture();
+        stores.edit().set_safe_key(None);
+        assert!(!stores.writable(&cookies("gmail")));
+        stores.edit().set_safe_key(Some(other_mac()));
+        assert!(stores.writable(&cookies("gmail")));
+    }
+
+    /// A malformed or empty payload refuses without touching the jar.
+    #[test]
+    fn a_payload_that_is_not_a_jar_refuses_before_the_database_is_opened() {
+        let target = TempDir::new().unwrap();
+        let jar = seal_jar_into(
+            target.path(),
+            "gmail",
+            &other_mac(),
+            &[("sessionKey", "mine")],
+        );
+        let before = std::fs::read(&jar).unwrap();
+        for payload in ["{}", "[]", r#"[[{"host_key":".claude.ai"},"x"]]"#] {
+            let err = cookies_write(target.path(), "gmail", Some(other_mac()), payload)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("refusing it") || err.contains("empty"),
+                "{payload} => {err}"
+            );
+        }
+        assert_eq!(std::fs::read(&jar).unwrap(), before);
     }
 
     /// A target with no Safe Storage key refuses, and refusing costs the

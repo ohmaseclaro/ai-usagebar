@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 
+use crate::claude_desktop::app::AppControl;
 use crate::config::{Config, SyncCategory, SyncConfig};
 use crate::sync::crypto::{KdfParams, Keyfile, Keys, content_address};
 use crate::sync::github::setup::TtyPrompt;
@@ -879,6 +880,14 @@ struct PullIo<'a> {
     /// the same reason `gate` is: `pull_with_parts` is the tested seam and must
     /// not reach for a terminal.
     progress: &'a mut dyn progress::Progress,
+    /// How Claude Desktop is stopped and started around the write — the same
+    /// [`AppControl`] seam the local account switch uses, and deliberately not
+    /// a second way to control the app.
+    ///
+    /// **`None` where there is no Claude Desktop to control**, which is every
+    /// platform but macOS. Not a stub that pretends: the absence *is* the
+    /// answer, and `stop_desktop` reads it as "nothing to stop".
+    app: Option<&'a dyn AppControl>,
 }
 
 /// Announced before an interactive read, because the password is echoed.
@@ -977,6 +986,67 @@ fn backups_dir(roots: &SyncRoots) -> PathBuf {
         .join("backups")
 }
 
+/// Stop Claude Desktop, if this restore writes anything it owns and it is up.
+///
+/// `Ok(true)` means **this run stopped it**, and therefore owes it a relaunch.
+/// `Ok(false)` means there was nothing to stop — no such app on this platform,
+/// nothing of the app's in the plan, or the user had already closed it — and in
+/// every one of those cases the app is left exactly as it was found. An app the
+/// user deliberately quit is not opened by a restore.
+///
+/// `Err` **aborts the restore before the backup and before the first byte.**
+/// That is the whole point: writing under a live app is the condition this
+/// exists to prevent, so failing to establish that it is not live cannot be
+/// answered by writing anyway.
+fn stop_desktop(
+    app: Option<&dyn AppControl>,
+    plan: &restore::RestorePlan,
+) -> std::result::Result<bool, String> {
+    let Some(app) = app else { return Ok(false) };
+    if !plan.touches_claude_desktop() {
+        return Ok(false);
+    }
+    // An unknown liveness state is not "closed". `app::is_running` already
+    // refuses to guess — see the probe-failure test beside it — and guessing
+    // here would undo that.
+    if !app.running().map_err(|e| {
+        format!(
+            "this restore writes files Claude Desktop holds open while it runs, and whether it \
+             is running could not be established — nothing was written and no archive was \
+             taken: {e}"
+        )
+    })? {
+        return Ok(false);
+    }
+    app.quit().map_err(|e| {
+        format!(
+            "Claude Desktop would not stop, and this restore writes files it holds open while \
+             it runs — nothing was written and no archive was taken. Quit it yourself and run \
+             this again: {e}"
+        )
+    })?;
+    Ok(true)
+}
+
+/// Start it again — and only ever the app *this run* stopped.
+///
+/// A failure is returned as text rather than as an error because it is a
+/// **warning on a restore that succeeded**: the data landed, and an app that
+/// did not come back is annoying rather than data loss. Same posture as
+/// `prune_warning` on the push side.
+fn relaunch_desktop(app: Option<&dyn AppControl>) -> Option<String> {
+    app?.relaunch().err().map(|e| e.to_string())
+}
+
+/// The warning line, built rather than interpolated at each site so both the
+/// succeeded and the failed restore say the same thing.
+fn relaunch_line(why: &str) -> String {
+    format!(
+        "\nwarning:    this restore closed Claude Desktop and it did not start again: {why}\n\
+         \x20           Nothing on disk is affected — open it yourself.\n"
+    )
+}
+
 /// `ai-usagebar sync pull` — the command a second machine types.
 ///
 /// **Every refusal that does not need a password comes first**, exactly as the
@@ -1011,6 +1081,13 @@ fn pull(
     // rather than stdin's: a `sync pull > log` with a password on the keyboard
     // should still get plain lines, and `sync pull | less` should not get a `\r`.
     let mut progress = progress::reporter(std::io::stderr().is_terminal(), stderr_style());
+    // macOS-gated exactly like the rest of the Claude Desktop path. Elsewhere
+    // there is no such app, so there is no control to hand over — and no stub
+    // pretending there is one.
+    #[cfg(target_os = "macos")]
+    let app: Option<&dyn AppControl> = Some(&crate::claude_desktop::app::DesktopApp);
+    #[cfg(not(target_os = "macos"))]
+    let app: Option<&dyn AppControl> = None;
     if interactive {
         let stdin = std::io::stdin();
         let mut gate = stdin.lock();
@@ -1018,6 +1095,7 @@ fn pull(
             out: &mut out,
             gate: Some(&mut gate),
             progress: progress.as_mut(),
+            app,
         };
         pull_with_parts(roots, &parts, &pw, opts, &mut io, now)
     } else {
@@ -1025,6 +1103,7 @@ fn pull(
             out: &mut out,
             gate: None,
             progress: progress.as_mut(),
+            app,
         };
         pull_with_parts(roots, &parts, &pw, opts, &mut io, now)
     }
@@ -1041,8 +1120,14 @@ fn pull(
 /// 3. the credential gate (D2), **before** `backup::take` and before the first
 ///    byte, so a user who stops here has cost the machine nothing at all — no
 ///    archive, no writes (T-5-60, T-5-61).
-/// 4. `restore::run` with `apply` set, which takes the backup and writes in the
+/// 4. `stop_desktop`, **before** `backup::take` and before the first byte, so
+///    an app that will not close costs the machine nothing — no archive, no
+///    writes. Only when the plan writes state the app owns, and only when it is
+///    actually running.
+/// 5. `restore::run` with `apply` set, which takes the backup and writes in the
 ///    order `restore/mod.rs` froze.
+/// 6. `relaunch_desktop`, but only for an app step 4 really stopped, and
+///    whatever step 5 returned.
 ///
 /// Exit codes: 0 for a completed dry run, a declined apply gate, or a completed
 /// apply; 1 for every error, one message to stderr. A declined *apply* gate is
@@ -1162,13 +1247,44 @@ fn pull_with_parts(
         }
     }
 
-    // 4.
+    // 4. Claude Desktop holds its cookie jar and its LevelDB stores open while
+    //    it runs, and persists its own copy of them over ours on quit — so if
+    //    this restore writes any of that, the app is stopped *here*: after both
+    //    gates, before `restore::run`, and therefore before `backup::take` and
+    //    before the first byte. A refusal at this point has cost the machine
+    //    nothing at all, exactly like a declined credential gate.
+    let stopped = match stop_desktop(io.app, &plan) {
+        Ok(stopped) => stopped,
+        Err(why) => return refuse(&why),
+    };
+
+    // 5.
     opts.apply = true;
-    let outcome = match rt.block_on(restore::run(ctx(opts), &mut *io.progress)) {
+    let restored = rt.block_on(restore::run(ctx(opts), &mut *io.progress));
+
+    // 6. And started again once the whole of `write::apply` is done — the files
+    //    first and then the stores' row-writes, which is the order
+    //    `restore/write.rs` froze. Unconditionally on the run's outcome: the
+    //    app was ours to close, so it is ours to reopen, and a restore that
+    //    failed part-way is the last moment to leave the user without it.
+    let relaunch = stopped.then(|| relaunch_desktop(io.app)).flatten();
+
+    let outcome = match restored {
         Ok(outcome) => outcome,
-        Err(e) => return refuse(&e.to_string()),
+        Err(e) => {
+            if let Some(why) = &relaunch {
+                eprint!("{}", relaunch_line(why));
+            }
+            return refuse(&e.to_string());
+        }
     };
     if let Err(e) = write!(io.out, "{}", restore::report::render_outcome(&outcome)) {
+        return refuse(&e.to_string());
+    }
+    // A restore that landed is a success even if the app did not come back.
+    if let Some(why) = &relaunch
+        && let Err(e) = write!(io.out, "{}", relaunch_line(why))
+    {
         return refuse(&e.to_string());
     }
     // A partial restore is reported, not rolled back — and it is not a success.
@@ -2224,6 +2340,12 @@ mod tests {
     /// alone promotes.
     const CRED: &str = "accounts/work/.credentials.json";
     const ROUTINE: &str = "claude-home/scheduled-tasks/daily.json";
+    /// One chat index under Claude Desktop's **own data directory** — the state
+    /// a running app rewrites, and the reason `sync pull --apply` closes it.
+    /// Seeded relative to the seed root, where `roots_in` puts `desktop/`.
+    /// It is also the path *under the restoring machine's root*, which is what
+    /// makes it the file the app-control ordering is asserted against.
+    const DESKTOP_SESSION: &str = "desktop/claude-code-sessions/acct/org/local_1.json";
 
     fn roots_in(dir: &Path) -> SyncRoots {
         SyncRoots::at(
@@ -2239,7 +2361,15 @@ mod tests {
         Config {
             sync: crate::config::SyncConfig {
                 repo: Some("o/n".into()),
-                categories: vec![SyncCategory::Config, SyncCategory::Routines],
+                categories: vec![
+                    SyncCategory::Config,
+                    SyncCategory::Routines,
+                    // Reaches Claude Desktop's own data directory. Costs the
+                    // other tests nothing — an empty category is collected as
+                    // nothing and `category_table` skips it — and it is the one
+                    // way a bundle here carries state the app owns.
+                    SyncCategory::ChatIndex,
+                ],
                 ..Default::default()
             },
             ..Config::default()
@@ -2411,7 +2541,7 @@ mod tests {
         opts: RestoreOptions,
         answers: Option<&str>,
     ) -> (i32, String) {
-        pull_as(roots, base, opts, answers, PASSWORD)
+        pull_as(roots, base, opts, answers, PASSWORD, None)
     }
 
     fn pull_as(
@@ -2420,6 +2550,7 @@ mod tests {
         opts: RestoreOptions,
         answers: Option<&str>,
         password: &str,
+        app: Option<&dyn AppControl>,
     ) -> (i32, String) {
         let cfg = pull_cfg();
         let parts = resolve(
@@ -2452,6 +2583,7 @@ mod tests {
                         out: &mut out,
                         gate: Some(&mut reader),
                         progress: &mut progress,
+                        app,
                     },
                     NOW,
                 )
@@ -2465,6 +2597,7 @@ mod tests {
                     out: &mut out,
                     gate: None,
                     progress: &mut progress,
+                    app,
                 },
                 NOW,
             ),
@@ -2491,6 +2624,341 @@ mod tests {
         }
         out.sort();
         out
+    }
+
+    // ---- 6-15: Claude Desktop is stopped and started around the write ------
+
+    use crate::error::Result as AppResult;
+    use std::cell::RefCell;
+
+    /// Claude Desktop as a double — **never the user's real app**, which is the
+    /// entire reason `AppControl` is a trait.
+    ///
+    /// It records more than the verb. At each call it also notes whether the
+    /// file this restore is about had landed yet, because "quit before the
+    /// first write" and "relaunch after the last" are orderings against the
+    /// *write*, and a bare list of steps cannot show either.
+    struct Desktop {
+        /// What [`AppControl::running`] answers.
+        up: bool,
+        /// The one verb made to fail, if any: `"quit"` or `"relaunch"`.
+        refuses: Option<&'static str>,
+        /// The destination whose existence is sampled at each verb.
+        watched: PathBuf,
+        steps: RefCell<Vec<(&'static str, bool)>>,
+    }
+
+    impl Desktop {
+        fn new(up: bool, watched: PathBuf) -> Self {
+            Self {
+                up,
+                refuses: None,
+                watched,
+                steps: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn refusing(verb: &'static str, watched: PathBuf) -> Self {
+            Self {
+                refuses: Some(verb),
+                ..Self::new(true, watched)
+            }
+        }
+
+        fn record(&self, verb: &'static str) -> AppResult<()> {
+            self.steps.borrow_mut().push((verb, self.watched.exists()));
+            if self.refuses == Some(verb) {
+                return Err(crate::error::AppError::Other(format!(
+                    "the double refuses `{verb}`"
+                )));
+            }
+            Ok(())
+        }
+
+        /// The steps, each paired with whether the restored file existed yet.
+        fn steps(&self) -> Vec<(&'static str, bool)> {
+            self.steps.borrow().clone()
+        }
+    }
+
+    impl AppControl for Desktop {
+        fn running(&self) -> AppResult<bool> {
+            Ok(self.up)
+        }
+
+        fn quit(&self) -> AppResult<()> {
+            self.record("quit")
+        }
+
+        fn relaunch(&self) -> AppResult<()> {
+            self.record("relaunch")
+        }
+
+        fn archive(&self, _: &Path, _: &Path, _: &[&str]) -> AppResult<()> {
+            unreachable!("a restore never asks the app to archive; `backup::take` does that")
+        }
+
+        fn restore(&self, _: &Path, _: &Path, _: &[&str]) -> AppResult<()> {
+            unreachable!("a restore never asks the app to roll back; the user runs `tar`")
+        }
+    }
+
+    /// A bundle carrying one chat index — state Claude Desktop owns — plus one
+    /// credential and one routine that it does not.
+    fn desktop_bundle(seed: &Path) -> Bundle {
+        pushed(
+            seed,
+            &[
+                (CRED, b"{\"token\":\"fixture\"}"),
+                (ROUTINE, b"{\"routine\":true}"),
+                (DESKTOP_SESSION, b"{\"chat\":\"index\"}"),
+            ],
+        )
+    }
+
+    /// An applying pull driven against an injected app control.
+    fn pull_with_app(
+        roots: &SyncRoots,
+        base: &str,
+        opts: RestoreOptions,
+        app: &dyn AppControl,
+    ) -> (i32, String) {
+        pull_as(roots, base, opts, None, PASSWORD, Some(app))
+    }
+
+    fn applying() -> RestoreOptions {
+        RestoreOptions {
+            apply: true,
+            ..RestoreOptions::default()
+        }
+    }
+
+    /// **The plan's whole point.** The app is stopped before the first byte of
+    /// its own state lands, and started again once the write is done.
+    #[test]
+    fn a_restore_of_desktop_state_stops_the_app_before_the_first_write_and_starts_it_after() {
+        let push_dir = TempDir::new().unwrap();
+        let bundle = desktop_bundle(push_dir.path());
+        let mut server = mockito::Server::new();
+        serve(&mut server, &bundle);
+
+        let dir = TempDir::new().unwrap();
+        let roots = paired(dir.path());
+        let landed = dir.path().join(DESKTOP_SESSION);
+        let app = Desktop::new(true, landed.clone());
+
+        let (code, out) = pull_with_app(&roots, &server.url(), applying(), &app);
+
+        assert_eq!(code, 0, "{out}");
+        assert_eq!(
+            app.steps(),
+            vec![("quit", false), ("relaunch", true)],
+            "quit must run while the file is still absent, relaunch once it is there"
+        );
+        assert_eq!(fs::read(&landed).unwrap(), b"{\"chat\":\"index\"}");
+    }
+
+    /// An app the user had already closed is left closed. Nothing is launched
+    /// on their behalf, and the restore still writes.
+    #[test]
+    fn an_app_that_is_not_running_is_neither_stopped_nor_started_and_the_restore_still_writes() {
+        let push_dir = TempDir::new().unwrap();
+        let bundle = desktop_bundle(push_dir.path());
+        let mut server = mockito::Server::new();
+        serve(&mut server, &bundle);
+
+        let dir = TempDir::new().unwrap();
+        let roots = paired(dir.path());
+        let landed = dir.path().join(DESKTOP_SESSION);
+        let app = Desktop::new(false, landed.clone());
+
+        let (code, out) = pull_with_app(&roots, &server.url(), applying(), &app);
+
+        assert_eq!(code, 0, "{out}");
+        assert!(app.steps().is_empty(), "an app that was down stays down");
+        assert!(landed.is_file(), "the restore still wrote");
+    }
+
+    /// Derived from the plan's items, not from a flag: a restore carrying only
+    /// a config file and a routine does not close an app it writes no byte of.
+    #[test]
+    fn a_restore_that_writes_nothing_of_the_apps_leaves_a_running_app_alone() {
+        let push_dir = TempDir::new().unwrap();
+        let bundle = pushed(
+            push_dir.path(),
+            &[
+                (CRED, b"{\"token\":\"fixture\"}"),
+                (ROUTINE, b"{\"routine\":true}"),
+            ],
+        );
+        let mut server = mockito::Server::new();
+        serve(&mut server, &bundle);
+
+        let dir = TempDir::new().unwrap();
+        let roots = paired(dir.path());
+        let app = Desktop::new(true, dir.path().join(DESKTOP_SESSION));
+
+        let (code, out) = pull_with_app(&roots, &server.url(), applying(), &app);
+
+        assert_eq!(code, 0, "{out}");
+        assert!(
+            app.steps().is_empty(),
+            "config and routines are not Claude Desktop's, so it is not closed"
+        );
+        assert!(
+            roots
+                .claude_home
+                .join("scheduled-tasks/daily.json")
+                .is_file()
+        );
+    }
+
+    /// A dry run reads and reports. It has no business closing the user's app —
+    /// neither the piped arm nor a gate the user declines.
+    #[test]
+    fn a_dry_run_never_touches_the_app() {
+        let push_dir = TempDir::new().unwrap();
+        let bundle = desktop_bundle(push_dir.path());
+        let mut server = mockito::Server::new();
+        serve(&mut server, &bundle);
+
+        let dir = TempDir::new().unwrap();
+        let roots = paired(dir.path());
+        let landed = dir.path().join(DESKTOP_SESSION);
+
+        let piped = Desktop::new(true, landed.clone());
+        let (code, out) = pull_as(
+            &roots,
+            &server.url(),
+            RestoreOptions::default(),
+            None,
+            PASSWORD,
+            Some(&piped),
+        );
+        assert_eq!(code, 0, "{out}");
+        assert!(piped.steps().is_empty(), "a dry run closes nothing");
+        assert!(!landed.exists());
+
+        let declined = Desktop::new(true, landed.clone());
+        let (code, out) = pull_as(
+            &roots,
+            &server.url(),
+            RestoreOptions::default(),
+            Some("n\n"),
+            PASSWORD,
+            Some(&declined),
+        );
+        assert_eq!(code, 0, "{out}");
+        assert!(
+            declined.steps().is_empty(),
+            "a declined gate closes nothing either"
+        );
+        assert!(!landed.exists());
+    }
+
+    /// The exact condition this plan exists to prevent: if the app will not
+    /// stop, the restore would be writing under a live process. It refuses,
+    /// and it changes nothing — not even the archive.
+    #[test]
+    fn an_app_that_will_not_stop_aborts_the_restore_before_anything_is_written() {
+        let push_dir = TempDir::new().unwrap();
+        let bundle = desktop_bundle(push_dir.path());
+        let mut server = mockito::Server::new();
+        serve(&mut server, &bundle);
+
+        let dir = TempDir::new().unwrap();
+        let roots = paired(dir.path());
+        let before = files_under(dir.path());
+        let app = Desktop::refusing("quit", dir.path().join(DESKTOP_SESSION));
+
+        let (code, _) = pull_with_app(&roots, &server.url(), applying(), &app);
+
+        assert_ne!(code, 0, "a restore under a live app is not a success");
+        assert_eq!(
+            app.steps(),
+            vec![("quit", false)],
+            "it stopped at the quit and never reached the relaunch"
+        );
+        assert_eq!(
+            files_under(dir.path()),
+            before,
+            "nothing was written and no archive was taken"
+        );
+    }
+
+    /// …and the message names the app, so the user knows what to close. On the
+    /// pure helper, because the refusal itself goes to stderr.
+    #[test]
+    fn the_refusal_names_claude_desktop_and_says_nothing_was_written() {
+        let app = Desktop::refusing("quit", PathBuf::from("/nonexistent"));
+        let plan = restore::RestorePlan {
+            items: vec![restore::ItemPlan {
+                manifest_path: "desktop-data/claude-code-sessions/a/o/local_1.json".into(),
+                dest: Some(PathBuf::from("/nonexistent")),
+                category: SyncCategory::ChatIndex,
+                true_len: 1,
+                chunks: Vec::new(),
+                disposition: restore::Disposition::Create,
+            }],
+            counter: 1,
+            created_at: NOW,
+            repo_id: REPO_ID.into(),
+            packs_needed: 0,
+            bytes_to_fetch: 0,
+        };
+        let why = stop_desktop(Some(&app), &plan).expect_err("the app would not stop");
+        assert!(why.contains("Claude Desktop"), "{why}");
+        assert!(why.contains("nothing was written"), "{why}");
+    }
+
+    /// The data landed. An app that did not come back is annoying, not data
+    /// loss — the same posture `prune_warning` takes on the push side.
+    #[test]
+    fn a_relaunch_that_fails_is_a_warning_on_a_restore_that_still_succeeded() {
+        let push_dir = TempDir::new().unwrap();
+        let bundle = desktop_bundle(push_dir.path());
+        let mut server = mockito::Server::new();
+        serve(&mut server, &bundle);
+
+        let dir = TempDir::new().unwrap();
+        let roots = paired(dir.path());
+        let landed = dir.path().join(DESKTOP_SESSION);
+        let app = Desktop::refusing("relaunch", landed.clone());
+
+        let (code, out) = pull_with_app(&roots, &server.url(), applying(), &app);
+
+        assert_eq!(code, 0, "the restore succeeded: {out}");
+        assert!(out.contains("RESTORED"), "{out}");
+        assert!(out.contains("did not start again"), "{out}");
+        assert_eq!(fs::read(&landed).unwrap(), b"{\"chat\":\"index\"}");
+        assert_eq!(app.steps(), vec![("quit", false), ("relaunch", true)]);
+    }
+
+    /// The consent gate covers the disruption, so `--yes` answers it like the
+    /// rest of the report rather than needing a second question.
+    #[test]
+    fn the_report_says_the_app_will_be_closed_only_when_the_plan_writes_its_state() {
+        let push_dir = TempDir::new().unwrap();
+        let mut server = mockito::Server::new();
+        serve(&mut server, &desktop_bundle(push_dir.path()));
+        let dir = TempDir::new().unwrap();
+        let roots = paired(dir.path());
+        let (_, out) = pull_at(&roots, &server.url(), RestoreOptions::default(), None);
+        assert!(
+            out.contains("Claude Desktop is running, it is closed"),
+            "{out}"
+        );
+
+        let quiet_dir = TempDir::new().unwrap();
+        let mut quiet = mockito::Server::new();
+        serve(
+            &mut quiet,
+            &pushed(quiet_dir.path(), &[(CRED, b"{\"token\":\"fixture\"}")]),
+        );
+        let dir = TempDir::new().unwrap();
+        let roots = paired(dir.path());
+        let (_, out) = pull_at(&roots, &quiet.url(), RestoreOptions::default(), None);
+        assert!(!out.contains("Claude Desktop"), "{out}");
     }
 
     /// What a machine that already has *newer* copies of both items looks like.
@@ -2942,6 +3410,7 @@ mod tests {
             },
             None,
             "not the password",
+            None,
         );
         assert_ne!(code, 0);
         assert_eq!(files_under(dir.path()), before);

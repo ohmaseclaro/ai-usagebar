@@ -21,6 +21,7 @@
 
 pub mod app;
 pub mod capture;
+pub mod cookies;
 pub mod merge;
 
 use std::collections::BTreeSet;
@@ -55,7 +56,7 @@ const DEVICE_REGISTRY: &str = "ant-device-registry.json";
 /// Profile-store filenames, owned by claude-acc's layout.
 const TOKEN_CACHE: &str = "config-tokenCache";
 const TOKEN_CACHE_V2: &str = "config-tokenCacheV2";
-const DESKTOP_STATE: &str = "desktop-state";
+pub(crate) const DESKTOP_STATE: &str = "desktop-state";
 const META_JSON: &str = "meta.json";
 /// One credential mutation can include a remote OAuth refresh. Account
 /// switching waits on the same lock rather than racing or failing after the
@@ -998,6 +999,10 @@ mod tests {
     }
 
     impl AppControl for QuitFailure {
+        fn running(&self) -> Result<bool> {
+            Ok(true)
+        }
+
         fn quit(&self) -> Result<()> {
             self.steps.borrow_mut().push("quit");
             Err(AppError::Other("liveness probe failed".into()))

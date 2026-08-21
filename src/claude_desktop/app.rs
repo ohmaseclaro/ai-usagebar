@@ -16,6 +16,16 @@ use crate::error::{AppError, Result};
 
 /// Host-level effects of a switch.
 pub trait AppControl {
+    /// Whether the app is up **right now**.
+    ///
+    /// The one question that decides whether the two verbs below run at all,
+    /// and it sits on the same trait for exactly that reason: a caller that has
+    /// to reach for the free [`is_running`] to decide, and for this trait to
+    /// act, is a caller no test can drive without the user's real Mac.
+    ///
+    /// It is also what keeps "only relaunch what you stopped" expressible — an
+    /// app the user had deliberately quit is left closed.
+    fn running(&self) -> Result<bool>;
     /// Stop the Claude Desktop app. Must return only once it is really gone —
     /// its SQLite and LevelDB stores cannot be copied while it is writing them.
     fn quit(&self) -> Result<()>;
@@ -152,6 +162,10 @@ fn wait_until_stopped() -> Result<bool> {
 }
 
 impl AppControl for DesktopApp {
+    fn running(&self) -> Result<bool> {
+        is_running()
+    }
+
     fn quit(&self) -> Result<()> {
         // Graceful first so the app tears down its own child processes; the
         // signals are the fallback for a hung app. Neither touches a `claude`
@@ -274,6 +288,16 @@ impl Recorder {
 }
 
 impl AppControl for Recorder {
+    /// **Not up.** A recorder stands in for a run that performs no host effect,
+    /// so the answer that causes none is the honest one here: nothing this
+    /// double backs decides whether to stop the app — [`apply_switch`] has
+    /// already decided by the time it holds one.
+    ///
+    /// [`apply_switch`]: super::apply_switch
+    fn running(&self) -> Result<bool> {
+        Ok(false)
+    }
+
     fn quit(&self) -> Result<()> {
         self.record("quit");
         Ok(())

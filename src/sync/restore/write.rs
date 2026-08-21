@@ -1190,4 +1190,66 @@ mod tests {
             "the store was written before the file it writes into"
         );
     }
+
+    /// The same ordering, for the pair that shares a **category**.
+    ///
+    /// `keystore/desktop-cookies/<profile>` re-seals values inside
+    /// `desktop-profiles/<profile>/desktop-state/Cookies`, and unlike the
+    /// Cursor pair above — a `Transcripts` file and a `Credentials` store —
+    /// both of these are `Credentials`. So this is the case that would still
+    /// pass if the ordering came from category order and the categories
+    /// happened to sort the right way, and the case that fails if it does.
+    /// Both are planted `Credentials`, and the store is planted *first*.
+    #[test]
+    fn the_cookie_jar_lands_before_its_store_even_when_both_are_credentials() {
+        let m = Machine::new();
+        const JAR: &str = "desktop-profiles/gmail/desktop-state/Cookies";
+        let store = crate::sync::keystore::Store::DesktopCookies {
+            profile: "gmail".into(),
+        };
+
+        // The jar's own directory, planted as a regular file, so the file half
+        // of the run cannot succeed.
+        let dest = m.dest(JAR);
+        std::fs::create_dir_all(dest.parent().unwrap().parent().unwrap()).unwrap();
+        std::fs::write(dest.parent().unwrap(), b"in the way").unwrap();
+
+        let (packs, ids) = packed(&[b"the re-sealed values", b"a whole cookie jar"]);
+        let store_item = ItemPlan {
+            dest: None,
+            manifest_path: store.manifest_path(),
+            category: SyncCategory::Credentials,
+            true_len: 20,
+            chunks: ids[0].clone(),
+            disposition: Disposition::Create,
+        };
+        let mut file_item = item(
+            &m,
+            JAR,
+            b"a whole cookie jar",
+            ids[1].clone(),
+            Disposition::Create,
+        );
+        file_item.category = SyncCategory::Credentials;
+        // Store first in manifest order — the order the queue must override.
+        let plan = plan_of(vec![store_item, file_item]);
+
+        let applied = apply(
+            &m.ctx(),
+            &plan,
+            &packs,
+            &mut crate::sync::push::progress::Silent,
+        )
+        .unwrap();
+        assert_eq!(
+            applied.failed_at.as_deref(),
+            Some(JAR),
+            "the file half must have run first"
+        );
+        assert_eq!(applied.written, 0);
+        assert!(
+            m.roots.stores.edit().get(&store).is_none(),
+            "the values were re-sealed into a jar that had not landed yet"
+        );
+    }
 }
