@@ -497,6 +497,26 @@ mod tests {
         assert!(!FixedName::new("Bridge-State.json").is_folded());
     }
 
+    /// A Windows checkout has no `.gitattributes` telling it otherwise, so the
+    /// runner's `core.autocrlf` writes every source file with `\r\n`. A guard
+    /// that searches for a multi-line marker finds nothing there and silently
+    /// scans each file whole, test module included — which is how
+    /// `no_third_http_client_is_built_under_src_sync` failed on `windows-latest`
+    /// and nowhere else. `lines()` drops the `\r`, and this pins that.
+    #[test]
+    fn a_crlf_checkout_is_split_at_the_same_place_as_an_lf_one() {
+        let lf = concat!(
+            "fn shipped() {}\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    fn inside_the_test_module() {}\n",
+            "}\n",
+        );
+        let crlf = lf.replace('\n', "\r\n");
+        assert_eq!(guard::production_code(&crlf), guard::production_code(lf));
+        assert!(!guard::production_code(&crlf).contains("inside_the_test_module"));
+    }
+
     /// F-4: prose is not code, so a doc comment naming the marker must not
     /// truncate the region every structural guard scans.
     #[test]

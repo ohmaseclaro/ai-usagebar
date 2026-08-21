@@ -387,30 +387,23 @@ mod tests {
         let needle = format!("reqwest::{}::", "Client");
         let files = crate::sync::guard::rs_files_in("src/sync");
 
-        // Shipped code only, and the marker is the whole `mod tests` header
-        // rather than the bare attribute: the bare form also occurs inside a doc
-        // comment in `pairing.rs`, and splitting on it there would truncate that
-        // file to its first 76 lines.
-        const TEST_MODULE: &str = "\n#[cfg(test)]\nmod tests";
+        // The shared helper, not a marker of this test's own. It drops comments
+        // before it looks for `#[cfg(test)]`, so the doc comment in `pairing.rs`
+        // cannot truncate that file early — the reason this test once carried a
+        // bespoke `"\n#[cfg(test)]\nmod tests"` marker. That marker was also the
+        // one thing here that a CRLF checkout broke: on Windows the text reads
+        // `\r\n`, nothing matched, and every file's test module counted as
+        // production code. `production_code` splits on `lines()`, which eats the
+        // `\r`, so the guard means the same thing on all four CI jobs.
         let mut sites: Vec<String> = Vec::new();
-        let mut split_files = 0usize;
         for path in &files {
-            let text = std::fs::read_to_string(path).unwrap();
-            if text.contains(TEST_MODULE) {
-                split_files += 1;
-            }
-            for line in text.split(TEST_MODULE).next().unwrap().lines() {
-                // The type named in a field or a doc comment is not a
-                // construction, so match the path-and-associated-item form.
+            let source = std::fs::read_to_string(path).unwrap();
+            for line in crate::sync::guard::production_code(&source).lines() {
                 if line.contains(&needle) {
                     sites.push(format!("{}: {}", path.display(), line.trim()));
                 }
             }
         }
-        assert!(
-            split_files > 5,
-            "only {split_files} files carried a test module; the split marker has drifted"
-        );
         assert_eq!(
             sites.len(),
             2,
