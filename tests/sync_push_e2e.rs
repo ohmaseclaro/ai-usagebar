@@ -881,7 +881,10 @@ async fn a_landed_push_records_when_it_landed() {
     let remote = Remote::new().await;
 
     assert!(
-        Index::at(&local.roots.index_file).unwrap().last_sync().is_none(),
+        Index::at(&local.roots.index_file)
+            .unwrap()
+            .last_sync()
+            .is_none(),
         "nothing has landed yet"
     );
     push(&local, &remote).await.expect("the push lands");
