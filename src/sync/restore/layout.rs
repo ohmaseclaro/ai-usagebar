@@ -38,6 +38,7 @@
 use std::path::{Component, Path, PathBuf};
 
 use crate::error::{AppError, Result};
+use crate::sync::keystore::Store;
 use crate::sync::{SyncRoots, scope};
 
 // There is deliberately no encoder in this module. `push::packer::manifest_path`
@@ -218,6 +219,57 @@ fn is_drive_prefixed(s: &str) -> bool {
 /// not the bundle's fault.
 pub fn accept_for_write(rel: &Path) -> bool {
     !scope::is_excluded(rel)
+}
+
+/// The two prefixes below, with their separator. [`ROOT_PREFIXES`] carries them
+/// bare, and `the_owned_prefixes_are_the_ones_in_the_root_table` keeps the two
+/// spellings one vocabulary.
+const DESKTOP_DATA_PREFIX: &str = "desktop-data/";
+const DESKTOP_PROFILES_PREFIX: &str = "desktop-profiles/";
+
+/// Does this manifest entry name state the **Claude Desktop app itself** owns —
+/// state a running app holds open and would write its own copy of back over a
+/// restored one?
+///
+/// Three shapes, and the exclusions matter as much as the inclusions, because
+/// this is what decides whether a restore closes the user's app:
+///
+/// - `desktop-data/…` — the app's live data directory. Whatever is under it is
+///   the app's: `claude-code-sessions/` is what a real bundle carries there,
+///   and a hostile manifest naming anything else under the same root is state
+///   the app owns too.
+/// - `desktop-profiles/<profile>/desktop-state/…` — the Chromium cookie jar and
+///   LevelDB trees, *captured out of the app* and destined straight back into
+///   it. `desktop-profiles/<profile>/meta.json` is deliberately **not** here:
+///   it is claude-acc's own bookkeeping and the app has never heard of it.
+/// - the two Claude Desktop [`Store`]s — the sealed halves of that same
+///   `desktop-state`, asked of [`Store::from_manifest_path`] rather than
+///   re-spelled, so the wire vocabulary lives in one module.
+///   `keystore/claude-code-oauth` and `keystore/cursor-auth` are other
+///   applications' credentials and answer `false`.
+///
+/// Everything else — `config/…`, `claude-home/…`, `cursor-user/…` — answers
+/// `false`, which is what keeps a config-only or transcripts-only restore from
+/// closing an app it is not writing a byte of.
+pub fn is_claude_desktop_state(manifest_path: &str) -> bool {
+    if manifest_path.starts_with(DESKTOP_DATA_PREFIX) {
+        return true;
+    }
+    if let Some(rest) = manifest_path.strip_prefix(DESKTOP_PROFILES_PREFIX)
+        && let Some((_profile, under)) = rest.split_once('/')
+    {
+        // The directory itself is not enough — `desktop-state` must be a
+        // *component*, so a profile with a file literally named
+        // `desktop-state-notes` is not mistaken for the app's browser state.
+        let state = format!("{}/", crate::claude_desktop::DESKTOP_STATE);
+        if under.starts_with(&state) {
+            return true;
+        }
+    }
+    matches!(
+        Store::from_manifest_path(manifest_path),
+        Some(Store::DesktopTokenCache { .. } | Store::DesktopCookies { .. })
+    )
 }
 
 #[cfg(test)]
@@ -518,6 +570,61 @@ mod tests {
                 accept_for_write(Path::new(accepted)),
                 "{accepted} would have been dropped"
             );
+        }
+    }
+
+    // ---- 6-15: which entries belong to the running app ---------------------
+
+    /// The two slashed prefixes are the root table's, not a second spelling of
+    /// them — the same discipline `the_two_directions_agree_on_every_prefix`
+    /// applies to the push side.
+    #[test]
+    fn the_owned_prefixes_are_the_ones_in_the_root_table() {
+        let named: Vec<&str> = ROOT_PREFIXES.iter().map(|(name, _)| *name).collect();
+        for prefix in [DESKTOP_DATA_PREFIX, DESKTOP_PROFILES_PREFIX] {
+            let bare = prefix.strip_suffix('/').expect("a slashed prefix");
+            assert!(named.contains(&bare), "{bare} is not a root in the table");
+        }
+    }
+
+    /// What closes a running Claude Desktop, and — the half that matters more —
+    /// what does not.
+    #[test]
+    fn only_the_apps_own_state_is_the_apps() {
+        for owned in [
+            // Its live data directory.
+            "desktop-data/claude-code-sessions/acct/org/local_1.json",
+            "desktop-data/claude-code-sessions/acct/org/scheduled-tasks.json",
+            // The Chromium state captured out of it and destined back into it.
+            "desktop-profiles/work/desktop-state/Cookies",
+            "desktop-profiles/work/desktop-state/Local Storage/leveldb/000003.log",
+            // And the sealed halves of that same state.
+            "keystore/desktop-cookies/work",
+            "keystore/desktop-token-cache/work/config-tokenCache",
+        ] {
+            assert!(is_claude_desktop_state(owned), "{owned} is the app's");
+        }
+
+        for other in [
+            // Nothing the app has ever heard of — a restore of these alone must
+            // not close it.
+            "config/config.toml",
+            "config/accounts/work/.credentials.json",
+            "claude-home/.credentials.json",
+            "claude-home/scheduled-tasks/daily.json",
+            "claude-home/projects/repo/session.jsonl",
+            "cursor-user/globalStorage/state.vscdb",
+            // Other applications' credentials.
+            "keystore/claude-code-oauth",
+            "keystore/cursor-auth",
+            // claude-acc's own bookkeeping, beside the state but not part of it.
+            "desktop-profiles/work/meta.json",
+            // `desktop-state` must be a whole component, not a prefix of one.
+            "desktop-profiles/work/desktop-state-notes/x",
+            // A root that merely starts with the same letters.
+            "desktop-datastore/x",
+        ] {
+            assert!(!is_claude_desktop_state(other), "{other} is not the app's");
         }
     }
 }
