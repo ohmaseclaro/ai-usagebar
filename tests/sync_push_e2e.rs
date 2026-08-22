@@ -1761,11 +1761,19 @@ async fn a_long_push_reports_advancing_counts_and_every_failure_names_an_action(
 fn the_push_path_seals_only_the_formats_four_object_kinds() {
     /// Everything before a file's own `#[cfg(test)]` module. A test that seals
     /// something is a test, not a format change.
-    fn production(source: &str) -> &str {
+    fn production(source: &str) -> String {
+        // Line-based, not `split_once("\n#[cfg(test)]\n")`. A Windows checkout
+        // writes `\r\n` — this repository carries no `.gitattributes` saying
+        // otherwise — so the literal matched nothing there, the whole file
+        // counted as production, and this guard failed on `windows-latest`
+        // alone against a `seal_chunk` inside `packer.rs`'s own test module.
+        // That is the third time this exact marker has been written by hand and
+        // the second time CRLF has broken one; `lines()` drops the `\r`.
         source
-            .split_once("\n#[cfg(test)]\n")
-            .map(|(before, _)| before)
-            .unwrap_or(source)
+            .lines()
+            .take_while(|line| !line.trim_start().starts_with("#[cfg(test)]"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     // The complete set, each annotated with the kind it seals. Anything else
