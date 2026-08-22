@@ -415,15 +415,20 @@ mod tests {
             .collect()
     }
 
-    /// One member path in this platform's own separator. The argv carries what
-    /// `strip_prefix` produced, which is `\` on Windows and `/` everywhere
-    /// else — a literal `".claude/a.jsonl"` would be asserting on the
-    /// separator rather than on the member.
-    fn rel(unix: &str) -> String {
-        unix.split('/')
-            .collect::<PathBuf>()
-            .to_string_lossy()
-            .into_owned()
+    /// The member arguments — everything after `--` — with separators
+    /// normalized.
+    ///
+    /// **The argv carries whatever separator the input string had, not the
+    /// platform's.** Windows accepts both, and `Path::join` keeps the `/` these
+    /// fixtures seed with, so `strip_prefix` yields `.claude/a.jsonl` there
+    /// too. An assertion written in either separator is an assertion about how
+    /// the fixture spelled its path; normalizing is an assertion about the
+    /// member, which is what these tests are for.
+    fn members_of(p: &Plan) -> Vec<String> {
+        argv_of(p)[5..]
+            .iter()
+            .map(|m| m.replace('\\', "/"))
+            .collect()
     }
 
     /// Unix only: `PermissionsExt` does not exist on Windows, and the mode this
@@ -484,18 +489,25 @@ mod tests {
         assert_eq!(p.root, fixture.home(), "the -C root is not the home");
         assert_eq!(p.members, 2);
 
+        let argv = argv_of(&p);
         assert_eq!(
-            argv_of(&p),
-            vec![
+            argv[..5],
+            [
                 "-czf".to_string(),
                 expected.display().to_string(),
                 "-C".to_string(),
                 fixture.home().display().to_string(),
                 "--".to_string(),
-                rel(".claude/projects/a.jsonl"),
-                rel(".config/ai-usagebar/config.toml"),
             ],
-            "`--` must precede the members and the members must be relative"
+            "`--` must precede the members"
+        );
+        assert_eq!(
+            members_of(&p),
+            vec![
+                ".claude/projects/a.jsonl",
+                ".config/ai-usagebar/config.toml"
+            ],
+            "the members must be relative to the -C root"
         );
     }
 
@@ -515,10 +527,7 @@ mod tests {
 
         let p = plan(&fixture.ctx(), &targets).unwrap().unwrap();
         assert_eq!(p.members, 2);
-        assert_eq!(
-            &argv_of(&p)[5..],
-            &[rel(".claude/a.jsonl"), rel(".claude/z.jsonl")]
-        );
+        assert_eq!(members_of(&p), vec![".claude/a.jsonl", ".claude/z.jsonl"]);
     }
 
     /// T-5-45: a backup that cannot be taken is not advisory. `take` returns
@@ -638,8 +647,8 @@ mod tests {
 
         assert_eq!(p.root, fixture.dir.path());
         assert_eq!(
-            &argv_of(&p)[5..],
-            &[rel("bob/.claude/a.jsonl"), rel("elsewhere/config.toml")]
+            members_of(&p),
+            vec!["bob/.claude/a.jsonl", "elsewhere/config.toml"]
         );
     }
 
