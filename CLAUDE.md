@@ -7,7 +7,8 @@ these are invariants we keep almost-forgetting, not a project tour.
 
 When cutting a new version (patch, minor, or major):
 
-1. **Bump `Cargo.toml` `version`** — e.g. `0.3.2` → `0.3.3`.
+1. **Bump both versions** — `Cargo.toml` `version` and the root Omarchy
+   `manifest.json` `version` must match the release tag.
 2. **Update `CHANGELOG.md`**:
    - Add a new `## [X.Y.Z] — YYYY-MM-DD` section above the previous one.
    - Categorize entries by **Added / Changed / Fixed / Security** (Keep-A-Changelog).
@@ -29,10 +30,15 @@ When cutting a new version (patch, minor, or major):
    The committed files keep `sha256sums = SKIP`; CI pins the real hashes later.
 6. **Run gate before tagging**:
    ```
-   cargo test                                  # 200+ tests must pass
+   make test                                   # cargo test + the desktop JS gate
    cargo clippy --all-targets -- -D warnings   # clean
    cargo machete                               # no unused deps
+   omarchy plugin validate .                   # plugin manifest + entry points
    ```
+   `make test` rather than `cargo test`: it also runs the GNOME, KDE, and
+   Omarchy frontend contract suites. If `kde-plasmoid/` changed, also bump
+   `KPlugin.Version` in `kde-plasmoid/package/metadata.json`; it is versioned
+   independently of `Cargo.toml`, like the GNOME `metadata.json`.
 7. **Commit, tag, push**:
    ```
    git commit -m "vX.Y.Z — …"
@@ -90,6 +96,12 @@ patch version instead.
   the user's choice (and `chmod 600`ed by the Settings overlay), but
   **never commit** a real key. The `.gitignore` covers `.env`,
   `*.credentials.json`, and `.claude/`.
+- **Frontend adapters stay thin.** Provider fetching, credentials, canonical
+  product names, metric projection, and reset metadata belong in Rust.
+  `VendorId::display_name` is the shared label source; do not add a complete
+  provider-name table to a frontend. Build report metrics through
+  `SectionBuilder::push_metric` so the absolute reset travels with its row;
+  never recreate a per-vendor metric-order table in `report.rs`.
 - **Tests are hermetic.** A `#[test]`/`#[tokio::test]` must never read or
   write a real `$HOME`/`$XDG` path (config, cache, creds, Omarchy theme)
   or branch on an ambient env var — the AUR `check()` runs `cargo test`
@@ -145,12 +157,25 @@ vendor's response shape drifts:
   no credential and no remote endpoint: quota comes from whichever local
   Antigravity product is running (2.0, the IDE, or an interactive `agy`
   session), over a loopback RPC on a **dynamically assigned** port that is
-  discovered from `/proc` (Linux only; elsewhere set `ANTIGRAVITY_LS_ADDRESS`).
+  discovered from `/proc` on Linux or `lsof` on macOS (elsewhere set
+  `ANTIGRAVITY_LS_ADDRESS`).
   Tests must never probe `/proc` or the wall clock — use `candidate_bases_with`
   and `parse_cache_at`/`fetch_snapshot_at`, not their production wrappers.
-- `src/anthropic/keychain.rs` — macOS-only `security(1)` fallback when
+- `src/kiro/` — Kiro CLI. Reads kiro-cli's own `data.sqlite3` (read-only) for
+  the AWS SSO OIDC session, refreshes the ~1h access token via the documented
+  CreateToken API, and calls the undocumented `GetUsageLimits` — same operation
+  kiro-cli's `/usage` makes. Rotated credentials go to the vendor cache's
+  account-scoped mode-0600 `oauth.json`, never back to kiro-cli's db. Test
+  seams: `db::read_credentials(&path)` with a seeded temp db and
+  `fetch::fetch_snapshot_at` with an `Endpoints` override pointed at mockito.
+- `src/cursor/` — Cursor. Reads the IDE's own `state.vscdb` (read-only), with
+  a fallback to the headless `cursor-agent` CLI's `auth.json` when the IDE db
+  is absent — `db::resolve_access_token` tries both. Tests seed a temp db /
+  auth file and pass the paths in; never touch the real ones.
+- `src/anthropic/keychain.rs` — macOS-only Keychain fallback when
   `~/.claude/.credentials.json` is absent (Claude Code on macOS stores
-  the OAuth blob in the login Keychain). Module-gated with
+  the OAuth blob in the login Keychain). Reads use `security(1)`; writes use
+  Security.framework so OAuth JSON never enters process arguments. Module-gated with
   `#[cfg(target_os = "macos")]`; Linux build never compiles it.
 - `src/cache.rs` — atomic per-vendor cache writes + flock, plus the shared
   cross-platform path resolvers (`xdg_cache_dir`, `home_dir`). `home_dir`
@@ -164,8 +189,19 @@ vendor's response shape drifts:
   auto-signals waybar after save)
 - `src/tui/panels.rs` — native ratatui per-vendor panels
 - `src/widget/` — Waybar widget shell (CLI, render, pretty, run)
+- `manifest.json`, `omarchy/` — Omarchy 4 / Quattro plugin manifest, native
+  Quickshell panel, pure report model, and Node contract tests
 - `src/tooltip.rs` — shared Pango bordered-box renderer (used by
   every vendor's tooltip)
+- `gnome-extension/marker-logic.js` — pure GNOME formatting helpers and their
+  own Node contract tests.
+- `kde-plasmoid/` — KDE Plasma 6 plasmoid (KPackage). Vendor selection is
+  per applet instance via KConfigXT. Its single `usage --json` request omits
+  `--vendor`; selection happens client-side, so it never reads
+  `~/.cache/ai-usagebar/active_vendor`. The pure report adapter lives in
+  `package/contents/code/plasmoid-logic.mjs` and is not a copy of the GNOME
+  helpers. Test popup work with `plasmawindowed`, not `plasmoidviewer`; the
+  latter never instantiates the full representation.
 - `packaging/aur/PKGBUILD` — source-build AUR pkg
 - `packaging/aur/PKGBUILD-bin` — prebuilt-binary AUR pkg (multi-arch)
 - `.github/workflows/release.yml` — tag-driven release (x86_64 + aarch64)

@@ -15,24 +15,30 @@ A single Swift file (`NSStatusItem` + `NSAttributedString`); no Xcode project.
 
 ## Vendor scope
 
-The selector supports **eleven vendors** that ship in the binary:
+The selector supports **thirteen vendors** that ship in the binary:
 
-- **Rate-limit windows (5h / weekly):** Anthropic (Claude), OpenAI (Codex), and
-  Z.AI (GLM).
+- **Rate-limit windows (5h / weekly):** Claude, Codex,
+  Z.AI (GLM), and Google Antigravity (two independent pools — Gemini, and
+  Claude & GPT OSS — each with its own 5h/weekly pair).
+- **Included-usage pools:** Cursor (Cursor Models and Other Models, both reset
+  on the billing cycle).
 - **Balance-only:** OpenRouter, DeepSeek, Kimi, Kilo, Novita, Moonshot, Grok
-  (xAI), and Anthropic (API). These have no 5h/weekly quota windows, so the app
+  (xAI), and Anthropic API. These have no 5h/weekly quota windows, so the app
   shows their balance/credits in the header (`cr <amount>`) and suppresses the
-  session/weekly rows. Anthropic (API) additionally renders a spend-vs-limit
+  session/weekly rows. Anthropic API additionally renders a spend-vs-limit
   bar when a monthly limit is configured.
 
-Only **enabled** vendors appear in the selector. The opt-in balance vendors
-(DeepSeek, Kimi, Kilo, Novita, Moonshot, Grok, Anthropic API) default to
-disabled in the Rust config, matching `src/config.rs`; set
+Only **enabled** vendors appear in the selector. The opt-in vendors (DeepSeek,
+Kimi, Kilo, Novita, Moonshot, Grok, Anthropic API, Cursor, Antigravity) default
+to disabled in the Rust config, matching `src/config.rs`; set
 `[vendor].enabled = true` (or save an API key via the TUI) to turn one on.
 
-Google Antigravity is **not** supported in the macOS app: the binary only
-discovers its local language server on Linux, so on macOS it has no reachable
-quota source.
+Antigravity has no credential file to check, so the Vendors pane treats it as
+**configured** once it finds any of Antigravity 2.0/IDE/`agy`'s state
+directories (`~/.gemini/{antigravity,antigravity-cli,antigravity-ide}`) — the
+binary itself discovers whichever local server is actually reachable
+(Antigravity 2.0, the IDE, or an interactive `agy` session) via `lsof` at fetch
+time, so one of those must be running for quota to load.
 
 ## Requirements
 
@@ -51,7 +57,8 @@ cd macos
 ./ai-usagebar-menubar &    # appears in the menu bar (no Dock icon)
 ```
 
-Start at login:
+Start at login — toggle **Preferências… → Sistema → "Iniciar no login"** in the
+app, or from the shell:
 
 ```bash
 ./install-agent.sh         # installs a LaunchAgent (RunAtLoad)
@@ -76,8 +83,21 @@ Settings persist in `UserDefaults` and apply **live, no rebuild**.
 | Bar width | 8 | cells per menu-bar bar (4–20) |
 | Colors (low/mid/high/critical/empty) | One Dark | bar color per severity (≥90 / ≥75 / ≥50 / else) |
 | Refresh interval | 30 s | 5–3600 |
-| Vendor | anthropic | selectors: only enabled vendors (see [Vendor scope](#vendor-scope)). Anthropic, OpenAI, and Z.AI expose session/weekly windows; balance-only vendors show a credit balance instead. |
+| Vendor | anthropic | selectors: only enabled vendors (see [Vendor scope](#vendor-scope)). Claude, Codex, and Z.AI expose session/weekly windows; balance-only vendors show a credit balance instead. |
 | Binary path | auto | empty = `~/.cargo/bin`, Homebrew, then `PATH` |
+| Global vendor shortcut | on | **⌥⌘\\** cycles every configured vendor/account and Overview; turns itself back off if macOS cannot register it |
+| Global compact shortcut | on | **⌥⌘E** toggles Overview between mini bars and compact text; turns itself back off if unavailable |
+| Start at login | current LaunchAgent state | writes/removes the per-user LaunchAgent; write errors are shown below the toggle |
+
+`[ui] overview_vendors = ["anthropic", "cursor", "openai"]` in
+`config.toml` limits and orders the Overview on macOS exactly as it does in the
+TUI. Requesting `anthropic` includes every configured named Claude account.
+
+In Overview mode, each dropdown row is a **checkbox**: click it to drop that
+provider from the always-visible top-bar summary (checkmark = shown; unchecked +
+dimmed = hidden). Hidden providers stay listed so you can re-enable them, and the
+choice persists. Jumping to a provider's detail view is via the *Trocar vendor*
+submenu / ⌥⌘\ (the Overview row click toggles visibility instead).
 
 The Preferences window needs **macOS 12+** (the menu bar itself works on
 10.15+). Tags/labels use the system label colors, so they adapt to a light or
@@ -110,6 +130,66 @@ A **"Trocar vendor"** submenu in the dropdown (between "Atualizar agora" /
 "Abrir TUI" and "Preferências…") lists only configured vendors, with a
 checkmark on the active one.
 Selecting one switches immediately, without opening Preferences.
+The global **⌥⌘\\** shortcut performs the same cycle from any app; disable it
+under Preferências → Atalho if that chord belongs to another application.
+
+## Multiple Claude accounts
+
+Named Anthropic accounts from the binary's config
+(`[[anthropic.accounts]]` entries and `[anthropic] accounts_dir`
+auto-discovery — see the main README's "Multiple accounts") each get their own
+entry, "Claude · label", in the vendor submenu, the ⌥⌘\ swap ring, the
+Preferences selector, and the Overview. Each is fetched as
+`--vendor anthropic --account <label>`, so caches and token refreshes stay
+per-account. Set `[anthropic] show_default_account = false` to hide the
+default (unnamed) Claude entry when every account is managed explicitly.
+Every immediate `accounts_dir` subdirectory counts as an account; this includes
+macOS logins whose credentials exist only in a config-dir-scoped Keychain item.
+
+### Switching which account you are signed in as
+
+Those entries decide whose usage is *shown*. Which account you are actually
+signed in as is a separate thing — and there are two of them, the Claude
+Desktop app and the `claude` CLI, which drift apart.
+
+The dropdown gets a **Claude Desktop ▸** and a **Claude Code ▸** submenu, each
+listing the accounts it knows with a checkmark on the active one. Pick another
+to switch to it; pick **Adicionar conta…** to capture a new one (that part is
+interactive, so it opens in Terminal). A dim line under the header shows both
+active accounts at a glance — `Desktop: work · Code: personal`.
+
+Switching the Desktop app **quits and reopens Claude.app**, so the menu confirms
+first; your local history is merged into the target account and a rollback
+archive is written before anything changes. The Claude Code switch has no
+visible side effect and happens straight away. Both submenus grey out while a
+switch is running.
+
+The same thing from the shell:
+
+```bash
+ai-usagebar account status                  # who each surface is signed in as
+ai-usagebar account add work --desktop      # capture a Claude Desktop account
+ai-usagebar account switch work --dry-run   # what a switch would do
+ai-usagebar account switch work --desktop   # quits and reopens Claude.app
+```
+
+See the main README's *Switching the active Claude account* for the full story.
+
+## Multiple OpenRouter accounts
+
+Entries from `[[openrouter.accounts]]` appear as separate menu choices and use
+`--vendor openrouter --account <label>` behind the scenes. Each account keeps
+its own cache. Set `[openrouter] show_default_account = false` when you do not
+want the unnamed key listed. See the main
+[OpenRouter account guide](../docs/openrouter-accounts.md) for configuration.
+
+## Live config reload
+
+The app watches `config.toml` and reloads on any change — enable a vendor, add
+an account, tweak an `[ui]` knob, and the menu bar updates within a second, no
+restart. It re-arms across an editor's atomic save, and a half-written file
+mid-edit is ignored (the running config is kept until the file parses again).
+The TUI does the same, polling the file every couple of seconds.
 
 ## How it works
 

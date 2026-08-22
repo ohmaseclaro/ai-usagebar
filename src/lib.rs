@@ -8,26 +8,38 @@
 //! The two binaries (`ai-usagebar` and `ai-usagebar-tui`) are thin: they parse
 //! CLI args, instantiate vendors, and hand off to a renderer in this crate.
 
+pub mod account;
 pub mod active;
 pub mod anthropic;
 pub mod anthropic_api;
 pub mod antigravity;
 pub mod cache;
+pub mod claude_desktop;
 pub mod config;
 pub mod context;
 pub mod countdown;
+pub mod cursor;
 pub mod deepseek;
+pub mod display;
 pub mod error;
 pub mod format;
 pub mod grok;
 pub mod kilo;
 pub mod kimi;
+pub mod kiro;
+pub mod minimax;
 pub mod moonshot;
+pub mod nous;
 pub mod novita;
 pub mod openai;
+pub mod opencode_go;
 pub mod openrouter;
 pub mod pacing;
 pub mod pango;
+pub mod report;
+pub mod safe_storage;
+pub mod supergrok;
+pub mod sync;
 pub mod theme;
 pub mod tooltip;
 pub mod tui;

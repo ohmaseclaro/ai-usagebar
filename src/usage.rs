@@ -222,6 +222,80 @@ impl Default for DeepseekSnapshot {
     }
 }
 
+/// Cursor — the two included-usage pools the dashboard shows, from the
+/// undocumented `cursor.com/api/usage-summary` endpoint (the same one the
+/// dashboard's own frontend calls), authenticated with the session token the
+/// Cursor IDE wrote to its local `state.vscdb`.
+///
+/// Since Cursor's mid-2026 pricing, a plan's included compute is split into two
+/// quota pools, each shown as a percentage: **Cursor Models** (Auto + Composer,
+/// `autoPercentUsed`) and **Other Models** (named / third-party, `apiPercentUsed`).
+/// Overflow past either pool falls to on-demand spend. Percentages are integers
+/// (rounded from the wire floats) to match the dashboard and every other
+/// vendor's integer-percent convention; they can exceed 100 when a pool is over
+/// its included allowance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorSnapshot {
+    /// Membership label, title-cased from `membershipType` (e.g. "Ultra").
+    pub plan: String,
+    /// "Cursor Models" pool — Auto + Composer (`autoPercentUsed`, rounded).
+    pub auto_pct: i32,
+    /// "Other Models" pool — named / third-party (`apiPercentUsed`, rounded).
+    pub api_pct: i32,
+    /// Overall included usage (`totalPercentUsed`, rounded) — the dashboard's
+    /// "you've used N% of your included total usage" headline.
+    pub total_pct: i32,
+    /// `true` when the plan reports `isUnlimited` — the pools don't cap and the
+    /// percentages are not meaningful.
+    pub unlimited: bool,
+    /// Whether on-demand (overage) spend is turned on (`onDemand.enabled`).
+    pub on_demand_enabled: bool,
+    /// End of the current billing cycle (`billingCycleEnd`) — when the pools
+    /// reset.
+    pub reset_at: Option<DateTime<Utc>>,
+}
+
+impl CursorSnapshot {
+    /// The binding pool — whichever is closest to (or furthest past) its cap.
+    /// Drives the bar color and the single generic `session_pct` alias.
+    pub fn worst_pct(&self) -> i32 {
+        self.auto_pct.max(self.api_pct)
+    }
+}
+
+/// Kiro CLI (AWS CodeWhisperer / Q Developer backend) — a single credit pool
+/// from `AmazonCodeWhispererService.GetUsageLimits`, the same call kiro-cli's
+/// own `/usage` slash command makes. Authenticated with the AWS SSO OIDC
+/// bearer token kiro-cli already cached locally, refreshed with the paired
+/// refresh token when it's close to expiry — see `kiro::db` and `kiro::oauth`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KiroSnapshot {
+    /// Subscription tier label (`subscriptionInfo.subscriptionTitle`, e.g.
+    /// "KIRO POWER").
+    pub plan: String,
+    /// Credits consumed this cycle (`currentUsageWithPrecision`).
+    pub used: f64,
+    /// Credits included in the plan (`usageLimitWithPrecision`).
+    pub limit: f64,
+    /// When the credit pool resets (`nextDateReset`).
+    pub reset_at: Option<DateTime<Utc>>,
+}
+
+impl Eq for KiroSnapshot {}
+
+impl KiroSnapshot {
+    /// Percentage of the credit pool consumed, rounded. `0` when `limit` is
+    /// not positive — defensive; the API has not been observed to send that.
+    pub fn pct(&self) -> i32 {
+        if self.limit <= 0.0 {
+            return 0;
+        }
+        ((self.used / self.limit) * 100.0)
+            .round()
+            .clamp(0.0, 9999.0) as i32
+    }
+}
+
 /// Kimi Code — weekly subscription quota plus a 5h rolling rate-limit window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KimiSnapshot {
@@ -274,8 +348,14 @@ pub enum VendorSnapshot {
     Novita(NovitaSnapshot),
     Moonshot(MoonshotSnapshot),
     Grok(GrokSnapshot),
+    SuperGrok(SuperGrokSnapshot),
     AnthropicApi(AnthropicApiSnapshot),
     Antigravity(AntigravitySnapshot),
+    Cursor(CursorSnapshot),
+    Minimax(MinimaxSnapshot),
+    Kiro(KiroSnapshot),
+    NousResearch(crate::nous::types::AccountSnapshot),
+    OpenCodeGo(crate::opencode_go::types::Usage),
 }
 
 /// Google Antigravity 2.0 / CLI snapshot. The API groups models into Gemini
@@ -298,6 +378,27 @@ pub struct AntigravitySnapshot {
 }
 
 impl Eq for AntigravitySnapshot {}
+
+/// MiniMax Token Plan — `/v1/token_plan/remains` returns one row per model
+/// bucket (`general` for text/coding, `video`), and each row carries its own
+/// rolling interval window plus a weekly window.
+///
+/// Two things the payload dictates rather than convention: the interval length
+/// is **not fixed** (`general` rolls every 5h, `video` every 24h), so the
+/// duration is derived from the row's own start/end rather than assumed; and
+/// the API reports the percentage **remaining**, which is inverted on the way
+/// in so these windows carry consumed-% like every other vendor's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MinimaxSnapshot {
+    pub plan: String,
+    /// `general` bucket — rolling interval window (5h on the observed plans).
+    pub session: UsageWindow,
+    /// `general` bucket — weekly window.
+    pub weekly: UsageWindow,
+    /// `video` bucket, `None` on plans that carry no video quota.
+    pub video_session: Option<UsageWindow>,
+    pub video_weekly: Option<UsageWindow>,
+}
 
 /// Anthropic Admin API — month-to-date spend (USD) from the cost report. The
 /// monthly `limit` is supplied from config (the API exposes neither the limit
@@ -372,6 +473,55 @@ pub struct GrokSnapshot {
 }
 
 impl Eq for GrokSnapshot {}
+
+/// SuperGrok subscription usage returned by the official Grok Build CLI's
+/// credential-owning `x.ai/billing` ACP extension. Distinct from
+/// [`GrokSnapshot`] (Management API prepaid balance).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SuperGrokSnapshot {
+    /// Subscription tier label when the billing response supplies one
+    /// (e.g. "SuperGrok", "SuperGrok Heavy"); otherwise `"SuperGrok"`.
+    pub plan: String,
+    /// Opaque digest of Grok auth/config state. Never displayed — cache
+    /// isolation only.
+    pub account: String,
+    /// Current included-credit usage percent. The field name is retained as a
+    /// compatibility alias for format/render code; [`Self::period`] says
+    /// whether the server's actual window is weekly or monthly.
+    pub weekly_pct: i32,
+    pub period: SuperGrokPeriod,
+    /// When the current usage period ends.
+    pub reset_at: Option<DateTime<Utc>>,
+    /// Remaining prepaid (purchased) API credit in USD, when present.
+    pub prepaid_balance: Option<f64>,
+}
+
+impl Eq for SuperGrokSnapshot {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuperGrokPeriod {
+    Weekly,
+    Monthly,
+    Unknown,
+}
+
+impl SuperGrokPeriod {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Weekly => "Weekly",
+            Self::Monthly => "Monthly",
+            Self::Unknown => "Current period",
+        }
+    }
+
+    pub fn short(self) -> &'static str {
+        match self {
+            Self::Weekly => "wk",
+            Self::Monthly => "mo",
+            Self::Unknown => "period",
+        }
+    }
+}
 
 /// OpenAI Codex OAuth — exposes whichever rolling windows the API reports.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -661,5 +811,27 @@ mod tests {
         };
         assert_eq!(snap.weekly_pct(), 50);
         assert_eq!(snap.window_pct(), 100);
+    }
+
+    #[test]
+    fn kiro_pct_is_zero_without_a_positive_limit() {
+        let snap = KiroSnapshot {
+            plan: "FREE".into(),
+            used: 5.0,
+            limit: 0.0,
+            reset_at: None,
+        };
+        assert_eq!(snap.pct(), 0);
+    }
+
+    #[test]
+    fn kiro_pct_rounds_the_credit_ratio() {
+        let snap = KiroSnapshot {
+            plan: "KIRO POWER".into(),
+            used: 1.0,
+            limit: 3.0,
+            reset_at: None,
+        };
+        assert_eq!(snap.pct(), 33);
     }
 }

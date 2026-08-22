@@ -9,7 +9,861 @@ Each release is also published at
 
 ## [Unreleased]
 
+### Added
+
+- **A sixth sync category, `extensions`** — the tooling that makes a machine
+  yours rather than merely logged in to the same accounts. It carries Claude
+  Code's `skills/`, `agents/`, `hooks/` and `gsd-core/`, its `CLAUDE.md` and
+  `settings.json`, and the working trees of installed plugins, plus Cursor's
+  `agents/`, `rules/` and `mcp.json`. On by default: about 20 MB, against a
+  transcript category measured in gigabytes.
+
+  It is an allow-list, like Cursor's conversations already were. What is
+  deliberately absent is the point of the design: plugin `cache/` and `repos/`
+  are derived from what does travel, each marketplace's `.git` is 12 MB of
+  objects reconstructing 9.7 MB of files already in the bundle, and Cursor's
+  `extensions/` measured 2.9 GB of directories re-installable by name.
+
+### Security
+
+- **A keyfile no longer chooses what it costs to open.** Argon2id's parameters
+  live in cleartext in the keyfile and are read from a remote the format treats
+  as hostile — and they are necessarily consumed *before* the AEAD can say the
+  file was tampered with, since they are what produce the key the tag is checked
+  with. Only memory was bounded, at 4 GiB; `t` and `p` had no ceiling at all, so
+  `t = u32::MAX` — a pure CPU multiplier that allocates nothing, and about
+  1.4 × 10⁹ times the shipped cost — passed every check and then ran for
+  centuries.
+
+  Now `m ≤ 2 GiB` (RFC 9106 §4's first recommended option; the previous 4 GiB
+  was a guaranteed OOM on the 4 GB aarch64 class this project ships for), `t ≤
+  16` and `p ≤ 16`, all enforced in the single function every derivation routes
+  through, before anything is allocated or computed. `p` is documented as a
+  tamper signal rather than a cost bound, because the vendored `argon2` has no
+  parallel feature and claiming otherwise would repeat the defect being fixed.
+
+  The refusal now names the offending value, the bound, what a genuine keyfile
+  carries, and two commands that exist.
+
+### Removed
+
+- **The available-memory preflight, deleted rather than finished.** Its macOS
+  arm read total installed memory — a constant, so it could never fail — it had
+  no Windows implementation, it had no production call sites, and it named a
+  `--kdf-memory` flag that was never built. Six places in the code and three in
+  the docs assumed that flag existed, including a live error telling users to
+  re-run with it and a doc line asserting the refusal ships. All struck, with a
+  test that fails if any message here names a flag this build cannot parse.
+
 ### Fixed
+
+- **A per-account routine registry is no longer restored as a chat index.**
+  `scheduled-tasks.json` and `local_*.json` share one directory, and the restore
+  told them apart by directory alone — so a user syncing `routines` with
+  `chat_index` switched off had the registry come back under the switch they
+  left off. Both directions now use the collector's own predicate.
+- **A restored executable comes back runnable.** Every restored file landed at
+  mode 0600, which is right for a credential and silently wrong for a hook or a
+  skill script — it failed later, with an error about the hook rather than about
+  the restore that broke it. A file packed with any execute bit is now restored
+  at 0700: the bit comes back, and group and other stay shut however open they
+  were on the machine that packed it.
+- **`tar`'s stderr is sanitized like every other untrusted diagnostic.** It
+  names the member it failed on, and a restore's members are paths a hostile
+  manifest chose, so an escape sequence could repaint the line and an embedded
+  newline could forge a report line under it.
+- **The HTTP-client guard reads a CRLF checkout the same as an LF one.** It
+  searched for a literal `"\n#[cfg(test)]\nmod tests"`; a Windows checkout writes
+  `\r\n`, so the marker matched nothing and every file's test module counted as
+  production code — the one test that failed on `windows-latest` for a reason
+  other than `tar`.
+
+## [1.4.0] — 2026-08-20
+
+### Added
+
+- **Encrypted sync to a private GitHub repository** — `ai-usagebar sync`. Your
+  configuration, credentials, routines and chat index (and, opt-in, your Claude
+  Code transcripts) are compressed, encrypted on this machine, and stored as
+  content-addressed packs in a repository only you can read. One password, held
+  only by you, unwraps a master key that never leaves the machine. The remote
+  holds ciphertext, sizes and timings, and nothing else. Six subcommands:
+
+  - `sync setup` — a guided five-step pairing that uploads nothing: choose the
+    categories (`credentials` explicitly, never by implication), verify the
+    repository is private and yours, set the sync password — press Enter to take
+    a generated 20-character passphrase — see what a first push would send, and
+    confirm. Nothing is written to disk until that last step, so declining
+    leaves the machine exactly as it was.
+  - `sync status` — what would be sent per category, when sync last ran, and the
+    state of the pairing. `--json` prints the same facts as one machine-readable
+    object, without building a plan or contacting the network.
+  - `sync push` — uploads only what changed, verifies every pack is retrievable,
+    and only then flips the snapshot pointer, so an interruption leaves the
+    previous snapshot exactly as it was. `--dry-run` measures a push without
+    sending a byte.
+  - `sync pull` — restores this machine. **A dry run by default**: nothing is
+    written without `--apply`. An item whose local copy is newer is skipped and
+    named, never silently replaced; a locally-newer credential needs `--force`
+    **and** `--force-credentials` together. Everything about to be overwritten is
+    archived first, and the exact command that puts it back is printed at the
+    end.
+  - `sync prune` — deletes remote data no kept snapshot still references. Runs
+    automatically after every successful push.
+  - `sync rekey` — changes the sync password by rewrapping the master key. Not
+    one pack byte moves, and it is **not** revocation.
+
+  The repository must be private, and that is re-checked immediately before
+  every push rather than once at setup, because a repository can be made public
+  from the web interface at any moment. The token you create holds
+  `Contents: Read and write` and `Metadata: Read` and nothing else — without
+  `Administration: write` the tool structurally cannot create a repository,
+  public or private.
+
+  Primitives are Argon2id (RFC 9106), XChaCha20-Poly1305, BLAKE3 and zstd,
+  adding six dependencies (`argon2`, `chacha20poly1305`, `blake3`, `zstd`,
+  `zeroize`, `getrandom`). All are pure Rust or vendor their C, so the AUR
+  source build needs no system library and stays hermetic.
+
+- **macOS menu bar: a Sync row and a Sync submenu.** The row shows when sync
+  last ran and how much is not in the backup yet. The submenu lists every
+  category with whether it is switched on — a category switched *off* is shown
+  as off rather than omitted — plus a state refresh and two actions, push and
+  restore.
+
+- **TUI: a Sync section in the Settings overlay** (press `s`). One focusable row
+  per category with an on/off marker, and the last-sync time. Space or Enter
+  toggles a row; Ctrl-S saves through the overlay's existing writer, so comments
+  and key order survive and the file stays mode 0600. Turning every category off
+  writes `categories = []` — "sync nothing" — which is deliberately distinct
+  from a missing key, which still means "the defaults".
+
+- **Documentation.** An `Encrypted sync` section in the README with the
+  fine-grained token recipe, both surfaces, and the honest limits;
+  `docs/sync-github.md` for setup, retention and the acceptable-use note;
+  `docs/sync-format.md` as the on-the-wire specification; and
+  `docs/sync-calibration.md` for the measured sizes and timings. The README
+  states plainly that there is no password recovery, and that changing the
+  password is not revocation.
+
+### Changed
+
+- `config.toml` gained an optional `[sync]` section. Unknown keys inside it are
+  ignored rather than rejected, so a configuration restored from a newer build
+  onto an older one still loads, keeps the values that build understands, and
+  renders normally. A misspelled *section* is still an error.
+
+### Fixed
+
+- The TUI Settings overlay scrolls to keep the focused control on screen, and
+  the modal uses more of the window's height. On an 80×24 terminal — Terminal.app's
+  default — the **Save** row could otherwise sit below the fold while Tab still
+  moved focus into rows you could not see.
+
+### Security
+
+The encrypted-sync feature is new in this release, so none of the following was
+ever present in a shipped build. They are recorded because they were real
+defects, each found by this milestone's own audits, each closed with a
+regression test that was watched to fail first — and because a backup tool that
+is quiet about what it got wrong is not one worth trusting with a credential.
+
+- **Two machines could silently drop one machine's backup.** When two machines
+  published at the same time, both could claim the same snapshot number. The
+  rollback defence reads an equal number as "already seen", so one machine's
+  snapshot — genuinely different data — registered as something you had already
+  recovered. Snapshot numbering is now derived at the point the race is
+  resolved, so a machine that loses a simultaneous publish re-publishes *above*
+  the winner instead of beside it.
+
+- **The rollback defence was documented but never consulted, and an automatic
+  prune could then delete the orphaned data for good.** The design named a local
+  counter as the thing that would notice a remote rolled back to an older,
+  genuinely-signed snapshot — but nothing on the push path ever read it. Anyone
+  with write access to the backup repository could restore an authentic older
+  pointer; the next honest push would carry it forward and launder it into a
+  legitimately-written one, and the prune that runs after every push would then
+  delete the packs that rollback had orphaned. Those packs are older than the
+  24-hour grace period, so nothing held them back. The counter is now read on
+  all three paths that can launder a rollback — push, prune and rekey — and only
+  `sync push --allow-rollback` overrides it. That flag now exists; the refusal
+  message had been naming it for a phase before it did.
+
+- **A password change could be quietly undone by a machine that missed it.**
+  After `sync rekey`, a machine still holding the old keyfile would re-upload it
+  on its next push, restoring the wrapper the rekey had just destroyed and
+  verified gone. The old password kept working and the change was cosmetic. Such
+  a push is now refused before a single byte is packed, and tells you to copy
+  the new keyfile across first. Nothing that machine already pushed is affected:
+  a rekey re-encrypts no data.
+
+- **One capital letter defeated the credential confirmation.** Restoring a
+  credential over a newer local one is meant to require `--force` and
+  `--force-credentials` together. The check compared file names byte-exactly
+  while macOS folds case, so a backup naming `.Credentials.json` resolved to your
+  live `.credentials.json` on disk yet was classified as "not a credential" —
+  the second consent was never asked, and `--force` alone could revert a live
+  OAuth token and sign you out. The same byte-exact comparison also admitted the
+  device-identity files the exclusion list exists to keep off your machine
+  (`Bridge-State.json`, `Ant-Device-Registry.json`, `Backups/`,
+  `Local-Agent-Mode-Sessions/`) with no consent of any kind. File names are now
+  compared through a type that folds case and that will not compile a byte-exact
+  comparison, so the next instance is a build failure rather than a shipped hole.
+
+- **A hostile backup could rewrite what you saw on your terminal.** A path
+  chosen by whoever controls the repository was printed into a failure message
+  verbatim, so control characters and bidirectional overrides in it landed on
+  your terminal — immediately after the report you had just consented to. The
+  path had no size limit either, so that message could be made arbitrarily long
+  on demand. Paths taken from a backup are now escaped in the single `Display`
+  every restore error passes through, rather than at each print site that
+  remembered to, and are bounded (1024 bytes, 32 path components, 255 bytes per
+  name) by a check that runs first and never echoes its input.
+
+- **Sync cannot take your status bar down.** The widget render path exits 0 with
+  a `⚠` payload no matter what the configuration on disk looks like — including
+  the half-written TOML an interrupted restore leaves behind — because Waybar
+  hides a module that does not. That is now asserted through the shipped render
+  path rather than assumed, and a structural test proves that path holds no
+  reference into the encrypted-backup module at all.
+
+- **The menu bar never runs a sync itself, and never holds your password.** Its
+  push and restore actions confirm, show you the exact command, and open it in
+  Terminal.app, so a restore's two separate confirmations are answered where
+  they were designed to be. The alternative — a background process passing the
+  flags that skip those questions — would have made a menu click an easier route
+  to an irreversible write than the command line offers. No sync password is
+  ever read from a command-line argument or an environment variable, on any
+  surface; the GitHub token is stored in the macOS Keychain or in a mode-0600
+  file beside `config.toml`, never in `config.toml` itself.
+## [1.3.1] — 2026-08-19
+
+### Fixed
+
+- Omarchy remembers the exact provider or named account selected in the
+  Quattro panel and restores it after shell reloads, including sleep/unlock
+  cycles. If that entry is no longer available, the configured primary remains
+  the safe fallback.
+
+## [1.3.0] — 2026-08-19
+
+### Added
+
+- OpenRouter supports multiple named keys through `[[openrouter.accounts]]`.
+  Named accounts work with `--account`, appear separately in aggregate views,
+  and keep isolated caches; existing singular `[openrouter]` configs and cache
+  paths remain unchanged.
+- Z.AI and MiniMax now expose pace and elapsed-time placeholders
+  (`{zai_session_elapsed}`, `{zai_session_pace}`, `{zai_weekly_elapsed}`,
+  `{zai_weekly_pace}`, `{zai_mcp_elapsed}`, `{zai_mcp_pace}`,
+  `{minimax_session_elapsed}`, `{minimax_session_pace}`,
+  `{minimax_weekly_elapsed}`, `{minimax_weekly_pace}`,
+  `{minimax_video_elapsed}`, `{minimax_video_pace}`,
+  `{minimax_video_weekly_reset}`, `{minimax_video_weekly_elapsed}`,
+  `{minimax_video_weekly_pace}`, and their `_pace_indicator` variants), plus
+  the cross-vendor `{session_elapsed}` / `{weekly_elapsed}` aliases — the macOS
+  menu bar's pace marker now renders for both vendors the same way it already
+  does for Claude and Codex.
+
+### Fixed
+
+- Omarchy now reports a missing `ai-usagebar` binary with the required install
+  command instead of leaving the Quattro widget stuck in its loading state.
+- Omarchy's Quattro panel no longer evaluates hidden row components against
+  incompatible report rows, eliminating repeated QML type and string-binding
+  errors without changing the rendered layout.
+
+## [1.2.0] — 2026-08-18
+
+### Added
+
+- Added Nous Research subscription usage through its OAuth device flow and
+  OpenCode Go rolling, weekly, and monthly usage through its API key.
+
+### Fixed
+
+- Nous Research refreshes now send the refresh token in the form and the
+  required Portal header, work with existing safe configuration directories,
+  and use portable atomic credential replacement on Linux, macOS, and Windows.
+- Nous Research percentages now use subscription credits only. Purchased and
+  total usable credits remain separate balances instead of changing the plan
+  percentage.
+- OpenCode Go now rejects empty or unsupported usage responses and keeps live
+  and stale cache entries isolated by endpoint and API-key identity.
+
+### Security
+
+- Updated `h2` to 0.4.16 to bound empty DATA-frame processing
+  (`RUSTSEC-2026-0258`).
+- Nous browser launches no longer pass Portal URLs through the Windows command
+  shell, and OAuth traffic uses bounded requests with same-origin redirects.
+- OAuth fields and expiry arithmetic are bounded, and provider-specific error
+  classes are preserved without exposing credential-bearing response bodies.
+
+## [1.1.0] — 2026-08-16
+
+### Added
+
+- **KDE Plasma 6 plasmoid** (`kde-plasmoid/`). The native panel widget renders
+  every provider returned by `ai-usagebar usage --json`, follows the active
+  Plasma colour scheme, and keeps provider selection per applet instance. It
+  includes a popup, live reset countdowns, configurable compact bars, and Qt 6
+  and Node regression suites.
+
+### Fixed
+
+- **Aggregate views now source a Claude label shared by a CLI account and a
+  Desktop profile only from Desktop.** The same account in two stores means two
+  of them refreshing one rotating refresh token — each refresh invalidates the
+  other's copy — and the CLI copy can even refresh to a stale/wrong identity
+  that still authenticates but reports another account's (often zero) usage. The
+  symptom: a heavily-used account showing 0% while its Desktop token returns the
+  real number. The previous guard only dropped a CLI entry whose credential was
+  *empty* (a half-finished `account add`), which cannot catch a token that
+  authenticates but is misattributed. On a label collision the app-maintained
+  Desktop token now always wins, which both avoids the rotation war and stops
+  the silent misattribution. A CLI account with no Desktop profile of the same
+  name is unaffected. Direct widget commands remain explicit: add `--desktop`
+  when selecting the Desktop profile with `--account`.
+
+## [1.0.3] — 2026-08-15
+
+### Security
+
+- macOS OAuth refreshes now update Claude Code's login-Keychain entry through
+  Security.framework instead of placing access and refresh tokens in a
+  subprocess argument list.
+- Unix configuration files containing inline API keys are automatically
+  tightened to mode `0600`; the app fails closed if it cannot protect them.
+- Cached and live user-facing authentication failures discard provider response
+  bodies, and widget fallback diagnostics are Pango-escaped before display.
+- Claude and Grok subprocesses no longer inherit API keys belonging to unrelated
+  ai-usagebar providers.
+
+## [1.0.2] — 2026-08-14
+
+### Changed
+
+- Updated the Base64, bundled SQLite, error-derivation, SHA-2, AES, and CBC
+  dependency stacks. Chromium safeStorage encryption remains byte-compatible,
+  and SuperGrok cache identities remain stable across the hash upgrade; both
+  formats now have independent fixed regression vectors.
+- Updated the pinned Rust build-cache and cross-compilation installer actions.
+  All dependency changes passed the full Linux, macOS, Windows, and Rust 1.88
+  compatibility matrix.
+- Documented how to disable Quattro's stock `omarchy.agents` widget when AI
+  Usage should be the bar's only agent-status item.
+
+## [1.0.1] — 2026-08-14
+
+### Added
+
+- The Omarchy Quattro panel now includes a native QML settings form for the
+  primary provider and every supported API-key provider. Stored secret values
+  never enter the shell; it receives presence metadata only and sends changed
+  values to the Rust config owner over stdin.
+
+### Changed
+
+- Native and terminal settings share the existing `toml_edit` persistence
+  path, including comment preservation, explicit clear-versus-unchanged
+  behavior, automatic provider opt-in, mode-0600 writes on Unix, Waybar
+  refresh, environment-variable precedence, and legacy config-path fallback.
+  Existing configs and non-Omarchy frontends require no migration.
+
+## [1.0.0] — 2026-08-14
+
+### Added
+
+- **Native Omarchy 4 / Quattro plugin.** The repository is now directly
+  installable with `omarchy plugin add` and renders every configured provider
+  in Quattro's shared Quickshell design system: native bar interaction and
+  popup placement, theme-aware typography/surfaces/meters, provider switching,
+  keyboard navigation, live reset countdowns, refresh state, and stale/error
+  handling. It keeps credential access and network collection in the Rust
+  binary instead of duplicating vendor logic inside the shell.
+- `ai-usagebar usage --json` now exposes the configured `primary` id, canonical
+  `display_name`, additive `status`, `stale`, and `fetched_at` entry metadata,
+  plus `severity` and absolute `reset_at` values on percentage metrics.
+  Existing `metrics` and lossless `sections` consumers are unchanged;
+  long-lived native panels no longer have to parse human countdown strings.
+
+### Changed
+
+- Promoted the project to its first stable release with the provider, config,
+  CLI, report, cache, and native frontend compatibility guarantees established
+  across the 0.x series.
+- User-facing subscription labels now consistently use the recognizable
+  **Claude** and **Codex** product names. Stable machine ids remain `anthropic`
+  and `openai`, and the separate organization-spend integration remains
+  **Anthropic API**.
+- Canonical provider names and metric reset metadata now originate in the Rust
+  core. Native frontends remain platform-specific presentation adapters rather
+  than carrying copied vendor tables or metric-order assumptions.
+
+### Security
+
+- UI-bound report fields now remove Unicode bidirectional control characters
+  in addition to terminal controls, preventing untrusted labels or diagnostics
+  from visually reordering neighboring text.
+
+## [0.22.0] — 2026-08-11
+
+### Added
+
+- **SuperGrok subscription vendor** (`--vendor supergrok`, `[supergrok]`,
+  opt-in). Shows the current weekly or monthly included-credit usage, reset,
+  tier, and prepaid balance from the official Grok Build CLI's `x.ai/billing`
+  ACP extension. ai-usagebar never parses, copies, caches, refreshes, or places
+  Grok credentials in ACP messages:
+  Grok Build retains account-scope, custom OIDC/external-provider, proxy,
+  rotation, and `auth.json.lock` ownership. Cache isolation uses only an opaque
+  digest of Grok's auth/config state, never a raw token or account identifier.
+  Distinct from the existing `grok` vendor, which reads prepaid Management API
+  balance with `XAI_MANAGEMENT_KEY`. `{sgk_*}` placeholders include the actual
+  period kind; legacy generic weekly aliases remain available for format
+  compatibility.
+- `--version` / `-V` on the `ai-usagebar` binary, reporting the crate version
+  (#81). Until now the only way to tell which build was installed was parsing
+  `cargo install --list`.
+- **Kiro CLI vendor** (`--vendor kiro`, `[kiro]`, opt-in). Reads the credit
+  pool from `AmazonCodeWhispererService.GetUsageLimits` — the exact call
+  kiro-cli's own `/usage` slash command makes — using the AWS SSO OIDC
+  session kiro-cli already cached in its local `data.sqlite3` after
+  `kiro-cli login`. No separate login step; the OIDC access token (valid
+  ~1h) is refreshed via the documented AWS SSO OIDC `CreateToken` API when
+  close to expiry, using the refresh token + client credentials kiro-cli
+  registered for itself. Refreshed and rotated credentials are kept in an
+  atomic, mode-0600, account-scoped ai-usagebar sidecar and are never written
+  back to kiro-cli's own database.
+- **Cursor: `cursor-agent` fallback credential** (`[cursor] agent_auth_path`).
+  Text-only machines that never open the desktop IDE now get usage too: when
+  the IDE's `state.vscdb` is absent, the vendor falls back to the session
+  token the headless `cursor-agent` CLI wrote to its own
+  `~/.config/cursor/auth.json`. The IDE database stays the preferred source
+  when both exist; an existing but unreadable or malformed IDE database still
+  surfaces its own error instead of silently switching to another login.
+
+### Fixed
+
+- **A routine renamed in one account now converges to one title everywhere.** A
+  scheduled task has no `updatedAt`, so a rename leaves `createdAt` untouched and
+  previously only reached the account you switched *to*. A switch now carries
+  the title selected by the baseline-aware routine merge into *every* account's
+  registry, so the name stops disagreeing across accounts. The convergence pass
+  changes only `displayName` and preserves the rest of each registry, including
+  unknown top-level fields. There is no prompt, and it applies to the terminal
+  and menu bar alike since both drive the same switch path. Mirrored in
+  claude-acc.
+
+- **Antigravity now works on macOS, in both the CLI and the menu-bar app.**
+  Local-server discovery (`discover_ls_ports`) only ever walked `/proc`, so on
+  macOS — which has no `/proc` — it silently returned nothing and every
+  Antigravity fetch failed with "no local server found" even while Antigravity
+  was running. It now shells out to `lsof -iTCP -sTCP:LISTEN -F pcn`, the
+  macOS equivalent, and matches listening processes with the same predicate
+  the Linux path already used (now case-insensitive, since the packaged macOS
+  app's process name is capitalized). Separately, the menu-bar app's own
+  vendor list (`VENDOR_AUTH` in `macos/ai-usagebar-menubar.swift`) had never
+  been updated when Antigravity shipped, so it stayed invisible there even
+  after enabling `[antigravity]` — it's now a `local`-kind entry alongside
+  Cursor, "configured" the same way the GNOME extension already detects it
+  (any of `~/.gemini/{antigravity,antigravity-cli,antigravity-ide}`).
+
+### Security
+
+- Updated the transitive `lru` dependency from 0.18.0 to 0.18.2, fixing
+  RUSTSEC-2026-0253 (a panic-safety use-after-free in `LruCache::pop`).
+
+## [0.21.0] — 2026-08-03
+
+### Added
+
+- **Claude Desktop accounts now report usage with no `claude` CLI login.** A
+  saved Desktop account (`account add <label> --desktop`) previously needed a
+  *second*, separate `claude` login before its quota could show — because usage
+  came only from a CLI credential. It turns out the Desktop app stores its own
+  token under the same public OAuth client as Claude Code, and that token is
+  accepted by the usage endpoint, so ai-usagebar now reads it directly. Every
+  saved Desktop profile appears as a Claude account in `ai-usagebar usage`, the
+  TUI, and the macOS menu-bar overview — labelled `· <label> (desktop)` — with
+  zero CLI involvement.
+
+  The token lives in the app's encrypted `safeStorage` blob; ai-usagebar
+  decrypts it with the login-Keychain key (macOS), picks the
+  `user:inference`-scoped entry, and maps it onto the existing OAuth path so
+  fetching and rendering stay unchanged. The **active** account is read-only
+  from the live `config.json` the app keeps fresh; ai-usagebar never rotates
+  that credential,
+  even while the app happens to be stopped. Every other account is read from
+  its profile snapshot and refreshed under the same lock as account switching,
+  with the rotation written back before a switch can install it. Desktop caches
+  are isolated by account UUID, so a reused label cannot expose another CLI or
+  Desktop account's usage. A half-finished CLI `account add <label>` no longer
+  masks a working Desktop profile of the same name: the Desktop source takes
+  over when the CLI credential can't authenticate. The menu bar consumes this
+  same Rust-resolved list, including a configured `desktop_profiles_dir`.
+  macOS-only (the Desktop app and its Keychain key exist nowhere else).
+
+- **Deleted routines and chats are now confirmed instead of silently
+  resurrected.** The merge is a union, so deleting a routine or a conversation
+  in one account meant it came straight back from whichever account still held a
+  copy — and there was no way to tell that apart from something the account had
+  simply never received.
+  ai-usagebar now records what each account held after the last merge
+  (`~/.claude-acc/synced.json`, shared with claude-acc) and uses it to detect a
+  genuine deletion, then asks: keep them all, delete them everywhere, or choose
+  individually. Confirming sweeps it from *every* account so it stops returning.
+  A confirmed chat loses only its **index** — the transcript in the
+  account-agnostic `~/.claude/projects/` is never touched, so the conversation
+  stops following you between accounts without the text being destroyed. The
+  macOS menu bar asks the same question in a dialog with one checkbox per item —
+  checked keeps it — and passes the verdict through as the type-scoped
+  `--delete-conflict <key>`; `account status --json` lists each pending
+  conflict's opaque `key` under `deletion_conflicts` so scripts can do the same
+  without confusing a routine id with a chat filename.
+
+  Deleting is only ever reachable from an answered prompt: `-y` does not imply
+  it, and a switch with no terminal (the menu bar's subprocess, a pipe, a cron)
+  keeps everything and says so. With no record yet — the first run after
+  upgrading — nothing is reported as a deletion, so behaviour is unchanged until
+  there is real history to compare against.
+
+- **Routine edits now reconcile per task instead of per registry file.** The
+  sync record keeps a three-way baseline, so editing one routine in each of two
+  accounts preserves both edits. Concurrent edits to the same routine remain
+  local and are reported during the switch instead of silently choosing one;
+  editing the desired copy resolves it on the next switch. Existing sync files
+  remain readable and keep their flat claude-acc-compatible shape.
+
+- **`ai-usagebar usage` — quota and time-to-reset for everything in the config,
+  in one command.** The widget answers "how is *this* vendor doing" one process
+  at a time, which is what a status bar needs and what a person checking on four
+  Claude accounts does not. This walks the same set the TUI builds — every
+  enabled vendor plus one entry per named Claude account — and prints each
+  window's percentage next to when it resets. `--json` keeps gauge rows in a
+  convenient `metrics` list and provides a lossless ordered `sections` list for
+  balance text and grouped breakdowns, keyed by a stable id
+  (`anthropic@work`), for scripting and logging. A vendor that fails to fetch
+  reports inline instead of hiding the rest, and the exit code is non-zero only
+  when every entry failed.
+
+  Thin by construction: it reuses the TUI's existing tab enumeration, fetch, and
+  snapshot-to-sections projection, so no vendor needs to know it exists.
+
+### Changed
+
+- Refreshed the Rust UI, configuration, SQLite, serialization, and base64
+  dependencies and the pinned checkout, artifact, and AUR deployment actions.
+  The resulting dependency graph remains compatible with the declared Rust
+  1.88 minimum.
+
+### Fixed
+
+- **TUI refresh flicker.** Auto-refresh and manual refresh now keep the last
+  successful vendor snapshot visible with a `↻` indicator while revalidating.
+  Initial loads still show `fetching…`; failed revalidation preserves the old
+  snapshot with an explicit stale warning instead of briefly or permanently
+  hiding useful data. Duplicate requests for the same tab are suppressed
+  (#64).
+
+## [0.20.1] — 2026-07-30
+
+### Security
+
+- Redact successful-but-malformed OAuth token response bodies from diagnostics,
+  strip terminal control characters from vendor text and cached errors, and cap
+  untrusted display fields before they reach Pango, ANSI, or ratatui output.
+- Restrict vendor HTTP redirects to the original scheme, host, and port so
+  non-standard API-key headers cannot be forwarded cross-origin.
+- Create Claude Desktop rollback backup directories and archives with private
+  Unix permissions (`0700` and `0600`, respectively).
+- Pin every GitHub Action to an immutable commit, add automated pin updates,
+  and require release tags to be annotated and point to commits on `main`.
+
+## [0.20.0] — 2026-07-29
+
+### Added
+
+- **MiniMax Token Plan vendor** (`--vendor minimax`, `[minimax]`, opt-in). Reads
+  the subscription quota from the officially published
+  `GET /v1/token_plan/remains` route (response shape verified against the live
+  global endpoint). The plan reports one row per model bucket, each with a
+  rolling interval window and a weekly window, so it renders as a two-pool
+  quota vendor: `general` (text/coding) drives the bar and the generic
+  `{session_pct}` / `{weekly_pct}` aliases, and `video` rides along in the
+  tooltip and TUI panel. `{vendor_short}` is `mmx`.
+  Four properties of this API are encoded deliberately, each with a test:
+  it answers **HTTP 200 even when auth fails** (the real status is
+  `base_resp.status_code`; the two credential codes map onto HTTP 401 so a bad
+  key reports as an auth problem, not schema drift); the percentages are what
+  **remains**, not what was consumed, and are inverted on the way in; the
+  interval length is **not fixed** (5h for `general`, 24h for `video`), so each
+  window's duration comes from its own start/end; and all timestamps are epoch
+  **milliseconds**. `[minimax] region` picks the *instance* rather than a unit —
+  the global and CN deployments issue separate keys and reject each other's, so
+  the endpoint and a non-secret key fingerprint are recorded in the cache
+  payload, and a mismatched cache is discarded instead of being shown against
+  the wrong account.
+- **`ai-usagebar account status` and `account switch <label>` — see and change
+  which Claude account you are actually signed in as (macOS).** There are two
+  separate identities on a Mac and they drift apart constantly: the **Claude
+  Desktop app** (signed in through its own `config.json`) and the **`claude`
+  CLI** (one default login in the login Keychain). `account status` reports both
+  — with each account's e-mail, session count, and whether its credential and
+  browser state have been captured — and `--json` makes that available to
+  scripts and the menu bar. `account switch` moves either one: `--desktop`,
+  `--cli`, or neither for both, with `--dry-run` to see exactly what would
+  happen first.
+
+  Switching the **Desktop app** merges your local history into the target
+  account first — session indexes newest-wins, routines/schedules unioned by
+  task id — so the account you land on shows the union of everything rather
+  than only its own chats; then it quits the app, swaps the credential and the
+  cookie/LevelDB state, and reopens it. Before any of that it writes a rollback
+  archive of everything a switch can destroy (`--keep-backups`, default 10;
+  `--backup-sessions` for a full session-tree archive), and it writes
+  `config.json` atomically so a crash mid-switch cannot strand every account's
+  tokens. The volatile `bridge-state.json` is cleared each time, since a stale
+  cloud-session id makes `/remote-control` fail to disconnect; `--keep-bridge`
+  turns that off for diagnosing browser-connection issues.
+
+  Switching the **CLI** moves the account's stored credential into the one
+  default slot plain `claude` reads and removes its named copy. The outgoing
+  account's credential is saved back into its own slot first, and while a label
+  is the live CLI login
+  ai-usagebar reads that label from the default slot — so one rotating refresh
+  token is never live in two places, which is what would otherwise 401 one of
+  the two copies within hours. A CLI login that belongs to no configured
+  account is never silently discarded: the switch refuses unless `--force`.
+
+- **`ai-usagebar account add <label> --desktop` captures a Claude Desktop
+  account**, so a machine can build its account list from nothing. The CLI half
+  of `add` is easy — `CLAUDE_CONFIG_DIR` gives `claude` as many isolated logins
+  as you want — but the Desktop app has a single login slot and no way to ask
+  for a second, so the only way to obtain another account's credential is to
+  sign the app out, wait for you to sign in as that account, and keep what it
+  writes. That is what this does: it saves the current account into its own
+  profile, copies the live login aside, clears it, reopens the app at its login
+  screen, polls until the sign-in completes, then captures the credential,
+  browser state and organisation, and seeds the new account with the history
+  this machine already has so its first login is not an empty sidebar. Press
+  Ctrl-C to cancel — or let the five-minute window lapse — and your previous
+  login is put back exactly as it was.
+
+- **Claude Desktop ▸ and Claude Code ▸ submenus in the macOS menu bar.** Each
+  lists the accounts that surface knows, checkmarks the active one, and
+  switches on click; **Adicionar conta…** captures a new one (in Terminal,
+  since it is interactive). A dim line under the header shows both active
+  accounts at a glance. The Desktop switch confirms first, because it quits and
+  reopens Claude.app. The submenus refresh on launch, on a `config.toml` change,
+  and when the menu opens (debounced), so a switch made in a terminal shows up
+  without restarting anything.
+
+  Desktop accounts are stored in [claude-acc](https://github.com/ohmaseclaro/claude-acc)'s
+  profile format, so existing claude-acc users' profiles work here untouched and
+  either tool can capture or switch them; `[anthropic] desktop_profiles_dir`
+  overrides the location. That project's reverse-engineering of the Claude
+  Desktop internals is what this builds on, and the Desktop halves of `add` and
+  `switch` are ports of its commands. Removing an account and chat filtering
+  (`only`/`reset`) are not implemented here. Nothing affects the Linux build:
+  the modules compile and are tested everywhere, and simply find no Claude
+  Desktop installation.
+
+- **Configurable TUI vendor navigation.** Set `[ui] vendor_box` to `sidebar`
+  (the responsive existing default), `navbar` (always use the horizontal top
+  strip), or `none` (hide the navigation and give the active panel the full
+  terminal width). Live config reload applies the layout immediately.
+
+### Security
+
+- Updated `quinn-proto` to 0.11.15 to prevent remote memory exhaustion from
+  unbounded out-of-order stream reassembly (RUSTSEC-2026-0185), and `anyhow` to
+  1.0.104 to fix unsound mutable error downcasting (RUSTSEC-2026-0190).
+
+## [0.19.0] — 2026-07-27
+
+### Added
+
+- **Per-provider on/off toggle in the Overview (macOS menu bar).** Each row in
+  the Overview dropdown is now a checkbox: click it to drop that provider from
+  the always-visible top-bar summary (checkmark = shown; unchecked + dimmed =
+  hidden). Hidden providers stay listed in the dropdown so you can turn them
+  back on, and dropping some also frees up the top bar to draw mini bars again
+  instead of compact text. The choice persists (UserDefaults). Jumping to a
+  provider's detail view moves to the *Trocar vendor* submenu / **⌥⌘\\** (the
+  Overview row click now toggles instead).
+
+- **`ai-usagebar account add <label>`** takes a new custom Claude (Anthropic)
+  account from nothing to signed-in in one command: it appends an
+  `[[anthropic.accounts]]` block to `config.toml` (creating the file if needed,
+  preserving comments and formatting via `toml_edit`), creates the account's
+  credentials directory, and then **launches `claude` to sign in** with that
+  account's own `CLAUDE_CONFIG_DIR` — so the login writes exactly where
+  ai-usagebar reads it back (the config-dir-scoped Keychain item on macOS, a
+  `.credentials.json` on Linux/Windows) and **your default Claude login is never
+  touched**. When it returns, it re-stamps `config.toml` so the running menu bar
+  / TUI re-fetches and the enabled account shows up **with data immediately** —
+  no restart, no hand-copying credentials. It's idempotent (re-run it to sign an
+  already-registered account back in), never touches the default account, and
+  `--no-login` skips the login step to just register the entry (headless boxes,
+  or add-now-sign-in-later). If `claude` isn't on `PATH` or the login is
+  cancelled, the entry is still registered and it prints the exact login command
+  to finish by hand.
+
+- **Live `config.toml` reload — no more restart after editing it.** Both the
+  **macOS menu-bar app** and the **TUI** now watch `config.toml` and pick up
+  changes on the fly: enable a vendor, add an `[[anthropic.accounts]]` entry,
+  tweak an `[ui]` knob, and it takes effect within a second or two — the vendor
+  submenu, swap ring, Overview, and TUI tab set all rebuild in place. The menu
+  bar watches natively (`DispatchSource`, re-arming across an editor's atomic
+  save) so it's instant; the TUI polls the file's mtime every 2s (no new
+  dependency). In the TUI, a half-written/broken file mid-edit is ignored and
+  retried until it parses, so the running config is not replaced with defaults.
+
+## [0.18.0] — 2026-07-27
+
+### Added
+
+- **Claude multi-account in the macOS menu bar.** Every named Anthropic account
+  — explicit `[[anthropic.accounts]]` entries and `[anthropic] accounts_dir`
+  discoveries, the same config the binary and TUI already read — now appears as
+  its own entry ("Claude · work") in the *Trocar vendor* submenu, the **⌥⌘\\**
+  swap ring, the Preferences vendor selector, and the **Overview** (its own
+  dropdown row and status-bar segment, labeled by account). Fetches run as
+  `--vendor anthropic --account <label>`, so each account keeps its own cache
+  and refresh, and the dropdown header shows which account is active
+  ("Claude Max 20x · work"). `[anthropic] show_default_account = false` hides
+  the default (unnamed) Claude entry, mirroring the TUI.
+
+- **Overview across the TUI and the macOS menu bar.** A single view summarizing
+  every vendor at once — one compact row each (key metric, colored by severity)
+  — so all your limits are visible without switching tabs. In the **TUI** it is
+  a virtual first tab that `Tab`/`h`/`l` wrap through at both ends and the
+  default landing view (unless `[ui] primary` opens on a specific vendor);
+  `[ui] overview_vendors = [...]` picks and orders which vendors it lists on
+  both surfaces. In the **macOS menu-bar app** it is a target in the vendor
+  submenu and in the global
+  **⌥⌘\\** swap ring (which now cycles all providers *and* the overview); its
+  dropdown lists every configured vendor — each row **clickable** to jump to that
+  vendor — and the bar shows every vendor at once (a mini bar each when few, or
+  compact %-text past `[ui] overview_menubar_bars_max` (default 4), capped at
+  `overview_menubar_max`, in stable provider-grouped entry order). A
+  **Compactar** item right under the usage rows forces the compact %-text
+  mode even under the threshold; while compact it reads **Expandir** and turns
+  it back off. It also has a **global ⌥⌘E shortcut** (hinted on the item,
+  toggleable in Preferências → Atalho next to the ⌥⌘\\ swap toggle; overview
+  mode only). Each vendor's headline is the metric that matters:
+  **Cursor** shows its combined *included total usage*; **Anthropic** the biggest
+  of 5h / weekly / the scoped-model (Fable) window. The menu-bar title now also
+  shows each vendor's **time to reset**, squeezed to its leading unit ("4d",
+  "2h", "5m") to fit both bar and %-text modes — same countdown the dropdown
+  and the per-vendor detail view already show, just shortened for the bar.
+
+- **Instant "Loading…" feedback on a vendor swap** (menu bar). Switching vendor —
+  by ⌥⌘\\, the submenu, or an overview row — immediately replaces the view with a
+  placeholder naming the target, instead of leaving the previous vendor's data up
+  (which read as a freeze). The **⌥⌘\\ shortcut is also hinted** on the *Trocar
+  vendor* menu item.
+
+- **Cursor vendor.** Shows this billing cycle's two included-usage pools —
+  **Cursor Models** (Auto + Composer) and **Other Models** (named / API) — as
+  percentages, from `GET cursor.com/api/usage-summary`, the same undocumented
+  endpoint the Cursor dashboard's own frontend calls. Also surfaces the plan
+  (`membershipType`), the billing-cycle reset, whether on-demand spend is on,
+  and unlimited plans. No API key: the session token is read **read-only** from
+  the local `state.vscdb` SQLite database the Cursor IDE already wrote after you
+  signed in there (the JWT's `sub` claim yields the user id; combined with the
+  raw token it forms the `WorkosCursorSessionToken` cookie the endpoint
+  expects). Opt-in (`[cursor] enabled = true`) and wired into the Waybar widget,
+  `--vendor cursor`, the TUI panel (a bar per pool), scroll-cycling, **the macOS
+  menu bar app** (its two pools relabel the session/weekly bars as "Cursor
+  Models" / "Other Models"), and the config-example/README docs. Adds a
+  `rusqlite` (bundled) dependency. Not wired into the GNOME extension yet.
+  **Team accounts** (`membershipType` with no `individualUsage.plan`) are now
+  parsed too, via the auto/named "You've used N% of your included … usage"
+  display-message strings the payload also carries — the only percentage
+  source Cursor exposes for those accounts, per an independent
+  reverse-engineering of the same endpoint. Unverified against a live team
+  account (labeled `"<Plan> (team)"` in the UI so it's visibly a best-effort
+  path); falls back to the existing schema error rather than a fabricated
+  0% if the display messages don't parse.
+- **Auto-discovered Anthropic accounts (`[anthropic] accounts_dir`).** Point it
+  at a directory and ai-usagebar discovers each account under it automatically,
+  using Claude Code's own `CLAUDE_CONFIG_DIR` layout: every immediate
+  subdirectory becomes an account labeled by the subdirectory name — a TUI tab
+  and `--account <label>`, refreshed independently — with no per-account config
+  entry. This directory-based discovery also sees macOS logins whose credentials
+  live only in a config-dir-scoped Keychain item. Populate it by running the
+  `claude` CLI with a per-account `CLAUDE_CONFIG_DIR`, the general way to keep
+  several Claude Code logins side by side. Discovered accounts merge with
+  explicit `[[anthropic.accounts]]` (explicit wins on a label clash); a missing
+  or unreadable directory is ignored. Because it keys only on the standard
+  Claude Code layout, any tool that manages multiple logins works with it, not
+  one specific account switcher.
+  - **`[anthropic] show_default_account`** (default `true`): set `false` to hide
+    the default (unnamed) Claude tab when every account is managed explicitly,
+    so you don't get a redundant tab for the ambient Keychain/`~/.claude` login.
+    Ignored when there are no named accounts.
+  - **Staggered multi-account refreshes.** The TUI previously refreshed every
+    tab at once; with several Anthropic accounts that burst the shared
+    `/api/oauth/usage` + token endpoints and tripped their rate limit (`429`).
+    Anthropic tabs now refresh spaced out (~0.8s apart) so each account fetches
+    politely; other vendors still start immediately.
+- **"Iniciar no login" (start at login) toggle** in the macOS menu-bar app's
+  Preferences. Flipping it on installs a per-user LaunchAgent
+  (`~/Library/LaunchAgents/com.akitaonrails.ai-usagebar-menubar.plist`) pointing
+  at the running binary, so the app comes up automatically at each login; off
+  removes it. This is the GUI equivalent of `macos/install-agent.sh` — no
+  `launchctl` needed. macOS only: the app is a menu-bar agent that doesn't exist
+  on Linux (where the GNOME Shell extension autostarts with the session, and the
+  Waybar widget starts with the bar) or Windows.
+
+### Fixed
+
+- **Cursor caches are now bound to the signed-in account and billing cycle.**
+  A fresh cache from one Cursor login can no longer be shown after the IDE
+  switches accounts, and a stale snapshot is not served past its recorded
+  billing reset during an outage. Cached integers are range-checked before
+  narrowing, and the live payload must include a finite, representable
+  `totalPercentUsed` instead of silently turning schema drift into `0%`.
+
+- **macOS Overview, shortcuts, and login startup now reflect their real
+  configuration/state.** Overview honors `[ui] overview_vendors` (including all
+  named Claude accounts selected by `anthropic`) and grows its dropdown row pool
+  as accounts are discovered. Carbon handler/hot-key registration errors are
+  checked; an unavailable shortcut turns its preference back off instead of
+  appearing enabled while doing nothing. “Iniciar no login” reads the actual
+  LaunchAgent file, writes it atomically, and surfaces filesystem errors rather
+  than drifting from a stale `UserDefaults` value.
+
+- **Named/`accounts_dir` Anthropic accounts now find macOS Keychain-backed
+  logins.** `CLAUDE_CONFIG_DIR=<accounts_dir>/<label> claude` was documented
+  to make `<label>` "just work", but on macOS Claude Code stores the login in
+  the Keychain (service `Claude Code-credentials-<hash>`, hashed from the
+  config dir's absolute path) and never writes `<label>/.credentials.json` —
+  so a named account could look logged in via `claude` yet ai-usagebar kept
+  reporting "no usable cache" / stale file errors. Named accounts now prefer
+  the Keychain item hashed from their own directory, falling back to the file
+  (the Linux layout). Keychain-first matters: a `.credentials.json` copied by
+  hand shares its refresh-token lineage with the original, and dies with a
+  401 as soon as the real holder rotates it — reading the file first kept
+  resurrecting those dead snapshots over the live login sitting in the
+  Keychain. Token refreshes write back to the same scoped item, so
+  ai-usagebar and Claude Code keep sharing one source of truth per account.
+  Account discovery itself now keys on each immediate directory, rather than
+  requiring the file that Keychain-only logins intentionally do not create.
+  A different account's item can never match (the hash is per-directory), so
+  this doesn't reopen the cross-account ambiguity the original file-only
+  rule (#15) was written to avoid.
+
+- **Menu-bar app no longer freezes in Overview mode.** The appearance observer
+  fired on every layout pass (not just real light↔dark flips), and in Overview
+  each fire rebuilt the vendor submenu — which relaid out the button, re-firing
+  the observer: a main-thread loop that also spawned a keychain subprocess each
+  iteration, so the menu stopped responding to clicks. The observer now reacts
+  only to actual theme changes, appearance repaints skip the submenu rebuild, and
+  the keychain check is cached.
 
 - **A failed terminal resize no longer exits the TUI.** A transient
   `terminal.resize` error (e.g. an ioctl failure) now just skips that resize
@@ -946,7 +1800,22 @@ vendors. Highlights:
 - Live API smoke test suite (`make smoke`) that exercises the real
   undocumented endpoints to detect schema drift before users do.
 
-[Unreleased]: https://github.com/akitaonrails/ai-usagebar/compare/v0.17.2...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-usagebar/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/akitaonrails/ai-usagebar/compare/v1.3.1...v1.4.0
+[1.3.1]: https://github.com/akitaonrails/ai-usagebar/compare/v1.3.0...v1.3.1
+[1.3.0]: https://github.com/akitaonrails/ai-usagebar/compare/v1.2.0...v1.3.0
+[1.2.0]: https://github.com/akitaonrails/ai-usagebar/compare/v1.1.0...v1.2.0
+[1.1.0]: https://github.com/akitaonrails/ai-usagebar/compare/v1.0.3...v1.1.0
+[1.0.3]: https://github.com/akitaonrails/ai-usagebar/compare/v1.0.2...v1.0.3
+[1.0.2]: https://github.com/akitaonrails/ai-usagebar/compare/v1.0.1...v1.0.2
+[1.0.1]: https://github.com/akitaonrails/ai-usagebar/compare/v1.0.0...v1.0.1
+[1.0.0]: https://github.com/akitaonrails/ai-usagebar/compare/v0.22.0...v1.0.0
+[0.22.0]: https://github.com/akitaonrails/ai-usagebar/compare/v0.21.0...v0.22.0
+[0.21.0]: https://github.com/akitaonrails/ai-usagebar/compare/v0.20.1...v0.21.0
+[0.20.1]: https://github.com/akitaonrails/ai-usagebar/compare/v0.20.0...v0.20.1
+[0.20.0]: https://github.com/akitaonrails/ai-usagebar/compare/v0.19.0...v0.20.0
+[0.19.0]: https://github.com/akitaonrails/ai-usagebar/compare/v0.18.0...v0.19.0
+[0.18.0]: https://github.com/akitaonrails/ai-usagebar/compare/v0.17.2...v0.18.0
 [0.17.2]: https://github.com/akitaonrails/ai-usagebar/compare/v0.17.1...v0.17.2
 [0.17.1]: https://github.com/akitaonrails/ai-usagebar/compare/v0.16.0...v0.17.1
 [0.16.0]: https://github.com/akitaonrails/ai-usagebar/compare/v0.15.0...v0.16.0

@@ -7,10 +7,23 @@ use std::path::PathBuf;
 
 pub type Result<T> = std::result::Result<T, AppError>;
 
+pub const AUTH_FAILURE_MESSAGE: &str =
+    "authentication rejected — credentials may be missing, expired, or invalid";
+
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     /// Local I/O failed (cache write, credentials read, theme file, etc.).
-    #[error("io error at {path}: {source}")]
+    ///
+    /// The path is rendered through the crate's sanitizer rather than through
+    /// `Path`'s `Display`, which escapes nothing. Since Phase 5 a path here can
+    /// be built component-by-component out of a manifest a hostile remote
+    /// wrote, and this error reaches stderr from a dozen places — so the escape
+    /// belongs in the one `Display` every one of them goes through, not in each
+    /// print site that happened to remember (F-3).
+    #[error(
+        "io error at {}: {source}",
+        crate::display::sanitize_untrusted_path(path)
+    )]
     Io {
         path: PathBuf,
         #[source]
@@ -72,6 +85,17 @@ impl AppError {
     pub fn is_transient(&self) -> bool {
         matches!(self, AppError::Transport(_))
     }
+
+    /// Render an error for a local UI or report without exposing an upstream
+    /// authentication response body. Other errors retain their diagnostic text.
+    pub fn user_message(&self) -> String {
+        match self {
+            AppError::Http { status, .. } if matches!(status, 401 | 403) => {
+                format!("HTTP {status}: {AUTH_FAILURE_MESSAGE}")
+            }
+            other => other.to_string(),
+        }
+    }
 }
 
 /// Map a reqwest error into the right variant. Connection-class failures
@@ -88,5 +112,34 @@ impl From<reqwest::Error> for AppError {
             };
         }
         AppError::Other(err.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_message_does_not_expose_authentication_response_bodies() {
+        for status in [401, 403] {
+            let error = AppError::Http {
+                status,
+                body: "PANCEA user@example.test <credential>&token".into(),
+            };
+            let rendered = error.user_message();
+            assert!(rendered.contains(AUTH_FAILURE_MESSAGE));
+            assert!(!rendered.contains("PANCEA"));
+            assert!(!rendered.contains("user@example.test"));
+            assert!(!rendered.contains("&token"));
+        }
+    }
+
+    #[test]
+    fn user_message_preserves_non_authentication_diagnostics() {
+        let error = AppError::Http {
+            status: 500,
+            body: "provider unavailable".into(),
+        };
+        assert!(error.user_message().contains("provider unavailable"));
     }
 }

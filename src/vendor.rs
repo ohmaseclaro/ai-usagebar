@@ -20,6 +20,56 @@ pub const HTTP_CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
 /// misbehaving proxy or a hijacked endpoint.
 pub const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 
+/// Credential-bearing environment variables owned by ai-usagebar vendors.
+/// Subprocesses receive only the entries that belong to their own provider.
+pub(crate) const VENDOR_SECRET_ENV_VARS: &[&str] = &[
+    "ZAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "KIMI_API_KEY",
+    "KILO_API_KEY",
+    "NOVITA_API_KEY",
+    "MINIMAX_API_KEY",
+    "MOONSHOT_API_KEY",
+    "XAI_MANAGEMENT_KEY",
+    "ANTHROPIC_ADMIN_KEY",
+    "XAI_API_KEY",
+    "GROK_API_KEY",
+    "OPENCODE_GO_API_KEY",
+];
+
+pub(crate) fn vendor_secret_env_vars_to_remove(keep: &[&str]) -> Vec<&'static str> {
+    VENDOR_SECRET_ENV_VARS
+        .iter()
+        .copied()
+        .filter(|var| !keep.contains(var))
+        .collect()
+}
+
+/// Follow ordinary vendor redirects without forwarding non-standard API-key
+/// headers to a different origin. Reqwest strips `Authorization` on sensitive
+/// redirects, but vendors also use headers such as `x-api-key`, which are not
+/// covered by that built-in list.
+pub fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 10 {
+            return attempt.error("too many redirects");
+        }
+        let Some(origin) = attempt.previous().first() else {
+            return attempt.stop();
+        };
+        let target = attempt.url();
+        if target.scheme() == origin.scheme()
+            && target.host_str() == origin.host_str()
+            && target.port_or_known_default() == origin.port_or_known_default()
+        {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
 /// Read a response body with an upper bound.
 ///
 /// Every vendor buffered the whole body with `resp.bytes()` *before* anything
@@ -69,7 +119,15 @@ pub enum VendorId {
     Novita,
     Moonshot,
     Grok,
+    Supergrok,
     Antigravity,
+    Cursor,
+    Minimax,
+    Kiro,
+    #[serde(rename = "nous")]
+    NousResearch,
+    #[serde(rename = "opencode-go")]
+    OpenCodeGo,
 }
 
 impl VendorId {
@@ -86,7 +144,39 @@ impl VendorId {
             VendorId::Novita => "novita",
             VendorId::Moonshot => "moonshot",
             VendorId::Grok => "grok",
+            VendorId::Supergrok => "supergrok",
             VendorId::Antigravity => "antigravity",
+            VendorId::Cursor => "cursor",
+            VendorId::Minimax => "minimax",
+            VendorId::Kiro => "kiro",
+            VendorId::NousResearch => "nous",
+            VendorId::OpenCodeGo => "opencode-go",
+        }
+    }
+
+    /// Canonical human-readable name for shared reports and compact UI labels.
+    /// Platform frontends may add context (for example, "GLM (Z.AI)" in a
+    /// wide TUI tab), but should not carry their own full vendor-name table.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            VendorId::Anthropic => "Claude",
+            VendorId::AnthropicApi => "Anthropic API",
+            VendorId::Openai => "Codex",
+            VendorId::Zai => "Z.AI",
+            VendorId::Openrouter => "OpenRouter",
+            VendorId::Deepseek => "DeepSeek",
+            VendorId::Kimi => "Kimi",
+            VendorId::Kilo => "Kilo",
+            VendorId::Novita => "Novita",
+            VendorId::Moonshot => "Moonshot",
+            VendorId::Grok => "Grok",
+            VendorId::Supergrok => "SuperGrok",
+            VendorId::Antigravity => "Antigravity",
+            VendorId::Cursor => "Cursor",
+            VendorId::Minimax => "MiniMax",
+            VendorId::Kiro => "Kiro",
+            VendorId::NousResearch => "Nous Research",
+            VendorId::OpenCodeGo => "OpenCode Go",
         }
     }
 
@@ -103,7 +193,13 @@ impl VendorId {
             VendorId::Novita,
             VendorId::Moonshot,
             VendorId::Grok,
+            VendorId::Supergrok,
             VendorId::Antigravity,
+            VendorId::Cursor,
+            VendorId::Minimax,
+            VendorId::Kiro,
+            VendorId::NousResearch,
+            VendorId::OpenCodeGo,
         ]
     }
 }
@@ -145,6 +241,59 @@ impl RenderOpts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_vendor_has_stable_machine_and_display_names() {
+        for vendor in VendorId::all() {
+            assert!(!vendor.slug().is_empty());
+            assert!(!vendor.display_name().is_empty());
+        }
+        assert_eq!(VendorId::Anthropic.slug(), "anthropic");
+        assert_eq!(VendorId::Anthropic.display_name(), "Claude");
+        assert_eq!(VendorId::Openai.display_name(), "Codex");
+        assert_eq!(VendorId::Zai.display_name(), "Z.AI");
+    }
+
+    #[test]
+    fn new_vendor_contracts_keep_public_names_and_slugs() {
+        assert_eq!(VendorId::NousResearch.slug(), "nous");
+        assert_eq!(VendorId::NousResearch.display_name(), "Nous Research");
+        assert_eq!(VendorId::OpenCodeGo.slug(), "opencode-go");
+        assert_eq!(VendorId::OpenCodeGo.display_name(), "OpenCode Go");
+        assert_eq!(
+            serde_json::to_value(VendorId::OpenCodeGo).unwrap(),
+            serde_json::json!("opencode-go")
+        );
+    }
+
+    #[test]
+    fn vendor_secret_env_vars_cover_config_defaults() {
+        let configured_defaults = [
+            "ZAI_API_KEY",
+            "OPENROUTER_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "KIMI_API_KEY",
+            "KILO_API_KEY",
+            "NOVITA_API_KEY",
+            "MINIMAX_API_KEY",
+            "MOONSHOT_API_KEY",
+            "XAI_MANAGEMENT_KEY",
+            "ANTHROPIC_ADMIN_KEY",
+        ];
+        for name in configured_defaults {
+            assert!(VENDOR_SECRET_ENV_VARS.contains(&name), "missing {name}");
+        }
+    }
+
+    #[test]
+    fn vars_to_remove_preserves_only_requested_grok_credentials() {
+        let removed = vendor_secret_env_vars_to_remove(&["XAI_API_KEY", "GROK_API_KEY"]);
+        assert!(!removed.contains(&"XAI_API_KEY"));
+        assert!(!removed.contains(&"GROK_API_KEY"));
+        assert!(removed.contains(&"ANTHROPIC_ADMIN_KEY"));
+        assert!(removed.contains(&"OPENROUTER_API_KEY"));
+        assert_eq!(removed.len(), VENDOR_SECRET_ENV_VARS.len() - 2);
+    }
 
     #[tokio::test]
     async fn body_over_the_cap_is_refused_and_under_it_round_trips() {
@@ -203,6 +352,73 @@ mod tests {
         assert!(response.content_length().is_none());
         let error = read_body_capped(response, 1024).await.unwrap_err();
         assert!(error.to_string().contains("exceeds"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn same_origin_redirects_still_work_with_vendor_headers() {
+        let mut server = mockito::Server::new_async().await;
+        let redirect = server
+            .mock("GET", "/start")
+            .match_header("x-api-key", "secret")
+            .with_status(302)
+            .with_header("location", "/finish")
+            .create_async()
+            .await;
+        let finish = server
+            .mock("GET", "/finish")
+            .match_header("x-api-key", "secret")
+            .with_status(200)
+            .create_async()
+            .await;
+        let client = reqwest::Client::builder()
+            .redirect(same_origin_redirect_policy())
+            .build()
+            .unwrap();
+
+        let response = client
+            .get(format!("{}/start", server.url()))
+            .header("x-api-key", "secret")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        redirect.assert_async().await;
+        finish.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn cross_origin_redirects_are_not_followed_with_vendor_headers() {
+        let mut origin = mockito::Server::new_async().await;
+        let mut target = mockito::Server::new_async().await;
+        let target_url = format!("{}/capture", target.url());
+        let redirect = origin
+            .mock("GET", "/start")
+            .match_header("x-api-key", "secret")
+            .with_status(302)
+            .with_header("location", &target_url)
+            .create_async()
+            .await;
+        let capture = target
+            .mock("GET", "/capture")
+            .expect(0)
+            .create_async()
+            .await;
+        let client = reqwest::Client::builder()
+            .redirect(same_origin_redirect_policy())
+            .build()
+            .unwrap();
+
+        let response = client
+            .get(format!("{}/start", origin.url()))
+            .header("x-api-key", "secret")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        redirect.assert_async().await;
+        capture.assert_async().await;
     }
 
     #[test]

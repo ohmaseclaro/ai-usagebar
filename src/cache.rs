@@ -17,7 +17,7 @@ use std::time::{Duration, SystemTime};
 
 use fs2::FileExt;
 
-use crate::error::{AppError, Result};
+use crate::error::{AUTH_FAILURE_MESSAGE, AppError, Result};
 
 /// Default TTL — claudebar's `CACHE_TTL=60`.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(60);
@@ -175,6 +175,15 @@ impl Cache {
     pub fn write_last_error(&self, code: u16, msg: &str) {
         let _ = self.ensure_dir();
         let path = self.last_error_path();
+        // Authentication failure bodies routinely include account identifiers or
+        // partial credential details. Do not persist them; other status bodies
+        // remain useful diagnostics after their usual control-char cleanup.
+        let msg = if matches!(code, 401 | 403) {
+            AUTH_FAILURE_MESSAGE
+        } else {
+            msg
+        };
+        let msg = crate::display::sanitize_untrusted_field(msg);
         let body = format!("{code}\n{msg}");
         let _ = atomic_write(&path, body.as_bytes());
     }
@@ -234,8 +243,7 @@ pub fn acquire_lock(path: &Path, timeout: Duration) -> Result<LockGuard> {
             Err(_) => {
                 if std::time::Instant::now() >= deadline {
                     return Err(AppError::Other(format!(
-                        "cache lock timeout after {:?}",
-                        timeout
+                        "cache lock timeout after {timeout:?}"
                     )));
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -281,7 +289,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn xdg_cache_dir() -> Result<PathBuf> {
+pub(crate) fn xdg_cache_dir() -> Result<PathBuf> {
     directories::BaseDirs::new()
         .map(|b| b.cache_dir().to_path_buf())
         .ok_or_else(|| AppError::Other("could not resolve XDG cache dir (no HOME?)".into()))
@@ -435,6 +443,28 @@ mod tests {
         assert_eq!(msg, "");
     }
 
+    #[test]
+    fn last_error_replaces_401_body_with_credential_neutral_message() {
+        let (_td, cache) = fixture();
+        cache.write_last_error(401, "PANCEA user@example.test <credential>&token");
+
+        let persisted = fs::read_to_string(cache.last_error_path()).unwrap();
+        assert_eq!(persisted, format!("401\n{AUTH_FAILURE_MESSAGE}"));
+        assert!(!persisted.contains("PANCEA"));
+        assert!(!persisted.contains("<credential>"));
+    }
+
+    #[test]
+    fn last_error_replaces_403_body_with_credential_neutral_message() {
+        let (_td, cache) = fixture();
+        cache.write_last_error(403, "PANCEA account@example.test <credential>&token");
+
+        let persisted = fs::read_to_string(cache.last_error_path()).unwrap();
+        assert_eq!(persisted, format!("403\n{AUTH_FAILURE_MESSAGE}"));
+        assert!(!persisted.contains("PANCEA"));
+        assert!(!persisted.contains("<credential>"));
+    }
+
     /// The regression this guards: vendors write the raw HTTP body, which is
     /// usually multi-line JSON. The reader kept only line 2, so the tooltip
     /// showed `{` and dropped the actual API explanation.
@@ -451,6 +481,21 @@ mod tests {
             msg.contains("quota exhausted"),
             "message was truncated to its first line: {msg:?}"
         );
+    }
+
+    #[test]
+    fn last_error_strips_terminal_controls_before_persisting() {
+        let (_td, cache) = fixture();
+        cache.write_last_error(500, "bad\x1b]52;c;Y2FuYXJ5\x07\nnext\tfield");
+
+        let (code, msg) = cache.read_last_error().unwrap();
+        assert_eq!(code, 500);
+        assert_eq!(msg, "bad]52;c;Y2FuYXJ5\nnext field");
+        assert!(
+            msg.contains("Y2FuYXJ5"),
+            "non-auth diagnostic was not preserved"
+        );
+        assert!(!msg.chars().any(|ch| ch.is_control() && ch != '\n'));
     }
 
     /// A user upgrades with a `.last_error` already on disk; it must still
