@@ -37,6 +37,13 @@ class TrayModelTest(unittest.TestCase):
         self.assertEqual(metric_pace(under, NOW, "en_US"), ("ahead", None))
         self.assertEqual(metric_pace({**ahead, "window_secs": None}, NOW, "en_US"), None)
 
+    def test_opencode_go_report_paces_the_rolling_and_weekly_windows_only(self):
+        fixture = json.loads((Path(__file__).resolve().parent.parent / "tests/fixtures/opencode_go_paced_report.json").read_text())
+        rolling, weekly, monthly = list(report_sections(fixture["entries"][0]))
+        self.assertEqual(metric_pace(rolling, NOW, "en_US")[0], "behind")
+        self.assertEqual(metric_pace(weekly, NOW, "en_US"), ("ahead", None))
+        self.assertEqual(metric_pace(monthly, NOW, "en_US"), None)
+
     def test_binary_resolution_supports_cargo_and_saved_override(self):
         with tempfile.TemporaryDirectory() as temporary_home:
             home = Path(temporary_home)

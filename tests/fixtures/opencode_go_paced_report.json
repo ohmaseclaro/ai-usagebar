@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "id": "opencode-go",
+      "display_name": "OpenCode Go",
+      "plan": "OpenCode Go",
+      "sections": [
+        {
+          "type": "metric",
+          "label": "Rolling (5h)",
+          "percent": 70,
+          "value": "70%",
+          "headline": "percent",
+          "severity": "mid",
+          "detail": "Resets in 2h 30m · 50% elapsed · 20pts ahead",
+          "reset_at": "2026-09-25T14:30:00Z",
+          "window_secs": 18000
+        },
+        {
+          "type": "metric",
+          "label": "Weekly (7d)",
+          "percent": 30,
+          "value": "30%",
+          "headline": "percent",
+          "severity": "low",
+          "detail": "Resets in 3d 12h · 50% elapsed · 20pts under",
+          "reset_at": "2026-09-29T00:00:00Z",
+          "window_secs": 604800
+        },
+        {
+          "type": "metric",
+          "label": "Monthly",
+          "percent": 10,
+          "value": "10%",
+          "headline": "percent",
+          "severity": "low",
+          "detail": "Resets in 20d 0h",
+          "reset_at": "2026-10-15T12:00:00Z"
+        }
+      ]
+    }
+  ]
+}

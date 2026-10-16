@@ -1987,6 +1987,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn opencode_go_json_matches_the_shared_frontend_pacing_fixture() {
+        use crate::opencode_go::types::{Usage, Window};
+
+        let now = "2026-09-25T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let window = |percent, resets_at| {
+            Some(Window {
+                status: "ok".into(),
+                percent,
+                resets_at,
+            })
+        };
+        let state = TabState::Ready(Box::new(ReadyTab {
+            snapshot: VendorSnapshot::OpenCodeGo(Usage {
+                rolling: window(70.0, now + chrono::Duration::minutes(150)),
+                weekly: window(30.0, now + chrono::Duration::hours(84)),
+                monthly: window(10.0, now + chrono::Duration::days(20)),
+            }),
+            stale: false,
+            last_error: None,
+            fetched_at: None,
+            display: Default::default(),
+        }));
+        let projected = entry_from_state(&TabId::vendor(VendorId::OpenCodeGo), &state, now);
+        let rendered = render_json_for_primary(&[projected], None);
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/opencode_go_paced_report.json"
+        ))
+        .unwrap();
+        let entry = &value["entries"][0];
+        let expected = &fixture["entries"][0];
+        assert_eq!(entry["id"], expected["id"]);
+        assert_eq!(entry["display_name"], expected["display_name"]);
+        let metrics: Vec<_> = entry["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|section| section["type"] == "metric")
+            .collect();
+        assert_eq!(metrics.len(), 3);
+        for (index, metric) in metrics.into_iter().enumerate() {
+            assert_eq!(metric, &expected["sections"][index]);
+            for field in ["percent", "detail", "reset_at", "window_secs"] {
+                assert_eq!(entry["metrics"][index][field], metric[field]);
+            }
+        }
+    }
+
     /// A rolling window's exact length rides along with its row, in both the
     /// ordered `sections` and the `metrics` convenience view, and is omitted
     /// (not `null`) for a metric that has none.
