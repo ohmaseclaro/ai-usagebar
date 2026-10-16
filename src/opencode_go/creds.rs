@@ -17,6 +17,7 @@
 //! it is not read as an API key.
 
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags};
@@ -43,11 +44,14 @@ const SQLITE_MAGIC: &[u8] = b"SQLite format 3\0";
 /// does not carry a key yields `None` rather than an error: one broken shape
 /// must not mask a working path later in the search list.
 pub fn read_key_from(path: &Path) -> Option<String> {
-    let bytes = std::fs::read(path).ok()?;
-    if bytes.starts_with(SQLITE_MAGIC) {
+    let mut header = [0u8; SQLITE_MAGIC.len()];
+    let is_db = std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .is_ok_and(|()| header == *SQLITE_MAGIC);
+    if is_db {
         return read_key_from_db(path);
     }
-    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    let value: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
     PROVIDER_IDS
         .iter()
         .find_map(|id| key_from_entry(value.get(*id)?))
