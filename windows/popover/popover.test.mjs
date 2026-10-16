@@ -113,6 +113,16 @@ const englishMessages = JSON.parse(readFileSync(new URL('./messages/en.json', im
   assert.equal(pace({...ahead, window: undefined}, now), null);
 }
 
+{
+  const fixture = JSON.parse(readFileSync(new URL('../../tests/fixtures/opencode_go_paced_report.json', import.meta.url), 'utf8'));
+  const now = Date.parse('2026-09-25T12:00:00Z');
+  const [rolling, weekly, monthly] = projectCards(parseHostPayload(fixture), now)[0].rows;
+  assert.equal(pace(rolling, now).elapsedPercent, 50);
+  assert.equal(pace(rolling, now).state, 'behind');
+  assert.notEqual(pace(weekly, now).state, 'behind');
+  assert.equal(pace(monthly, now), null);
+}
+
 // The page declares an empty icon, so the WebView never asks the tray for /favicon.ico: the
 // custom protocol serves only the page, its script and its stylesheet, and the request logged
 // a 404 in the popover's console on every open.
@@ -1722,6 +1732,7 @@ assert.equal(resolvedTheme('system'), 'light');
   const codex = providerLinks('openai@work');
   assert.equal(codex[0].label, 'Status');
   assert.equal(codex[1].label, 'Dashboard');
+  assert.deepEqual(providerLinks('opencode-go').map(link => link.label), ['Status', 'Dashboard']);
   assert.equal(providerLinks('unknown-vendor').length, 0);
   const grok = providerLinks('supergrok');
   assert.equal(grok.length, 1);

@@ -1,5 +1,28 @@
 ## [Unreleased]
 
+### Added
+
+- **OpenCode Go has a live smoke test and a shared frontend fixture.**
+  `cargo test --test live opencode_go_live -- --ignored` checks the real
+  `zen/go/v1/usage` shape and skips without a key, and
+  `tests/fixtures/opencode_go_paced_report.json` pins the paced rolling,
+  weekly and monthly rows for the GNOME, KDE, Windows, Linux Mint and Omarchy
+  contract suites.
+
+- **Windows popover links OpenCode Go's status page and console.**
+
+### Fixed
+
+- **OpenCode Go finds a key the current OpenCode CLI saved.** Recent CLI
+  releases keep credentials in SQLite (`opencode.db`, honouring `OPENCODE_DB`)
+  and import the legacy `auth.json` only once, so a key added since was never
+  found. The database is now read first, read-only, then `auth.json`, and the
+  `opencode-go` entry is preferred over the `opencode` (Zen) one.
+
+- **An OpenCode Go key without a Go subscription says so.** The usage endpoint
+  answers 403 for a valid key whose workspace has no Go plan; that was reported
+  as rejected credentials.
+
 ## [1.38.1] — 2026-10-16
 
 ### Fixed
