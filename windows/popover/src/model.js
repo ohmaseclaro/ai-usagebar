@@ -1571,6 +1571,10 @@ const PROVIDER_LINKS = {
     ["Status", "https://status.cursor.com/"],
     ["Dashboard", "https://www.cursor.com/dashboard"],
   ],
+  "opencode-go": [
+    ["Status", "https://status.opencode.ai/"],
+    ["Dashboard", "https://opencode.ai/auth"],
+  ],
   copilot: [
     ["Status", "https://www.githubstatus.com/"],
     ["Dashboard", "https://github.com/settings/billing"],

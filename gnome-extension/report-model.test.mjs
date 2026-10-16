@@ -27,6 +27,14 @@ const labels = rows => rows.map(row => `${row.type}:${row.label}`);
     assert.deepEqual(unstated.rows.map(row => row.elapsed), [null, null]);
 }
 
+{
+    const fixture = JSON.parse(readFileSync(new URL('../tests/fixtures/opencode_go_paced_report.json', import.meta.url), 'utf8'));
+    const entry = projectEntry(fixture.entries[0], Date.parse('2026-09-25T12:00:00Z'));
+    assert.equal(entry.title, 'OpenCode Go');
+    assert.deepEqual(entry.rows.map(row => row.elapsed), [50, 50, null]);
+    assert.equal(entry.rows[0].detail, '50% elapsed · 20pts ahead');
+}
+
 assert.equal(finitePercent(37), 37);
 assert.equal(finitePercent('83'), 83);
 assert.equal(finitePercent(null), null);

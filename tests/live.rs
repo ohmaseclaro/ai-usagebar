@@ -63,6 +63,10 @@
 //! - **SuperGrok**: asks the official Grok Build CLI's `x.ai/billing` ACP
 //!   extension, then asserts usage percent and plan. Set
 //!   `SUPERGROK_GROK_BINARY` to the trusted official executable.
+//! - **OpenCode Go**: resolves the key from `OPENCODE_GO_API_KEY` or the
+//!   OpenCode CLI's `opencode.db` / `auth.json`, then asserts at least one of the rolling,
+//!   weekly and monthly windows is present and every `percent` is 0..=100.
+//!   `opencode_go_live` skips when neither holds a key.
 //! - **Antigravity (app closed)**: reads the Google session Antigravity saved
 //!   in the OS keyring and asks the Cloud Code API for the quota summary,
 //!   bypassing local discovery so the remote path is what runs. Asserts the
@@ -972,5 +976,57 @@ async fn cline_live() {
         out.snapshot.five_hour.as_ref().map(|w| w.pct()),
         out.snapshot.seven_day.as_ref().map(|w| w.pct()),
         out.snapshot.thirty_day.as_ref().map(|w| w.pct()),
+    );
+}
+
+#[tokio::test]
+#[ignore = "live API; run with --ignored"]
+async fn opencode_go_live() {
+    use ai_usagebar::opencode_go;
+
+    let key = match opencode_go::creds::resolve_key("OPENCODE_GO_API_KEY", None, None) {
+        Ok(key) => key,
+        Err(error) => {
+            eprintln!("opencode_go_live: {error} — skipping OpenCode Go smoke test");
+            return;
+        }
+    };
+    let cache = xdg_cache_for("opencode-go");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+    let out = opencode_go::fetch::fetch_snapshot(
+        &client,
+        &key,
+        &cache,
+        &opencode_go::fetch::Endpoints::default(),
+        Duration::from_secs(0),
+    )
+    .await
+    .expect("opencode-go fetch should succeed against the real API");
+
+    let windows = [
+        ("rolling", &out.snapshot.rolling),
+        ("weekly", &out.snapshot.weekly),
+        ("monthly", &out.snapshot.monthly),
+    ];
+    assert!(
+        windows.iter().any(|(_, window)| window.is_some()),
+        "opencode-go reported no window — `usage.{{rolling,weekly,monthly}}` renamed?"
+    );
+    for (label, window) in windows {
+        let Some(window) = window else { continue };
+        assert!(
+            (0.0..=100.0).contains(&window.percent),
+            "opencode-go.{label}: percent {} out of 0..=100",
+            window.percent
+        );
+    }
+    println!(
+        "✅ opencode-go — rolling={:?}%, weekly={:?}%, monthly={:?}%",
+        out.snapshot.rolling.as_ref().map(|w| w.percent),
+        out.snapshot.weekly.as_ref().map(|w| w.percent),
+        out.snapshot.monthly.as_ref().map(|w| w.percent),
     );
 }

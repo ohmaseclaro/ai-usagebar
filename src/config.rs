@@ -1178,9 +1178,10 @@ pub struct OpenCodeGoConfig {
     pub enabled: bool,
     pub api_key_env: String,
     pub api_key: Option<String>,
-    /// Override the search list for the official OpenCode CLI's `auth.json`
-    /// (`$XDG_DATA_HOME/opencode` or `~/.local/share/opencode`), for a
-    /// non-standard install. The key is read read-only, never copied.
+    /// Override the search list for the official OpenCode CLI's credential
+    /// store (`opencode.db`, then `auth.json`, under `$XDG_DATA_HOME/opencode`
+    /// or `~/.local/share/opencode`), for a non-standard install. The key is
+    /// read read-only, never copied.
     pub auth_paths: Option<Vec<PathBuf>>,
 }
 

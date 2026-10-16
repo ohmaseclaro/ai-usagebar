@@ -1,44 +1,81 @@
 //! Locate the OpenCode Go API key the official OpenCode CLI already holds.
 //!
-//! The CLI files every provider's credential in its own data directory:
-//! `~/.local/share/opencode/auth.json` (`$XDG_DATA_HOME` when set), shaped
-//! `{ "<provider id>": { "type": "api", "key": "..." } }`. The account
-//! OpenCode sells as Zen (pay-as-you-go) and Go (monthly quota) is stored
-//! under the provider id `opencode`, and that same account key is what the
-//! `zen/go/v1/usage` endpoint accepts — the official console calls it with
-//! the logged-in account's credential.
+//! The CLI keeps credentials in its data directory (`$XDG_DATA_HOME/opencode`,
+//! else `~/.local/share/opencode`). Current releases store them in the SQLite
+//! database `opencode.db` (`OPENCODE_DB` overrides it), table `credential`,
+//! one row per integration with a JSON `value` such as
+//! `{"type":"key","key":"..."}`. Older releases wrote
+//! `auth.json`, shaped `{ "<provider id>": { "type": "api", "key": "..." } }`;
+//! the database imports it once and never writes it again, so the database is
+//! searched first. A Go key lives under the integration `opencode-go`; the
+//! console account key filed under `opencode` (Zen) is accepted after it.
 //!
-//! This module reads that file read-only and never writes, copies, or caches
-//! the key, exactly like anthropic, cursor, kiro, and devin treat the
-//! credential file the official CLI already wrote. The entry must declare a
-//! key-bearing type: an OAuth or well-known entry keeps its material in
-//! other fields, so it is not read as an API key.
+//! This module reads both read-only and never writes, copies, or caches the
+//! key, exactly like anthropic, cursor, kiro, and devin treat the credential
+//! store the official CLI already wrote. The entry must declare a key-bearing
+//! type: an OAuth or well-known entry keeps its material in other fields, so
+//! it is not read as an API key.
 
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 
 use crate::cache::home_dir;
 use crate::error::{AppError, Result};
 
-/// The provider id OpenCode uses for its own Zen/Go account in `auth.json`.
-const PROVIDER_ID: &str = "opencode";
+/// Integration ids holding a key the usage endpoint accepts, most specific
+/// first.
+const PROVIDER_IDS: &[&str] = &["opencode-go", "opencode"];
 
 /// Entry types whose `key` field is a usable API key. Anything else — in
 /// particular OpenCode's `oauth` and `wellknown` types, which hold the secret
 /// in `token`/`refresh` — must not be read as a key.
-const KEY_TYPES: &[&str] = &["api", "zen"];
+const KEY_TYPES: &[&str] = &["key", "api", "zen"];
 
-/// Read the OpenCode Go key out of one `auth.json`.
+const SQLITE_MAGIC: &[u8] = b"SQLite format 3\0";
+
+/// Read the OpenCode Go key out of one credential store: the CLI's SQLite
+/// database or a legacy `auth.json`, told apart by the file's header.
 ///
-/// A missing or malformed file, a missing `opencode` entry, or an entry whose
-/// type does not carry a key yields `None` rather than an error: one broken
-/// shape must not mask a working path later in the search list.
+/// A missing or malformed file, no matching entry, or an entry whose type
+/// does not carry a key yields `None` rather than an error: one broken shape
+/// must not mask a working path later in the search list.
 pub fn read_key_from(path: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let value: Value = serde_json::from_str(&text).ok()?;
-    let entry = value.get(PROVIDER_ID)?.as_object()?;
+    let mut header = [0u8; SQLITE_MAGIC.len()];
+    let is_db = std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .is_ok_and(|()| header == *SQLITE_MAGIC);
+    if is_db {
+        return read_key_from_db(path);
+    }
+    let value: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    PROVIDER_IDS
+        .iter()
+        .find_map(|id| key_from_entry(value.get(*id)?))
+}
+
+fn read_key_from_db(path: &Path) -> Option<String> {
+    // Read-only: the running CLI owns this database; SQLite allows concurrent
+    // readers alongside it.
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    PROVIDER_IDS.iter().find_map(|id| {
+        let value: String = conn
+            .query_row(
+                "SELECT value FROM credential WHERE integration_id = ?1 \
+                 ORDER BY active DESC, time_created DESC LIMIT 1",
+                [id],
+                |row| row.get(0),
+            )
+            .ok()?;
+        key_from_entry(&serde_json::from_str(&value).ok()?)
+    })
+}
+
+fn key_from_entry(entry: &Value) -> Option<String> {
+    let entry = entry.as_object()?;
     if !entry
         .get("type")
         .and_then(Value::as_str)
@@ -50,12 +87,31 @@ pub fn read_key_from(path: &Path) -> Option<String> {
     (!key.is_empty()).then(|| key.to_string())
 }
 
+/// The CLI's database: `OPENCODE_DB` when set (a relative name resolves
+/// against the data dir, as the CLI does), else `opencode.db` there.
+pub fn default_db_path() -> Result<PathBuf> {
+    Ok(db_path(
+        std::env::var_os("OPENCODE_DB"),
+        &opencode_data_dir()?,
+    ))
+}
+
+fn db_path(var: Option<OsString>, data: &Path) -> PathBuf {
+    match var.filter(|v| !v.is_empty() && v != ":memory:") {
+        Some(v) => data.join(v),
+        None => data.join("opencode.db"),
+    }
+}
+
+fn opencode_data_dir() -> Result<PathBuf> {
+    Ok(data_dir(std::env::var_os("XDG_DATA_HOME"), home_dir()?).join("opencode"))
+}
+
 /// The OpenCode CLI's documented data directory: `$XDG_DATA_HOME` when it is
 /// absolute, else `~/.local/share` — on every platform, the troubleshooting
 /// docs put `auth.json` in `.local/share` on macOS, Linux, and Windows alike.
 pub fn default_auth_path() -> Result<PathBuf> {
-    let dir = data_dir(std::env::var_os("XDG_DATA_HOME"), home_dir()?);
-    Ok(dir.join("opencode").join("auth.json"))
+    Ok(opencode_data_dir()?.join("auth.json"))
 }
 
 /// Pure XDG rule: the variable wins only when absolute, as the XDG Base
@@ -68,11 +124,11 @@ fn data_dir(var: Option<OsString>, home: PathBuf) -> PathBuf {
 }
 
 /// The effective search list: a configured override when it names at least
-/// one path, else the default data-dir file.
+/// one path, else the CLI's database, then its legacy `auth.json`.
 pub fn effective_paths(configured: Option<&[PathBuf]>) -> Result<Vec<PathBuf>> {
     match configured {
         Some(paths) if !paths.is_empty() => Ok(paths.to_vec()),
-        _ => Ok(vec![default_auth_path()?]),
+        _ => Ok(vec![default_db_path()?, default_auth_path()?]),
     }
 }
 
@@ -86,7 +142,7 @@ pub fn probe(configured: Option<&[PathBuf]>) -> bool {
 }
 
 /// Production resolver: configured env var, then inline `api_key`, then the
-/// CLI's `auth.json`. Tests use [`resolve_from`], which takes the values as
+/// CLI's own credential store. Tests use [`resolve_from`], which takes the values as
 /// inputs so an ambient `OPENCODE_GO_API_KEY` cannot leak into them.
 pub fn resolve_key(
     env_var_name: &str,
@@ -128,7 +184,7 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 fn signed_out_message(env_var_name: &str) -> String {
     format!(
         "OpenCode Go is not signed in. Run `opencode auth login` and choose \
-         OpenCode, or set {env_var_name}."
+         OpenCode Go, or set {env_var_name}."
     )
 }
 
@@ -212,6 +268,119 @@ mod tests {
         std::fs::write(&malformed, "not json").unwrap();
         assert_eq!(read_key_from(&malformed), None);
         assert_eq!(read_key_from(&dir.path().join("missing.json")), None);
+    }
+
+    fn seed_db(path: &Path, rows: &[(&str, Value, Option<bool>, i64)]) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, \
+             label TEXT NOT NULL, value TEXT NOT NULL, connector_id TEXT, method_id TEXT, \
+             active INTEGER, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL)",
+        )
+        .unwrap();
+        for (index, (integration, value, active, created)) in rows.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO credential VALUES (?1, ?2, 'label', ?3, NULL, NULL, ?4, ?5, ?5)",
+                rusqlite::params![
+                    format!("row-{index}"),
+                    integration,
+                    value.to_string(),
+                    active,
+                    created
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn reads_the_go_key_from_the_cli_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opencode.db");
+        seed_db(
+            &path,
+            &[
+                (
+                    "opencode",
+                    serde_json::json!({"type": "key", "key": "zen-key"}),
+                    Some(true),
+                    1,
+                ),
+                (
+                    "opencode-go",
+                    serde_json::json!({"type": "key", "key": "old-key"}),
+                    Some(false),
+                    3,
+                ),
+                (
+                    "opencode-go",
+                    serde_json::json!({"type": "key", "key": "go-key"}),
+                    Some(true),
+                    2,
+                ),
+            ],
+        );
+        assert_eq!(read_key_from(&path).unwrap(), "go-key");
+    }
+
+    #[test]
+    fn database_oauth_rows_and_other_integrations_are_not_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opencode.db");
+        seed_db(
+            &path,
+            &[
+                (
+                    "opencode-go",
+                    serde_json::json!({"type": "oauth", "access": "tok"}),
+                    Some(true),
+                    1,
+                ),
+                (
+                    "anthropic",
+                    serde_json::json!({"type": "key", "key": "other"}),
+                    Some(true),
+                    1,
+                ),
+            ],
+        );
+        assert_eq!(read_key_from(&path), None);
+        let empty = dir.path().join("empty.db");
+        Connection::open(&empty)
+            .unwrap()
+            .execute_batch("CREATE TABLE t (x)")
+            .unwrap();
+        assert_eq!(read_key_from(&empty), None);
+    }
+
+    #[test]
+    fn auth_json_prefers_the_go_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "auth.json",
+            serde_json::json!({
+                "opencode": {"type": "api", "key": "zen-key"},
+                "opencode-go": {"type": "api", "key": "go-key"}
+            }),
+        );
+        assert_eq!(read_key_from(&path).unwrap(), "go-key");
+    }
+
+    #[test]
+    fn db_path_follows_opencode_db() {
+        let data = PathBuf::from("data");
+        assert_eq!(db_path(None, &data), data.join("opencode.db"));
+        assert_eq!(
+            db_path(Some(":memory:".into()), &data),
+            data.join("opencode.db")
+        );
+        assert_eq!(db_path(Some("beta.db".into()), &data), data.join("beta.db"));
+        #[cfg(not(windows))]
+        assert_eq!(
+            db_path(Some("/x/o.db".into()), &data),
+            PathBuf::from("/x/o.db")
+        );
     }
 
     #[test]
