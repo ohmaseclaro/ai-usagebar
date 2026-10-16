@@ -258,12 +258,13 @@ enabled = true             # disabled by default; enable once you've run `kiro-c
 
 [opencode-go]
 enabled = true             # disabled by default; enable once signed in or configured
-# Reads the API key the official OpenCode CLI already wrote to its own
-# auth.json (default $XDG_DATA_HOME/opencode or ~/.local/share/opencode),
-# read-only, so a signed-in CLI shows up on its own. An explicit key still
-# wins: OPENCODE_GO_API_KEY (or `api_key`) is resolved before the file.
+# Reads the API key the official OpenCode CLI already holds, read-only:
+# its opencode.db (OPENCODE_DB honoured), then the legacy auth.json, both in
+# $XDG_DATA_HOME/opencode or ~/.local/share/opencode. A signed-in CLI shows
+# up on its own. An explicit key still wins: OPENCODE_GO_API_KEY (or
+# `api_key`) is resolved before either file.
 # api_key = "..."                          # or export OPENCODE_GO_API_KEY
-# auth_paths = ["/custom/opencode/auth.json"]  # non-standard install
+# auth_paths = ["/custom/opencode/opencode.db", "/custom/opencode/auth.json"]
 
 [modelstudio]
 enabled = false            # disabled by default; enable after `bl auth login --console`

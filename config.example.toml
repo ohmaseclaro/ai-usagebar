@@ -586,8 +586,9 @@ enabled = false
 # keeps the meter, the severity colour and the detail line either way.
 # headline = "amount"
 
-# OpenCode Go — usage from /zen/go/v1/usage. Opt in only after exporting the
-# API key under this variable; the key itself is never written to this example.
+# OpenCode Go — usage from /zen/go/v1/usage. A signed-in OpenCode CLI is read
+# read-only (opencode.db, then legacy auth.json); the env var or inline key
+# below wins when set. The key itself is never written to this example.
 [opencode-go]
 enabled = false
 api_key_env = "OPENCODE_GO_API_KEY"

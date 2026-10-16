@@ -307,7 +307,7 @@ come from environment variables or `config.toml`.
 | Cursor | Existing Cursor IDE or `cursor-agent` login | Opt in and sign in once. `cursor-agent` is the headless fallback. |
 | Kiro CLI | Existing kiro-cli login | Opt in and run `kiro-cli login` once. ai-usagebar refreshes the session when needed. |
 | Nous Research | OAuth device flow | Enable `[nous]`, click **Log in with Nous Research** in the Omarchy settings panel, or run `ai-usagebar auth nous login`. Credentials are kept in ai-usagebar's separate platform config directory (`~/.config/ai-usagebar/credentials.json` on Linux). |
-| OpenCode Go | Existing OpenCode CLI login (read-only `~/.local/share/opencode/auth.json`), or API key (`OPENCODE_GO_API_KEY` env or `[opencode-go] api_key`) | Enable `[opencode-go]`. A signed-in OpenCode CLI is detected on its own; an explicit key is unnecessary then, and wins when set (Settings panel / environment). |
+| OpenCode Go | Existing OpenCode CLI login (read-only `~/.local/share/opencode/opencode.db`, or legacy `auth.json`), or API key (`OPENCODE_GO_API_KEY` env or `[opencode-go] api_key`) | Enable `[opencode-go]`. A signed-in OpenCode CLI is detected on its own; an explicit key is unnecessary then, and wins when set (Settings panel / environment). |
 | Command Code | Existing `commandcode` or pi login | Enable `[commandcode]` and sign in to either one once. No key to paste; `COMMANDCODE_API_KEY` overrides if you prefer one. |
 | Model Studio | Existing `bl auth login --console` (Alibaba Cloud) | Opt in (`[modelstudio]`), install the official `bl` CLI, and run `bl auth login --console` once. Reports the Token Plan's 5-hour, weekly and monthly percentage windows with resets, through the same console gateway the CLI uses; the credential file `~/.bailian/config.json` is only ever read. |
 | Devin | Existing official Devin CLI login | Opt in (`[devin]`) after signing in with the Devin CLI. Reuses its existing `credentials.toml` read-only; ai-usagebar never logs in, refreshes, or writes credentials. Reports daily and weekly quota usage and an optional overage balance. |
@@ -335,10 +335,12 @@ directory and inherited per-user access controls.
 
 OpenCode Go uses the official usage endpoint and the `percent` field. Its key is
 resolved from `OPENCODE_GO_API_KEY` / `[opencode-go] api_key` first, or read
-read-only from the credential the official OpenCode CLI already wrote to
-`~/.local/share/opencode/auth.json` (`$XDG_DATA_HOME` is honoured;
-`[opencode-go] auth_paths` overrides the file), so a signed-in CLI needs no
-setup. The file is never written, copied, or cached. Keys entered through the
+read-only from the credential the official OpenCode CLI already holds: its
+`~/.local/share/opencode/opencode.db` (`OPENCODE_DB` is honoured), then the
+legacy `auth.json` beside it (`$XDG_DATA_HOME` is honoured for both;
+`[opencode-go] auth_paths` overrides the list). The `opencode-go` entry wins
+over the `opencode` (Zen) one, so a signed-in CLI needs no setup. Neither file
+is ever written, copied, or cached. Keys entered through the
 native Settings panel are sent to the Rust settings command over stdin and are
 never placed in QML command arguments; cache entries are tied to the endpoint
 and a one-way key fingerprint, so changing accounts cannot reuse another

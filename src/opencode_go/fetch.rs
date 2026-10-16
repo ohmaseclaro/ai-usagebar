@@ -154,7 +154,12 @@ fn parse_payload(body: &[u8]) -> Result<Usage> {
 
 fn status_message(status: u16) -> &'static str {
     match status {
-        401 | 403 => AUTH_FAILURE_MESSAGE,
+        401 => AUTH_FAILURE_MESSAGE,
+        // The usage route answers 403 `EntitlementError` for a valid key whose
+        // workspace has no Go subscription.
+        403 => {
+            "OpenCode Go access denied — check that this key's workspace has an active Go subscription"
+        }
         429 => "OpenCode Go request was rate limited",
         500..=599 => "OpenCode Go service is temporarily unavailable",
         _ => "OpenCode Go request failed",
@@ -331,6 +336,12 @@ mod tests {
             assert!(!rendered.contains("body-secret"));
             assert!(!rendered.contains("test-key"));
         }
+    }
+
+    #[test]
+    fn forbidden_points_at_the_subscription_not_the_key() {
+        assert!(status_message(403).contains("Go subscription"));
+        assert_eq!(status_message(401), AUTH_FAILURE_MESSAGE);
     }
 
     #[tokio::test]
